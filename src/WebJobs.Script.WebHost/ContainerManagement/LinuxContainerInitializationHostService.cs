@@ -55,6 +55,15 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.ContainerManagement
 
                 bool success = _instanceManager.StartAssignment(assignmentContext);
                 _logger.LogInformation($"StartAssignment invoked (Success={success})");
+
+                if (assignmentContext.MSIContext != null)
+                {
+                    await _instanceManager.SpecializeMSISidecar(assignmentContext);
+                }
+                else
+                {
+                    _logger.LogInformation("Skipping re-specialization of MSI sidecar.");
+                }
             }
             else
             {
