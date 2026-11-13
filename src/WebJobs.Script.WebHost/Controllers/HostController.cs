@@ -5,7 +5,6 @@ using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
-using System.Linq;
 using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
@@ -16,12 +15,16 @@ using Microsoft.AspNetCore.Mvc.WebApiCompatShim;
 using Microsoft.Azure.WebJobs.Host;
 using Microsoft.Azure.WebJobs.Host.Executors;
 using Microsoft.Azure.WebJobs.Host.Scale;
+using Microsoft.Azure.WebJobs.Logging;
+using Microsoft.Azure.WebJobs.Script.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.ExtensionBundle;
 using Microsoft.Azure.WebJobs.Script.Scale;
 using Microsoft.Azure.WebJobs.Script.WebHost.Filters;
 using Microsoft.Azure.WebJobs.Script.WebHost.Management;
 using Microsoft.Azure.WebJobs.Script.WebHost.Models;
+using Microsoft.Azure.WebJobs.Script.WebHost.Security.Authentication;
 using Microsoft.Azure.WebJobs.Script.WebHost.Security.Authorization.Policies;
+using Microsoft.Azure.WebJobs.Script.Workers;
 using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -44,6 +47,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
         private readonly IScriptHostManager _scriptHostManager;
         private readonly IFunctionsSyncManager _functionsSyncManager;
         private readonly HostPerformanceManager _performanceManager;
+        private readonly IMetricsLogger _metricsLogger;
         private static readonly SemaphoreSlim _drainSemaphore = new SemaphoreSlim(1, 1);
         private static readonly SemaphoreSlim _resumeSemaphore = new SemaphoreSlim(1, 1);
 
@@ -52,7 +56,8 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
             IEnvironment environment,
             IScriptHostManager scriptHostManager,
             IFunctionsSyncManager functionsSyncManager,
-            HostPerformanceManager performanceManager)
+            HostPerformanceManager performanceManager,
+            IMetricsLogger metricsLogger)
         {
             _applicationHostOptions = applicationHostOptions;
             _logger = loggerFactory.CreateLogger(ScriptConstants.LogCategoryHostController);
@@ -60,11 +65,12 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
             _scriptHostManager = scriptHostManager;
             _functionsSyncManager = functionsSyncManager;
             _performanceManager = performanceManager;
+            _metricsLogger = metricsLogger;
         }
 
         [HttpGet]
         [Route("admin/host/status")]
-        [Authorize(Policy = PolicyNames.AdminAuthLevelOrInternal)]
+        [Authorize(Policy = PolicyNames.AdminAuthLevel)]
         [TypeFilter(typeof(EnableDebugModeFilter))]
         public async Task<IActionResult> GetHostStatus([FromServices] IScriptHostManager scriptHostManager, [FromServices] IHostIdProvider hostIdProvider, [FromServices] IServiceProvider serviceProvider = null)
         {
@@ -100,7 +106,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
             if (lastError != null)
             {
                 status.Errors = new Collection<string>();
-                status.Errors.Add(Utility.FlattenException(lastError));
+                status.Errors.Add(Sanitizer.Sanitize(Utility.FlattenException(lastError)));
             }
 
             string message = $"Host Status: {JsonConvert.SerializeObject(status, Formatting.Indented)}";
@@ -116,10 +122,12 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
         /// </summary>
         [HttpGet]
         [Route("admin/host/processes")]
-        [Authorize(Policy = PolicyNames.AdminAuthLevelOrInternal)]
-        public async Task<IActionResult> GetWorkerProcesses([FromServices] IScriptHostManager scriptHostManager)
+        [Authorize(Policy = PolicyNames.AdminAuthLevel)]
+        public async Task<IActionResult> GetWorkerProcesses(
+            [FromServices] IScriptHostManager scriptHostManager,
+            [FromServices] IWorkerRuntimeResolver runtimeResolver)
         {
-            if (!Utility.TryGetHostService(scriptHostManager, out IWebHostRpcWorkerChannelManager webHostLanguageWorkerChannelManager))
+            if (!Utility.TryGetHostService(scriptHostManager, out IWebHostWorkerManager webHostWorkerManager))
             {
                 return StatusCode(StatusCodes.Status503ServiceUnavailable);
             }
@@ -136,40 +144,23 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
                 }
             };
 
-            string workerRuntime = _environment.GetFunctionsWorkerRuntime();
+            string workerRuntime = runtimeResolver.GetWorkerRuntime(defaultValue: string.Empty);
 
-            List<IRpcWorkerChannel> channels = null;
-            if (Utility.TryGetHostService(scriptHostManager, out IJobHostRpcWorkerChannelManager jobHostLanguageWorkerChannelManager))
+            IEnumerable<WorkerProcessInfo> workerProcesses = null;
+            if (Utility.TryGetHostService(scriptHostManager, out IScriptHostWorkerManager scriptHostWorkerManager))
             {
-                channels = jobHostLanguageWorkerChannelManager.GetChannels(workerRuntime).ToList();
+                workerProcesses = await scriptHostWorkerManager.GetWorkerProcessInfoAsync(workerRuntime);
             }
 
-            var webhostChannelDictionary = webHostLanguageWorkerChannelManager.GetChannels(workerRuntime);
-
-            List<Task<IRpcWorkerChannel>> webHostchannelTasks = new List<Task<IRpcWorkerChannel>>();
-            if (webhostChannelDictionary is not null)
+            foreach (var workerProcess in workerProcesses)
             {
-                foreach (var pair in webhostChannelDictionary)
+                processes.Add(new FunctionProcesses.FunctionProcessInfo()
                 {
-                    var workerChannel = pair.Value.Task;
-                    webHostchannelTasks.Add(workerChannel);
-                }
-            }
-
-            var webHostchannels = await Task.WhenAll(webHostchannelTasks);
-            channels = channels ?? new List<IRpcWorkerChannel>();
-            channels.AddRange(webHostchannels);
-
-            foreach (var channel in channels)
-            {
-                var processInfo = new FunctionProcesses.FunctionProcessInfo()
-                {
-                    ProcessId = channel.WorkerProcess.Process.Id,
-                    ProcessName = channel.WorkerProcess.Process.ProcessName,
-                    DebugEngine = Utility.GetDebugEngineInfo(channel.WorkerConfig, workerRuntime),
+                    ProcessId = workerProcess.ProcessId,
+                    ProcessName = workerProcess.ProcessName,
+                    DebugEngine = workerProcess.DebugEngine,
                     IsEligibleForOpenInBrowser = false
-                };
-                processes.Add(processInfo);
+                });
             }
 
             var functionProcesses = new FunctionProcesses()
@@ -182,8 +173,8 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
 
         [HttpPost]
         [Route("admin/host/drain")]
-        [Authorize(Policy = PolicyNames.AdminAuthLevelOrInternal)]
-        public async Task<IActionResult> Drain([FromServices] IScriptHostManager scriptHostManager)
+        [Authorize(Policy = PolicyNames.AdminAuthLevel)]
+        public async Task<IActionResult> Drain([FromServices] IScriptHostManager scriptHostManager, CancellationToken cancellation)
         {
             _logger.LogDebug("Received request to drain the host");
 
@@ -192,26 +183,35 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
                 return StatusCode(StatusCodes.Status503ServiceUnavailable);
             }
 
-            await _drainSemaphore.WaitAsync();
+            try
+            {
+                await _drainSemaphore.WaitAsync(cancellation);
 
-            // Stop call to some listeners gets stuck, not waiting for the stop call to complete
-            _ = drainModeManager.EnableDrainModeAsync(CancellationToken.None)
-                                .ContinueWith(
-                                    antecedent =>
-                                    {
-                                        if (antecedent.Status == TaskStatus.Faulted)
+                // Stop call to some listeners gets stuck, not waiting for the stop call to complete
+                // We do not pass in this APIs cancellation token as we do not want drain to be aborted once we have the semaphore.
+                _ = drainModeManager.EnableDrainModeAsync(CancellationToken.None)
+                                    .ContinueWith(
+                                        antecedent =>
                                         {
-                                            _logger.LogError(antecedent.Exception, "Something went wrong invoking drain mode");
-                                        }
+                                            if (antecedent.Status == TaskStatus.Faulted)
+                                            {
+                                                _logger.LogError(antecedent.Exception, "Something went wrong invoking drain mode");
+                                            }
 
-                                        _drainSemaphore.Release();
-                                    });
-            return Accepted();
+                                            _drainSemaphore.Release();
+                                        });
+                return Accepted();
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogInformation("Drain request was cancelled");
+                throw;
+            }
         }
 
         [HttpGet]
         [Route("admin/host/drain/status")]
-        [Authorize(Policy = PolicyNames.AdminAuthLevelOrInternal)]
+        [Authorize(Policy = PolicyNames.AdminAuthLevel)]
         public IActionResult DrainStatus([FromServices] IScriptHostManager scriptHostManager)
         {
             if (Utility.TryGetHostService(scriptHostManager, out IFunctionActivityStatusProvider functionActivityStatusProvider) &&
@@ -245,13 +245,21 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
 
         [HttpPost]
         [Route("admin/host/resume")]
-        [Authorize(Policy = PolicyNames.AdminAuthLevelOrInternal)]
-        public async Task<IActionResult> Resume([FromServices] IScriptHostManager scriptHostManager)
+        [Authorize(Policy = PolicyNames.AdminAuthLevel)]
+        public async Task<IActionResult> Resume([FromServices] IScriptHostManager scriptHostManager, CancellationToken cancellation)
         {
             try
             {
-                await _resumeSemaphore.WaitAsync();
+                await _resumeSemaphore.WaitAsync(cancellation);
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogInformation("Resume request was cancelled");
+                throw;
+            }
 
+            try
+            {
                 ScriptHostState currentState = scriptHostManager.State;
 
                 _logger.LogDebug($"Received request to resume a draining host - host status: {currentState.ToString()}");
@@ -268,7 +276,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
                 if (drainModeManager.IsDrainModeEnabled)
                 {
                     _logger.LogDebug("Starting a new host");
-                    await scriptHostManager.RestartHostAsync();
+                    await scriptHostManager.RestartHostAsync("Resuming from drain mode.", CancellationToken.None);
                 }
 
                 var status = new ResumeStatus { State = scriptHostManager.State };
@@ -305,7 +313,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
 
         [HttpPost]
         [Route("admin/host/scale/status")]
-        [Authorize(Policy = PolicyNames.AdminAuthLevelOrInternal)]
+        [Authorize(Policy = PolicyNames.AdminAuthLevel)]
         [ResponseCache(NoStore = true, Location = ResponseCacheLocation.None)]
         [RequiresRunningHost]
         public async Task<IActionResult> GetScaleStatus([FromBody] ScaleStatusContext context, [FromServices] IScriptHostManager scriptHostManager)
@@ -334,7 +342,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
 
         [HttpPost]
         [Route("admin/host/log")]
-        [Authorize(Policy = PolicyNames.AdminAuthLevelOrInternal)]
+        [Authorize(Policy = PolicyNames.AdminAuthLevel)]
         public IActionResult Log([FromBody] IEnumerable<HostLogEntry> logEntries)
         {
             if (logEntries == null)
@@ -385,9 +393,12 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
 
         [HttpPost]
         [Route("admin/host/synctriggers")]
-        [Authorize(Policy = PolicyNames.AdminAuthLevelOrInternal)]
+        [Authorize(Policy = PolicyNames.AdminAuthLevel)]
+        [RequiresRunningHost]
         public async Task<IActionResult> SyncTriggers()
         {
+            _metricsLogger.LogEvent(MetricEventNames.SyncTriggersInvoked);
+
             var result = await _functionsSyncManager.TrySyncTriggersAsync();
 
             // Return a dummy body to make it valid in ARM template action evaluation
@@ -396,13 +407,46 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
                 : StatusCode(StatusCodes.Status500InternalServerError, new { status = result.Error });
         }
 
+        [HttpGet]
+        [Route("admin/host/triggers")]
+        [Authorize(Policy = PolicyNames.AdminAuthLevel)]
+        [ResourceContainsSecrets]
+        [RequiresRunningHost]
+        public async Task<IActionResult> GetTriggers()
+        {
+            _metricsLogger.LogEvent(MetricEventNames.GetTriggersInvoked);
+
+            if (!User.IsFuncPlatform())
+            {
+                return Forbid();
+            }
+
+            var result = await _functionsSyncManager.GetTriggersAsync();
+            return result.Success
+                ? Ok(result)
+                : StatusCode(StatusCodes.Status500InternalServerError, new { status = result.Error });
+        }
+
         [HttpPost]
         [Route("admin/host/restart")]
         [Authorize(Policy = PolicyNames.AdminAuthLevel)]
         public IActionResult Restart([FromServices] IScriptHostManager hostManager)
         {
-            Task ignore = hostManager.RestartHostAsync();
-            return Ok(_applicationHostOptions.Value);
+            Task ignore = hostManager.RestartHostAsync("Restart API called.");
+
+            var hostOptionsValue = _applicationHostOptions.Value;
+            var response = new HostRestartResponse()
+            {
+                IsFileSystemReadOnly = hostOptionsValue.IsFileSystemReadOnly,
+                IsScmRunFromPackage = hostOptionsValue.IsScmRunFromPackage,
+                IsSelfHost = hostOptionsValue.IsSelfHost,
+                HasParentScope = hostOptionsValue.HasParentScope,
+                LogPath = hostOptionsValue.LogPath,
+                ScriptPath = hostOptionsValue.ScriptPath,
+                SecretsPath = hostOptionsValue.SecretsPath
+            };
+
+            return Ok(response);
         }
 
         /// <summary>
@@ -454,8 +498,8 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
             return Accepted();
         }
 
-        [AcceptVerbs("GET", "POST", "DELETE", "OPTIONS")]
-        [Authorize(Policy = PolicyNames.SystemKeyAuthLevel)]
+        [AcceptVerbs("GET", "PUT", "POST", "DELETE", "OPTIONS")]
+        [Authorize(Policy = PolicyNames.ExtensionWebhookInvoke)]
         [Route("runtime/webhooks/{extensionName}/{*extra}")]
         [RequiresRunningHost]
         public async Task<IActionResult> ExtensionWebHookHandler(string extensionName, CancellationToken token, [FromServices] IScriptWebHookProvider provider)
@@ -463,6 +507,15 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
             if (provider.TryGetHandler(extensionName, out HttpHandler handler))
             {
                 var requestMessage = new HttpRequestMessageFeature(this.HttpContext).HttpRequestMessage;
+
+                // If ArmExtensionResourceFilter detected an ARM-bridged request, propagate the
+                // marker into the outgoing HttpRequestMessage so the extension can detect it
+                // (visible via both the modern Options API and the legacy Properties bag).
+                if (HttpContext.Items.TryGetValue(ScriptConstants.AzureFunctionsArmWebhookRequestKey, out object isArmRequest) && isArmRequest is true)
+                {
+                    requestMessage.Options.Set(new HttpRequestOptionsKey<bool>(ScriptConstants.AzureFunctionsArmWebhookRequestKey), true);
+                }
+
                 HttpResponseMessage response = await handler.ConvertAsync(requestMessage, token);
 
                 var result = new ObjectResult(response);
@@ -475,7 +528,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
 
         [HttpGet]
         [Route("admin/host/config")]
-        [Authorize(Policy = PolicyNames.AdminAuthLevelOrInternal)]
+        [Authorize(Policy = PolicyNames.AdminAuthLevel)]
         [RequiresRunningHost]
         public IActionResult GetConfig([FromServices] IScriptHostManager scriptHostManager)
         {

@@ -1,14 +1,13 @@
-﻿using System;
-using System.Linq;
+using System;
 using System.Threading.Tasks;
-using Microsoft.Azure.Storage.Queue;
-using Microsoft.Azure.WebJobs.Script.Models;
 using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.WebJobs.Script.Tests;
 using Xunit;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Storage
 {
+    [Trait(TestTraits.Group, TestTraits.NonE2EStorage)]
     public class StorageEndToEndTests : IClassFixture<StorageEndToEndTests.StorageTestFixture>
     {
         private StorageTestFixture _fixture;
@@ -25,13 +24,15 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Storage
 
             string id = Guid.NewGuid().ToString();
             string messageContent = string.Format("{{ \"id\": \"{0}\" }}", id);
-            CloudQueueMessage message = new CloudQueueMessage(messageContent);
 
-            await _fixture.TestQueue.AddMessageAsync(message);
+            await _fixture.TestQueue.SendMessageAsync(messageContent);
 
-            var resultBlob = _fixture.TestOutputContainer.GetBlockBlobReference(id);
-            string result = await TestHelpers.WaitForBlobAndGetStringAsync(resultBlob);
-            Assert.Equal(TestHelpers.RemoveByteOrderMarkAndWhitespace(messageContent), TestHelpers.RemoveByteOrderMarkAndWhitespace(result));
+            var resultBlob = _fixture.TestOutputContainer.GetBlobClient(id);
+            string expectedContent = TestHelpers.RemoveByteOrderMarkAndWhitespace(messageContent);
+            string result = await TestHelpers.WaitForBlobAndGetStringAsync(
+                resultBlob,
+                content => string.Equals(expectedContent, TestHelpers.RemoveByteOrderMarkAndWhitespace(content), StringComparison.Ordinal));
+            Assert.Equal(expectedContent, TestHelpers.RemoveByteOrderMarkAndWhitespace(result));
         }
 
         public class StorageTestFixture : EndToEndTestFixture

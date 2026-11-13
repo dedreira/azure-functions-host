@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
@@ -8,26 +8,32 @@ using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
+using System.Net.Http.Json;
 using System.Reflection;
 using System.Text;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Xml.Linq;
-using Microsoft.Azure.Storage.Blob;
+using Azure.Storage.Blobs;
 using Microsoft.Azure.WebJobs.Script.Config;
+using Microsoft.Azure.WebJobs.Script.Diagnostics.HealthChecks;
 using Microsoft.Azure.WebJobs.Script.Management.Models;
 using Microsoft.Azure.WebJobs.Script.Models;
 using Microsoft.Azure.WebJobs.Script.WebHost;
 using Microsoft.Azure.WebJobs.Script.WebHost.Authentication;
+using Microsoft.Azure.WebJobs.Script.WebHost.Middleware;
 using Microsoft.Azure.WebJobs.Script.WebHost.Models;
 using Microsoft.Azure.WebJobs.Script.WebHost.Security;
 using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using Microsoft.WebJobs.Script.Tests;
 using Moq;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
-using NuGet.Common;
 using Xunit;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
@@ -48,18 +54,17 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
         [Fact]
         public async Task HostAdminApis_ValidAdminToken_Succeeds()
         {
-            // verify with SWT
+            // token specified as bearer token
             string uri = "admin/host/status";
             HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Get, uri);
-            string token = SimpleWebTokenHelper.CreateToken(DateTime.UtcNow.AddMinutes(1));
-            request.Headers.Add(ScriptConstants.SiteRestrictedTokenHeaderName, token);
+            string token = _fixture.Host.GenerateAdminJwtToken();
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
             HttpResponseMessage response = await _fixture.Host.HttpClient.SendAsync(request);
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
 
-            // verify with JWT
+            // token specified via x-ms-site-token header
             request = new HttpRequestMessage(HttpMethod.Get, uri);
-            token = _fixture.Host.GenerateAdminJwtToken();
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+            request.Headers.Add(ScriptConstants.SiteTokenHeaderName, token);
             response = await _fixture.Host.HttpClient.SendAsync(request);
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         }
@@ -87,27 +92,110 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
             response = await _fixture.Host.HttpClient.SendAsync(request);
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
 
-            // verify that even though a site token grants admin level access to
-            // host APIs, it can't be used to invoke user functions
-            using (new TestScopedEnvironmentVariable(EnvironmentSettingNames.WebSiteAuthEncryptionKey, TestHelpers.GenerateKeyHexString()))
-            {
-                string token = SimpleWebTokenHelper.CreateToken(DateTime.UtcNow.AddMinutes(2));
+            // Verify that even though a platform issued site token grants admin level access to
+            // host APIs, it can't be used to invoke user functions.
+            string token = _fixture.Host.GenerateAdminJwtToken(issuer: ScriptConstants.AppServiceCoreUri);
 
-                // verify the token is valid by invoking an admin API
-                request = new HttpRequestMessage(HttpMethod.Get, "admin/host/status");
-                request.Headers.Add(ScriptConstants.SiteRestrictedTokenHeaderName, token);
-                response = await _fixture.Host.HttpClient.SendAsync(request);
-                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            // verify the token is valid by invoking an admin API
+            request = new HttpRequestMessage(HttpMethod.Get, "admin/host/status");
+            request.Headers.Add(ScriptConstants.SiteTokenHeaderName, token);
+            response = await _fixture.Host.HttpClient.SendAsync(request);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
 
-                // verify it can't be used to invoke user functions
-                request = new HttpRequestMessage(HttpMethod.Get, uri);
-                request.Headers.Add(ScriptConstants.SiteRestrictedTokenHeaderName, token);
-                response = await _fixture.Host.HttpClient.SendAsync(request);
-                Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
-            }
+            // verify it can't be used to invoke user functions
+            request = new HttpRequestMessage(HttpMethod.Get, uri);
+            request.Headers.Add(ScriptConstants.SiteTokenHeaderName, token);
+            response = await _fixture.Host.HttpClient.SendAsync(request);
+            Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
         }
 
         [Fact]
+        public async Task InvokeFunction_RequiresKeyOrNonPlatformToken()
+        {
+            // no key presented
+            string uri = $"api/httptrigger?name=Mathew";
+            HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Get, uri);
+            HttpResponseMessage response = await _fixture.Host.HttpClient.SendAsync(request);
+            Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+
+            // required key supplied
+            request = new HttpRequestMessage(HttpMethod.Get, uri);
+            string key = await _fixture.Host.GetFunctionSecretAsync("httptrigger");
+            request.Headers.Add(AuthenticationLevelHandler.FunctionsKeyHeaderName, key);
+            response = await _fixture.Host.HttpClient.SendAsync(request);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+            // Verify that even though a platform issued site token grants admin level access to
+            // host APIs, it can't be used to invoke user functions.
+            string token = _fixture.Host.GenerateAdminJwtToken(issuer: ScriptConstants.AppServiceCoreUri);
+
+            // verify the token is valid by invoking an admin API
+            request = new HttpRequestMessage(HttpMethod.Get, "admin/host/status");
+            request.Headers.Add(ScriptConstants.SiteTokenHeaderName, token);
+            response = await _fixture.Host.HttpClient.SendAsync(request);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+            // verify platform JWT token can't be used to invoke non-anonymous user functions
+            request = new HttpRequestMessage(HttpMethod.Get, uri);
+            request.Headers.Add(ScriptConstants.SiteTokenHeaderName, token);
+            response = await _fixture.Host.HttpClient.SendAsync(request);
+            Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+
+            // verify non-platform JWT token CAN be used to invoke non-anonymous user functions
+            token = _fixture.Host.GenerateAdminJwtToken();
+            request = new HttpRequestMessage(HttpMethod.Get, uri);
+            request.Headers.Add(ScriptConstants.SiteTokenHeaderName, token);
+            response = await _fixture.Host.HttpClient.SendAsync(request);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        }
+
+        [Fact]
+        public async Task InvokeFunction_AdminInvokeApi_Succeeds()
+        {
+            string functionName = "HttpTrigger";
+
+            // jwt token with site issuer
+            var response = await AdminInvokeFunctionAdminToken(functionName);
+            Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+
+            // jwt token with platform issuer
+            response = await AdminInvokeFunctionAdminToken(functionName, issuer: ScriptConstants.AppServiceCoreUri);
+            Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        }
+
+        [Fact]
+        [Trait(TestTraits.Group, TestTraits.WebhookTests)]
+        public async Task ExtensionWebHook_AuthorizationLevelOverride_Succeeds()
+        {
+            // configure a mock webhook handler for the "test2" extension
+            // for which we've overridden the auth level to "Anonymous"
+            Mock<IAsyncConverter<HttpRequestMessage, HttpResponseMessage>> mockHandler = new Mock<IAsyncConverter<HttpRequestMessage, HttpResponseMessage>>(MockBehavior.Strict);
+            mockHandler.Setup(p => p.ConvertAsync(It.IsAny<HttpRequestMessage>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(() => new HttpResponseMessage(HttpStatusCode.OK));
+            var handler = mockHandler.Object;
+            _fixture.MockWebHookProvider.Setup(p => p.TryGetHandler("test2", out handler)).Returns(true);
+
+            // Verify that if the valid system key is specified, the request succeeds
+            string uri = "runtime/webhooks/test2?code=SystemValue4";
+            HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Get, uri);
+            HttpResponseMessage response = await _fixture.Host.HttpClient.SendAsync(request);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+            // Verify that if an invalid system key is specified, the request also succeeds, since auth is not required
+            uri = "runtime/webhooks/test2?code=invalid";
+            request = new HttpRequestMessage(HttpMethod.Get, uri);
+            response = await _fixture.Host.HttpClient.SendAsync(request);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+            // No key provided, the request succeeds
+            uri = "runtime/webhooks/test2";
+            request = new HttpRequestMessage(HttpMethod.Get, uri);
+            response = await _fixture.Host.HttpClient.SendAsync(request);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        }
+
+        [Fact]
+        [Trait(TestTraits.Group, TestTraits.WebhookTests)]
         public async Task ExtensionWebHook_Succeeds()
         {
             // configure a mock webhook handler for the "test" extension
@@ -118,11 +206,18 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
             _fixture.MockWebHookProvider.Setup(p => p.TryGetHandler("test", out handler)).Returns(true);
             _fixture.MockWebHookProvider.Setup(p => p.TryGetHandler("invalid", out handler)).Returns(false);
 
-            // successful request
+            // successful request for all supported verbs
             string uri = "runtime/webhooks/test?code=SystemValue3";
-            HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, uri);
-            HttpResponseMessage response = await _fixture.Host.HttpClient.SendAsync(request);
-            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            HttpRequestMessage request = null;
+            HttpResponseMessage response = null;
+            var httpMethods = new HttpMethod[] { HttpMethod.Get, HttpMethod.Put, HttpMethod.Post, HttpMethod.Delete, HttpMethod.Options };
+            foreach (var httpMethod in httpMethods)
+            {
+                uri = "runtime/webhooks/test?code=SystemValue3";
+                request = new HttpRequestMessage(httpMethod, uri);
+                response = await _fixture.Host.HttpClient.SendAsync(request);
+                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            }
 
             // invalid system key value - no key match
             uri = "runtime/webhooks/test?code=invalid";
@@ -151,24 +246,33 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
 
         [Theory]
         [Trait(TestTraits.Group, TestTraits.AdminIsolationTests)]
-        [InlineData("admin/host/status", true, true, false, false, true, HttpStatusCode.Forbidden)]
-        [InlineData("admin/host/status", true, true, true, false, false, HttpStatusCode.Unauthorized)]
-        [InlineData("admin/host/status", true, true, true, true, true, HttpStatusCode.OK)]
-        [InlineData("admin/host/status", true, false, false, false, true, HttpStatusCode.OK)]
-        [InlineData("admin/host/status", true, false, false, true, true, HttpStatusCode.OK)]
-        [InlineData("admin/host/status", true, true, true, false, true, HttpStatusCode.OK)]
-        [InlineData("admin/host/status", false, true, false, true, true, HttpStatusCode.Forbidden)]
-        [InlineData("admin/host/extensionBundle/v1/templates", true, true, false, true, false, HttpStatusCode.Unauthorized)]
-        [InlineData("admin/host/extensionBundle/v1/templates", true, true, true, false, true, HttpStatusCode.NotFound)]
-        [InlineData("admin/host/extensionBundle/v1/templates", true, false, false, false, true, HttpStatusCode.NotFound)]
-        [InlineData("admin/host/extensionBundle/v1/templates", true, true, false, true, true, HttpStatusCode.Forbidden)]
-        [InlineData("admin/vfs/host.json", true, true, true, false, true, HttpStatusCode.OK)]
-        [InlineData("admin/vfs/host.json", true, true, false, false, true, HttpStatusCode.Unauthorized)]
-        [InlineData("admin/vfs/host.json", true, true, true, false, false, HttpStatusCode.Unauthorized)]
-        public async Task AdminIsolation_ReturnsExpectedStatus(string uri, bool isAppService, bool enableIsolation, bool isPlatformInternal, bool bypassFE, bool addAuthKey, HttpStatusCode expectedStatus)
+        [InlineData("admin/host/status", ScriptConstants.DynamicSku, "1", true, false, false, true, HttpStatusCode.Forbidden)]
+        [InlineData("admin/host/status", ScriptConstants.DynamicSku, "1", true, true, false, false, HttpStatusCode.Unauthorized)]
+        [InlineData("admin/host/status", ScriptConstants.DynamicSku, "1", true, true, true, true, HttpStatusCode.OK)]
+        [InlineData("admin/host/status", ScriptConstants.DynamicSku, "1", false, false, false, true, HttpStatusCode.OK)]
+        [InlineData("admin/host/status", ScriptConstants.DynamicSku, "1", false, false, true, true, HttpStatusCode.OK)]
+        [InlineData("admin/host/status", ScriptConstants.DynamicSku, "1", true, true, false, true, HttpStatusCode.OK)]
+        [InlineData("admin/host/status", ScriptConstants.DynamicSku, null, true, false, true, true, HttpStatusCode.Forbidden)]
+        [InlineData("admin/host/extensionBundle/v1/templates", ScriptConstants.DynamicSku, "1", true, false, true, false, HttpStatusCode.Unauthorized)]
+        [InlineData("admin/host/extensionBundle/v1/templates", ScriptConstants.DynamicSku, "1", true, true, false, true, HttpStatusCode.NotFound)]
+        [InlineData("admin/host/extensionBundle/v1/templates", ScriptConstants.DynamicSku, "1", false, false, false, true, HttpStatusCode.NotFound)]
+        [InlineData("admin/host/extensionBundle/v1/templates", ScriptConstants.DynamicSku, "1", true, false, true, true, HttpStatusCode.NotFound)]
+        [InlineData("admin/vfs/host.json", ScriptConstants.DynamicSku, "1", true, true, false, true, HttpStatusCode.OK)]
+        [InlineData("admin/vfs/host.json", ScriptConstants.DynamicSku, "1", true, false, false, true, HttpStatusCode.Unauthorized)]
+        [InlineData("admin/vfs/host.json", ScriptConstants.DynamicSku, "1", true, true, false, false, HttpStatusCode.Unauthorized)]
+        [InlineData("admin/host/status", ScriptConstants.FlexConsumptionSku, null, true, true, false, true, HttpStatusCode.OK)]
+        [InlineData("admin/host/status", ScriptConstants.FlexConsumptionSku, null, true, false, true, true, HttpStatusCode.OK)]
+        [InlineData("admin/host/status", ScriptConstants.FlexConsumptionSku, null, true, false, false, true, HttpStatusCode.Forbidden)]
+        [InlineData("admin/host/status", ScriptConstants.FlexConsumptionSku, null, true, false, true, false, HttpStatusCode.Unauthorized)]
+        public async Task AdminIsolation_ReturnsExpectedStatus(string uri, string sku, string websiteInstanceId, bool enableIsolation, bool isPlatformInternal, bool bypassFE, bool addAuthKey, HttpStatusCode expectedStatus)
         {
             var environment = this._fixture.Host.WebHostServices.GetService<IEnvironment>();
-            string websiteInstanceId = environment.GetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteInstanceId);
+            string originalWebsiteInstanceId = environment.GetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteInstanceId);
+            string originalWebsiteSku = environment.GetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteSku);
+            string originalAdminIsolationEnabled = environment.GetEnvironmentVariable(EnvironmentSettingNames.FunctionsAdminIsolationEnabled);
+
+            environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteSku, sku);
+            environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteInstanceId, websiteInstanceId);
 
             try
             {
@@ -176,16 +280,6 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
                 {
                     environment.SetEnvironmentVariable(EnvironmentSettingNames.FunctionsAdminIsolationEnabled, "1");
                     Assert.True(environment.IsAdminIsolationEnabled());
-                }
-
-                if (!isAppService)
-                {
-                    environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteInstanceId, null);
-                    Assert.False(environment.IsAppService());
-                }
-                else
-                {
-                    Assert.True(environment.IsAppService());
                 }
 
                 HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Get, uri);
@@ -213,8 +307,96 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
             }
             finally
             {
-                environment.SetEnvironmentVariable(EnvironmentSettingNames.FunctionsAdminIsolationEnabled, null);
-                environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteInstanceId, websiteInstanceId);
+                environment.SetEnvironmentVariable(EnvironmentSettingNames.FunctionsAdminIsolationEnabled, originalAdminIsolationEnabled);
+                environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteInstanceId, originalWebsiteInstanceId);
+                environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteSku, originalWebsiteSku);
+            }
+        }
+
+        public enum SyncTriggersAuthMode
+        {
+            None,
+            ScmSiteToken,
+            NonScmSiteToken,
+            MasterKey
+        }
+
+        [Theory]
+        [Trait(TestTraits.Group, TestTraits.AdminIsolationTests)]
+        // The fix: isolation enabled, request routed through the Front End, authenticated with an SCM (Kudu)
+        // site token. The synctriggers exemption applies and the request succeeds where other admin endpoints would 403.
+        [InlineData(true, false, false, SyncTriggersAuthMode.ScmSiteToken, HttpStatusCode.OK)]
+        // The exemption is scoped to the SCM caller: a valid but non-SCM admin token is still rejected under isolation.
+        [InlineData(true, false, false, SyncTriggersAuthMode.NonScmSiteToken, HttpStatusCode.Forbidden)]
+        // A leaked master key is likewise still rejected under isolation - the exemption does not open the endpoint to it.
+        [InlineData(true, false, false, SyncTriggersAuthMode.MasterKey, HttpStatusCode.Forbidden)]
+        // The exemption does not bypass authentication - a request with no credentials is still rejected.
+        [InlineData(true, false, false, SyncTriggersAuthMode.None, HttpStatusCode.Unauthorized)]
+        // Existing isolation allowances are unaffected: platform-internal callers still succeed.
+        [InlineData(true, true, false, SyncTriggersAuthMode.MasterKey, HttpStatusCode.OK)]
+        // Existing isolation allowances are unaffected: AppService-internal (Front End bypassed) callers still succeed.
+        [InlineData(true, false, true, SyncTriggersAuthMode.MasterKey, HttpStatusCode.OK)]
+        // With isolation disabled, behavior is unchanged from today for both master key and SCM token callers.
+        [InlineData(false, false, false, SyncTriggersAuthMode.MasterKey, HttpStatusCode.OK)]
+        [InlineData(false, false, false, SyncTriggersAuthMode.ScmSiteToken, HttpStatusCode.OK)]
+        public async Task SyncTriggers_AdminIsolation_ReturnsExpectedStatus(bool enableIsolation, bool isPlatformInternal, bool bypassFE, SyncTriggersAuthMode authMode, HttpStatusCode expectedStatus)
+        {
+            var environment = _fixture.Host.WebHostServices.GetService<IEnvironment>();
+            string originalWebsiteInstanceId = environment.GetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteInstanceId);
+            string originalWebsiteSku = environment.GetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteSku);
+            string originalAdminIsolationEnabled = environment.GetEnvironmentVariable(EnvironmentSettingNames.FunctionsAdminIsolationEnabled);
+
+            environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteSku, ScriptConstants.DynamicSku);
+            environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteInstanceId, "1");
+
+            try
+            {
+                if (enableIsolation)
+                {
+                    environment.SetEnvironmentVariable(EnvironmentSettingNames.FunctionsAdminIsolationEnabled, "1");
+                    Assert.True(environment.IsAdminIsolationEnabled());
+                }
+
+                HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, "admin/host/synctriggers");
+
+                switch (authMode)
+                {
+                    case SyncTriggersAuthMode.ScmSiteToken:
+                        // Token issued by the SCM (Kudu) site - this is what unlocks the synctriggers isolation exemption.
+                        request.Headers.Add(ScriptConstants.SiteTokenHeaderName, _fixture.Host.GenerateAdminJwtToken());
+                        break;
+                    case SyncTriggersAuthMode.NonScmSiteToken:
+                        // Valid admin token, but issued by a non-SCM issuer, so the exemption must not apply.
+                        request.Headers.Add(ScriptConstants.SiteTokenHeaderName, _fixture.Host.GenerateAdminJwtToken(issuer: ScriptConstants.AppServiceCoreUri));
+                        break;
+                    case SyncTriggersAuthMode.MasterKey:
+                        request.Headers.Add(AuthenticationLevelHandler.FunctionsKeyHeaderName, await _fixture.Host.GetMasterKeyAsync());
+                        break;
+                    case SyncTriggersAuthMode.None:
+                        break;
+                }
+
+                if (isPlatformInternal)
+                {
+                    request.Headers.Add(ScriptConstants.AntaresPlatformInternal, "True");
+                }
+
+                if (!bypassFE)
+                {
+                    request.Headers.Add(ScriptConstants.AntaresLogIdHeaderName, Guid.NewGuid().ToString());
+                }
+
+                using (var httpClient = _fixture.Host.CreateHttpClient())
+                {
+                    HttpResponseMessage response = await httpClient.SendAsync(request);
+                    Assert.Equal(expectedStatus, response.StatusCode);
+                }
+            }
+            finally
+            {
+                environment.SetEnvironmentVariable(EnvironmentSettingNames.FunctionsAdminIsolationEnabled, originalAdminIsolationEnabled);
+                environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteInstanceId, originalWebsiteInstanceId);
+                environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteSku, originalWebsiteSku);
             }
         }
 
@@ -255,6 +437,87 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
             var cacheHeader = response.Headers.GetValues("Cache-Control").Single();
             Assert.Equal("no-store, no-cache", cacheHeader);
+        }
+
+        [Theory]
+        [InlineData("/admin/health")]
+        [InlineData("/admin/health/live")]
+        [InlineData("/admin/health/ready")]
+        public async Task HealthCheck_AdminToken_Succeeds(string uri)
+        {
+            // token specified as bearer token
+            HttpRequestMessage request = new(HttpMethod.Get, uri);
+            string token = _fixture.Host.GenerateAdminJwtToken();
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+            HttpResponseMessage response = await _fixture.Host.HttpClient.SendAsync(request);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+            string body = await response.Content.ReadAsStringAsync();
+            Assert.Equal("{\"status\":\"Healthy\"}", body);
+        }
+
+        [Theory]
+        [InlineData("/admin/health")]
+        [InlineData("/admin/health/live")]
+        [InlineData("/admin/health/ready")]
+        public async Task HealthCheck_NoToken_Succeeds(string uri)
+        {
+            // token specified as bearer token
+            HttpRequestMessage request = new(HttpMethod.Get, uri);
+            HttpResponseMessage response = await _fixture.Host.HttpClient.SendAsync(request);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+            string body = await response.Content.ReadAsStringAsync();
+            Assert.Equal("{\"status\":\"Healthy\"}", body);
+        }
+
+        [Theory]
+        [InlineData("/admin/health?expand=true", null)]
+        [InlineData("/admin/health/live?expand=true", HealthCheckTags.Liveness)]
+        [InlineData("/admin/health/ready?expand=true", HealthCheckTags.Readiness)]
+        public async Task HealthCheck_AdminToken_ExpandSucceeds(string uri, string tag)
+        {
+            // token specified as bearer token
+            HttpRequestMessage request = new(HttpMethod.Get, uri);
+            string token = _fixture.Host.GenerateAdminJwtToken();
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+            HttpResponseMessage response = await _fixture.Host.HttpClient.SendAsync(request);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+            // Not doing a deep validation of the response, just ensuring we get the correct tags.
+            // The full response body is validated in other tests.
+            using Stream stream = await response.Content.ReadAsStreamAsync();
+            JsonDocument json = await JsonDocument.ParseAsync(stream);
+            JsonElement entries = json.RootElement.GetProperty("entries");
+
+            if (string.IsNullOrEmpty(tag))
+            {
+                Assert.NotEmpty(entries.EnumerateObject());
+            }
+            else
+            {
+                bool atLeastOne = false;
+                foreach (JsonProperty entry in entries.EnumerateObject())
+                {
+                    atLeastOne = true;
+                    HashSet<string> tags = entry.Value.GetProperty("tags").Deserialize<HashSet<string>>();
+                    Assert.Contains(tag, tags);
+                }
+
+                Assert.True(atLeastOne, "Expected at least one entry to have the specified tag.");
+            }
+        }
+
+        [Theory]
+        [InlineData("/admin/health?expand=true")]
+        [InlineData("/admin/health/live?expand=true")]
+        [InlineData("/admin/health/ready?expand=true")]
+        public async Task HealthCheck_NoAdminToken_Fail(string uri)
+        {
+            // token specified as bearer token
+            HttpRequestMessage request = new(HttpMethod.Get, uri);
+            HttpResponseMessage response = await _fixture.Host.HttpClient.SendAsync(request);
+            Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
         }
 
         [Fact]
@@ -391,19 +654,21 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
         }
 
         [Fact]
-        public async Task SyncTriggers_InternalAuth_Succeeds()
+        public async Task SyncTriggers_AdminTokenProvided_Succeeds()
         {
             using (var httpClient = _fixture.Host.CreateHttpClient())
             {
                 string uri = "admin/host/synctriggers";
+                string token = _fixture.Host.GenerateAdminJwtToken(issuer: ScriptConstants.AppServiceCoreUri);
                 HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, uri);
+                request.Headers.Add(ScriptConstants.SiteTokenHeaderName, token);
                 HttpResponseMessage response = await httpClient.SendAsync(request);
                 Assert.Equal(HttpStatusCode.OK, response.StatusCode);
             }
         }
 
         [Fact]
-        public async Task SyncTriggers_ExternalUnauthorized_ReturnsUnauthorized()
+        public async Task SyncTriggers_NoAuthentication_ReturnsUnauthorized()
         {
             string uri = "admin/host/synctriggers";
             HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, uri);
@@ -412,7 +677,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
         }
 
         [Fact]
-        public async Task SyncTriggers_AdminLevel_Succeeds()
+        public async Task SyncTriggers_MasterKeyProvided_Succeeds()
         {
             string uri = "admin/host/synctriggers";
             HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, uri);
@@ -432,29 +697,12 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
         }
 
         [Fact]
-        public async Task HostLog_PlatformInternal_Succeeds()
-        {
-            var environment = _fixture.Host.JobHostServices.GetService<IEnvironment>();
-            Assert.True(environment.IsAppService());
-
-            using (var httpClient = _fixture.Host.CreateHttpClient())
-            {
-                // no x-arr-log-id header makes this request platform internal
-                var request = new HttpRequestMessage(HttpMethod.Post, "admin/host/log");
-                request.Content = new StringContent("[]");
-                request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
-                var response = await httpClient.SendAsync(request);
-                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-            }
-        }
-
-        [Fact]
         public async Task HostLog_AdminLevel_Succeeds()
         {
             var request = new HttpRequestMessage(HttpMethod.Post, "admin/host/log");
             request.Headers.Add(AuthenticationLevelHandler.FunctionsKeyHeaderName, await _fixture.Host.GetMasterKeyAsync());
-            var logs = new HostLogEntry[]
-            {
+            HostLogEntry[] logs =
+            [
                 new HostLogEntry
                 {
                     Level = System.Diagnostics.TraceLevel.Verbose,
@@ -480,13 +728,9 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
                     FunctionName = "TestFunction",
                     Message = string.Format("Test Error log {0}", Guid.NewGuid().ToString())
                 }
-            };
-            var serializer = new JsonSerializer();
-            var writer = new StringWriter();
-            serializer.Serialize(writer, logs);
-            var json = writer.ToString();
-            request.Content = new StringContent(json);
-            request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+            ];
+
+            request.Content = JsonContent.Create(logs);
 
             var response = await _fixture.Host.HttpClient.SendAsync(request);
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
@@ -496,7 +740,9 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
             var hostLogs = _fixture.Host.GetScriptHostLogMessages();
             foreach (var expectedLog in logs.Select(p => p.Message))
             {
-                Assert.Equal(1, hostLogs.Count(p => p.FormattedMessage != null && p.FormattedMessage.Contains(expectedLog)));
+                Assert.True(
+                    1 == hostLogs.Count(p => p.FormattedMessage != null && p.FormattedMessage.Contains(expectedLog)),
+                    $"Expected log message '{expectedLog}' not found. Log count: {hostLogs.Count}");
             }
         }
 
@@ -621,7 +867,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
             await VerifyOfflineResponse(response);
 
             // verify the same thing when invoking via admin api
-            response = await AdminInvokeFunction(functionName);
+            response = await AdminInvokeFunctionMasterKey(functionName);
             await VerifyOfflineResponse(response);
 
             // bring host back online
@@ -629,14 +875,14 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
 
             await AwaitHostStateAsync(ScriptHostState.Running);
 
-            // need to reinitialize TestFunctionHost to reset IApplicationLifetime
+            // need to reinitialize TestFunctionHost to reset IHostApplicationLifetime
             await _fixture.InitializeAsync();
 
             // verify functions can be invoked
             await SamplesTestHelpers.InvokeAndValidateHttpTrigger(_fixture, functionName);
 
             // verify the same thing via admin api
-            response = await AdminInvokeFunction(functionName);
+            response = await AdminInvokeFunctionMasterKey(functionName);
             Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
         }
 
@@ -678,7 +924,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
             var response = await _fixture.Host.HttpClient.SendAsync(request);
             var metadata = (await response.Content.ReadAsAsync<IEnumerable<FunctionMetadataResponse>>()).ToArray();
 
-            Assert.Equal(18, metadata.Length);
+            Assert.Equal(19, metadata.Length);
             var function = metadata.Single(p => p.Name == "HttpTrigger-CustomRoute");
             Assert.Equal("https://somewebsite.azurewebsites.net/api/csharp/products/{category:alpha?}/{id:int?}/{extra?}", function.InvokeUrlTemplate.ToString());
 
@@ -727,15 +973,15 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
         {
             var vars = new Dictionary<string, string>
             {
-                { RpcWorkerConstants.FunctionWorkerRuntimeSettingName, RpcWorkerConstants.DotNetLanguageWorkerName}
+                { EnvironmentSettingNames.FunctionWorkerRuntime, RpcWorkerConstants.DotNetLanguageWorkerName }
             };
             using (_fixture.Host.WebHostServices.CreateScopedEnvironment(vars))
             {
-                CloudBlobContainer outputContainer = _fixture.BlobClient.GetContainerReference("samples-output");
+                var outputContainer = _fixture.BlobServiceClient.GetBlobContainerClient("samples-output");
                 string inId = Guid.NewGuid().ToString();
                 string outId = Guid.NewGuid().ToString();
-                CloudBlockBlob statusBlob = outputContainer.GetBlockBlobReference(inId);
-                await statusBlob.UploadTextAsync("Hello C#!");
+                var statusBlob = outputContainer.GetBlobClient(inId);
+                await statusBlob.UploadAsync(BinaryData.FromString("Hello C#!"));
 
                 JObject input = new JObject()
             {
@@ -746,8 +992,10 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
                 await _fixture.Host.BeginFunctionAsync("manualtrigger", input);
 
                 // wait for completion
-                CloudBlockBlob outputBlob = outputContainer.GetBlockBlobReference(outId);
-                string result = await TestHelpers.WaitForBlobAndGetStringAsync(outputBlob);
+                var outputBlob = outputContainer.GetBlobClient(outId);
+                string result = await TestHelpers.WaitForBlobAndGetStringAsync(
+                    outputBlob,
+                    content => string.Equals("Hello C#!", Utility.RemoveUtf8ByteOrderMark(content), StringComparison.Ordinal));
                 Assert.Equal("Hello C#!", Utility.RemoveUtf8ByteOrderMark(result));
             }
         }
@@ -758,7 +1006,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
         {
             var vars = new Dictionary<string, string>
             {
-                { RpcWorkerConstants.FunctionWorkerRuntimeSettingName, RpcWorkerConstants.DotNetLanguageWorkerName}
+                { EnvironmentSettingNames.FunctionWorkerRuntime, RpcWorkerConstants.DotNetLanguageWorkerName }
             };
             using (_fixture.Host.WebHostServices.CreateScopedEnvironment(vars))
             {
@@ -782,9 +1030,11 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
                 Assert.Equal(HttpStatusCode.OK, response.StatusCode);
 
                 // wait for function to execute and produce its result blob
-                CloudBlobContainer outputContainer = _fixture.BlobClient.GetContainerReference("samples-output");
-                CloudBlockBlob outputBlob = outputContainer.GetBlockBlobReference(id);
-                string result = await TestHelpers.WaitForBlobAndGetStringAsync(outputBlob);
+                var outputContainer = _fixture.BlobServiceClient.GetBlobContainerClient("samples-output");
+                var outputBlob = outputContainer.GetBlobClient(id);
+                string result = await TestHelpers.WaitForBlobAndGetStringAsync(
+                    outputBlob,
+                    content => string.Equals("Testing", TestHelpers.RemoveByteOrderMarkAndWhitespace(content), StringComparison.Ordinal));
 
                 Assert.Equal("Testing", TestHelpers.RemoveByteOrderMarkAndWhitespace(result));
             }
@@ -797,11 +1047,76 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
         }
 
         [Fact]
+        public async Task HttpTrigger_CorrelationIDsAreLogged()
+        {
+            string functionKey = await _fixture.Host.GetFunctionSecretAsync("HttpTrigger");
+
+            string requestId = Guid.NewGuid().ToString();
+
+            _fixture.Host.ClearLogMessages();
+            _fixture.EventGenerator.ClearEvents();
+
+            string uri = $"api/HttpTrigger?code={functionKey}&name=Mathew";
+            HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Get, uri);
+            request.Headers.Add(ScriptConstants.AntaresLogIdHeaderName, requestId);
+            request.Headers.Add("User-Agent", new string[] { "TestAgent" });
+
+            HttpResponseMessage response = await _fixture.Host.HttpClient.SendAsync(request);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+            var webHostLogs = _fixture.Host.GetWebHostLogMessages();
+            var httpTraceLogs = webHostLogs.Where(p => p.Category == typeof(SystemTraceMiddleware).FullName).ToList();
+            Assert.Equal(2, httpTraceLogs.Count);
+
+            // validate executing trace
+            var log = httpTraceLogs[0];
+            Assert.Equal(typeof(SystemTraceMiddleware).FullName, log.Category);
+            Assert.Equal(LogLevel.Information, log.Level);
+            var idx = log.FormattedMessage.IndexOf(':');
+            var message = log.FormattedMessage.Substring(0, idx).Trim();
+            Assert.Equal("Executing HTTP request", message);
+            var details = log.FormattedMessage.Substring(idx + 1).Trim();
+            var jo = JObject.Parse(details);
+            Assert.Equal(2, jo.Count);
+            Assert.Equal(requestId, jo["requestId"]);
+            Assert.Equal("GET", jo["method"]);
+
+            // validate executed trace
+            log = httpTraceLogs[1];
+            Assert.Equal(typeof(SystemTraceMiddleware).FullName, log.Category);
+            Assert.Equal(LogLevel.Information, log.Level);
+            idx = log.FormattedMessage.IndexOf(':');
+            message = log.FormattedMessage.Substring(0, idx).Trim();
+            Assert.Equal("Executed HTTP request", message);
+            details = log.FormattedMessage.Substring(idx + 1).Trim();
+            jo = JObject.Parse(details);
+            Assert.Equal(5, jo.Count);
+            Assert.Equal(requestId, (string)jo["requestId"]);
+            Assert.Equal(200, jo["status"]);
+            Assert.Equal("api/HttpTrigger", (string)jo["route"]);
+            var duration = (long)jo["duration"];
+            Assert.True(duration >= 0);
+
+            // determine the function invocation ID
+            var scriptHostLogs = _fixture.Host.GetScriptHostLogMessages();
+            var functionInvocationStartingLog = scriptHostLogs.Single(p => p.EventId.Name == "FunctionStarted");
+            string functionInvocationId = (string)functionInvocationStartingLog.Scope[ScriptConstants.LogPropertyFunctionInvocationIdKey];
+
+            // verify we've stamped the function invocation logs with the Activity ID (i.e. the Request ID)
+            // and invocation ID
+            var traceEvents = _fixture.EventGenerator.GetFunctionTraceEvents();
+            var httpTraceEvents = traceEvents.Where(p => p.Source == "Function.HttpTrigger").ToArray();
+            Assert.Equal(2, httpTraceEvents.Length);
+            Assert.All(httpTraceEvents, p => Assert.Equal(requestId, p.ActivityId));
+            Assert.All(httpTraceEvents, p => Assert.Equal(functionInvocationId, p.FunctionInvocationId));
+        }
+
+        [Fact]
         public async Task Legacy_RequestTypes_Succeed()
         {
             var vars = new Dictionary<string, string>
             {
-                { RpcWorkerConstants.FunctionWorkerRuntimeSettingName, RpcWorkerConstants.DotNetLanguageWorkerName}
+                { EnvironmentSettingNames.FunctionWorkerRuntime, RpcWorkerConstants.DotNetLanguageWorkerName }
             };
             using (_fixture.Host.WebHostServices.CreateScopedEnvironment(vars))
             {
@@ -823,7 +1138,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
         {
             var vars = new Dictionary<string, string>
             {
-                { RpcWorkerConstants.FunctionWorkerRuntimeSettingName, RpcWorkerConstants.DotNetLanguageWorkerName}
+                { EnvironmentSettingNames.FunctionWorkerRuntime, RpcWorkerConstants.DotNetLanguageWorkerName }
             };
             using (_fixture.Host.WebHostServices.CreateScopedEnvironment(vars))
             {
@@ -836,16 +1151,28 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
                 Assert.Equal(HttpStatusCode.OK, response.StatusCode);
 
                 // wait for function to execute and produce its result blob
-                CloudBlobContainer outputContainer = _fixture.BlobClient.GetContainerReference("samples-output");
-                CloudBlockBlob outputBlob = outputContainer.GetBlockBlobReference(id);
-                string result = await TestHelpers.WaitForBlobAndGetStringAsync(outputBlob);
+                var outputContainer = _fixture.BlobServiceClient.GetBlobContainerClient("samples-output");
+                var outputBlob = outputContainer.GetBlobClient(id);
+                string result = await TestHelpers.WaitForBlobAndGetStringAsync(
+                    outputBlob,
+                    content => string.Equals("Testing", TestHelpers.RemoveByteOrderMarkAndWhitespace(content), StringComparison.Ordinal));
 
                 Assert.Equal("Testing", TestHelpers.RemoveByteOrderMarkAndWhitespace(result));
             }
         }
 
+        [Fact]
+        public async Task HttpTrigger_Anonymous_Get_Succeeds()
+        {
+            string uri = $"api/httptrigger-anonymouslevel?name=Mathew";
+            HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Get, uri);
+
+            HttpResponseMessage response = await _fixture.Host.HttpClient.SendAsync(request);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        }
+
         // invoke a function via the admin invoke api
-        private async Task<HttpResponseMessage> AdminInvokeFunction(string functionName, string input = null)
+        private async Task<HttpResponseMessage> AdminInvokeFunctionMasterKey(string functionName, string input = null)
         {
             string masterKey = await _fixture.Host.GetMasterKeyAsync();
             string uri = $"admin/functions/{functionName}?code={masterKey}";
@@ -859,6 +1186,23 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
             return await _fixture.Host.HttpClient.SendAsync(request);
         }
 
+        private async Task<HttpResponseMessage> AdminInvokeFunctionAdminToken(string functionName, string input = null, string issuer = null)
+        {
+            string uri = $"admin/functions/{functionName}";
+            HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, uri);
+            JObject jo = new JObject
+            {
+                { "input", input }
+            };
+            request.Content = new StringContent(jo.ToString());
+            request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+
+            string jwtToken = _fixture.Host.GenerateAdminJwtToken(issuer: issuer);
+            request.Headers.Add(ScriptConstants.SiteTokenHeaderName, jwtToken);
+
+            return await _fixture.Host.HttpClient.SendAsync(request);
+        }
+
         [Fact]
         [Trait(TestTraits.Group, TestTraits.AdminIsolationTests)]
         public async Task HttpTrigger_AdminLevel_AdminIsolationEnabled_Succeeds()
@@ -867,7 +1211,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
 
             var vars = new Dictionary<string, string>
             {
-                { RpcWorkerConstants.FunctionWorkerRuntimeSettingName, RpcWorkerConstants.DotNetLanguageWorkerName},
+                { EnvironmentSettingNames.FunctionWorkerRuntime, RpcWorkerConstants.DotNetLanguageWorkerName },
                 { EnvironmentSettingNames.FunctionsAdminIsolationEnabled, "1" }
             };
             using (_fixture.Host.WebHostServices.CreateScopedEnvironment(vars))
@@ -905,11 +1249,11 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
         {
             var vars = new Dictionary<string, string>
             {
-                { RpcWorkerConstants.FunctionWorkerRuntimeSettingName, RpcWorkerConstants.DotNetLanguageWorkerName}
+                { EnvironmentSettingNames.FunctionWorkerRuntime, RpcWorkerConstants.DotNetLanguageWorkerName }
             };
             using (_fixture.Host.WebHostServices.CreateScopedEnvironment(vars))
             {
-                Environment.SetEnvironmentVariable(RpcWorkerConstants.FunctionWorkerRuntimeSettingName, RpcWorkerConstants.DotNetLanguageWorkerName);
+                Environment.SetEnvironmentVariable(EnvironmentSettingNames.FunctionWorkerRuntime, RpcWorkerConstants.DotNetLanguageWorkerName);
                 string functionKey = await _fixture.Host.GetFunctionSecretAsync("httptrigger");
                 string uri = $"api/httptrigger?code={functionKey}&name=Mathew&name=Amy";
                 HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Get, uri);
@@ -928,7 +1272,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
         {
             var vars = new Dictionary<string, string>
             {
-                { RpcWorkerConstants.FunctionWorkerRuntimeSettingName, RpcWorkerConstants.DotNetLanguageWorkerName}
+                { EnvironmentSettingNames.FunctionWorkerRuntime, RpcWorkerConstants.DotNetLanguageWorkerName }
             };
             using (_fixture.Host.WebHostServices.CreateScopedEnvironment(vars))
             {
@@ -993,7 +1337,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
         {
             var vars = new Dictionary<string, string>
             {
-                { RpcWorkerConstants.FunctionWorkerRuntimeSettingName, RpcWorkerConstants.DotNetLanguageWorkerName}
+                { EnvironmentSettingNames.FunctionWorkerRuntime, RpcWorkerConstants.DotNetLanguageWorkerName }
             };
             using (_fixture.Host.WebHostServices.CreateScopedEnvironment(vars))
             {
@@ -1019,8 +1363,8 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
         {
             var vars = new Dictionary<string, string>
             {
-                { RpcWorkerConstants.FunctionWorkerRuntimeSettingName, RpcWorkerConstants.DotNetLanguageWorkerName},
-                { "WEBSITE_AUTH_ENABLED", "TRUE"}
+                { EnvironmentSettingNames.FunctionWorkerRuntime, RpcWorkerConstants.DotNetLanguageWorkerName },
+                { "WEBSITE_AUTH_ENABLED", "TRUE" }
             };
             using (_fixture.Host.WebHostServices.CreateScopedEnvironment(vars))
             {
@@ -1044,8 +1388,8 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
         {
             var vars = new Dictionary<string, string>
             {
-                { RpcWorkerConstants.FunctionWorkerRuntimeSettingName, RpcWorkerConstants.DotNetLanguageWorkerName},
-                { "WEBSITE_AUTH_ENABLED", "TRUE"}
+                { EnvironmentSettingNames.FunctionWorkerRuntime, RpcWorkerConstants.DotNetLanguageWorkerName },
+                { "WEBSITE_AUTH_ENABLED", "TRUE" }
             };
             using (_fixture.Host.WebHostServices.CreateScopedEnvironment(vars))
             {
@@ -1067,8 +1411,8 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
         {
             var vars = new Dictionary<string, string>
             {
-                { RpcWorkerConstants.FunctionWorkerRuntimeSettingName, RpcWorkerConstants.DotNetLanguageWorkerName},
-                { "WEBSITE_AUTH_ENABLED", "FALSE"}
+                { EnvironmentSettingNames.FunctionWorkerRuntime, RpcWorkerConstants.DotNetLanguageWorkerName },
+                { "WEBSITE_AUTH_ENABLED", "FALSE" }
             };
             using (_fixture.Host.WebHostServices.CreateScopedEnvironment(vars))
             {
@@ -1158,7 +1502,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
         public class TestFixture : EndToEndTestFixture
         {
             public TestFixture()
-                : base(Path.Combine(Environment.CurrentDirectory, @"..", "..", "..", "..", "..", "sample", "csharp"), "samples", RpcWorkerConstants.DotNetLanguageWorkerName)
+                : base(Path.Combine(Environment.CurrentDirectory, @"..", "..", "..", "..", "sample", "csharp"), "samples", RpcWorkerConstants.DotNetLanguageWorkerName)
             {
                 MockWebHookProvider = new Mock<IScriptWebHookProvider>(MockBehavior.Strict);
             }
@@ -1198,6 +1542,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
                     o.Functions = new[]
                     {
                         "HttpTrigger",
+                        "HttpTrigger-AnonymousLevel",
                         "HttpTrigger-AdminLevel",
                         "HttpTrigger-Compat",
                         "HttpTrigger-CustomRoute",

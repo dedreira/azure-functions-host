@@ -7,11 +7,14 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Net.Http;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
 using Azure;
+using Microsoft.Azure.WebJobs.Description;
 using Microsoft.Azure.WebJobs.Extensions.Http;
+using Microsoft.Azure.WebJobs.Host.Config;
 using Microsoft.Azure.WebJobs.Logging;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.WebHost;
@@ -32,7 +35,6 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Security
     public class SecretManagerTests
     {
         private const int TestSentinelWatcherInitializationDelayMS = 50;
-        private const string TestEncryptionKey = "/a/vXvWJ3Hzgx4PFxlDUJJhQm5QVyGiu0NNLFm/ZMMg=";
         private readonly HostNameProvider _hostNameProvider;
         private readonly TestEnvironment _testEnvironment;
         private readonly TestLoggerProvider _loggerProvider;
@@ -63,7 +65,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Security
             {
                 string startupContextPath = Path.Combine(directory.Path, Guid.NewGuid().ToString());
                 _testEnvironment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteStartupContextCache, startupContextPath);
-                _testEnvironment.SetEnvironmentVariable(EnvironmentSettingNames.WebSiteAuthEncryptionKey, TestEncryptionKey);
+                _testEnvironment.SetEnvironmentVariable(EnvironmentSettingNames.WebSiteAuthEncryptionKey, TestHelpers.EncryptionKey);
 
                 // Because we don't initialize any disk context, we can configure
                 // the secret manager to allocate fresh keys on start-up.
@@ -110,19 +112,17 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Security
             {
                 string startupContextPath = Path.Combine(directory.Path, Guid.NewGuid().ToString());
                 _testEnvironment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteStartupContextCache, startupContextPath);
-                _testEnvironment.SetEnvironmentVariable(EnvironmentSettingNames.WebSiteAuthEncryptionKey, TestEncryptionKey);
+                _testEnvironment.SetEnvironmentVariable(EnvironmentSettingNames.WebSiteAuthEncryptionKey, TestHelpers.EncryptionKey);
 
                 WriteStartContextCache(startupContextPath);
 
                 using (var secretManager = CreateSecretManager(directory.Path))
                 {
-                    var functionSecrets = await secretManager.GetFunctionSecretsAsync("function1", true);
+                    var functionSecrets = await secretManager.GetFunctionSecretsAsync("function1");
 
-                    Assert.Equal(4, functionSecrets.Count);
+                    Assert.Equal(2, functionSecrets.Count);
                     Assert.Equal("function1value1", functionSecrets["test-function1-1"]);
                     Assert.Equal("function1value2", functionSecrets["test-function1-2"]);
-                    Assert.Equal("hostfunction1value", functionSecrets["test-host-function-1"]);
-                    Assert.Equal("hostfunction2value", functionSecrets["test-host-function-2"]);
 
                     var hostSecrets = await secretManager.GetHostSecretsAsync();
 
@@ -143,194 +143,398 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Security
             }
         }
 
-        [Theory]
-        [InlineData("function1value1", "test-function1-1", "function1", AuthorizationLevel.Function)]
-        [InlineData("function1value2", "test-function1-2", "function1", AuthorizationLevel.Function)]
-        [InlineData("function2value1", "test-function2-1", "function2", AuthorizationLevel.Function)]
-        [InlineData("function2value2", "test-function2-2", "function2", AuthorizationLevel.Function)]
-        [InlineData("function2value1", null, "function1", AuthorizationLevel.Anonymous)]
-        [InlineData("function1value1", null, "function2", AuthorizationLevel.Anonymous)]
-        [InlineData("invalid", null, "function1", AuthorizationLevel.Anonymous)]
-        [InlineData("invalid", null, "function2", AuthorizationLevel.Anonymous)]
-        [InlineData("hostfunction1value", "test-host-function-1", "function1", AuthorizationLevel.Function)]
-        [InlineData("hostfunction2value", "test-host-function-2", "function1", AuthorizationLevel.Function)]
-        [InlineData("hostfunction1value", "test-host-function-1", "function2", AuthorizationLevel.Function)]
-        [InlineData("hostfunction2value", "test-host-function-2", "function2", AuthorizationLevel.Function)]
-        [InlineData("test-master-key", "master", "function1", AuthorizationLevel.Admin)]
-        [InlineData("test-master-key", "master", "function2", AuthorizationLevel.Admin)]
-        [InlineData("test-master-key", "master", null, AuthorizationLevel.Admin)]
-        [InlineData("system1value", "test-system-1", null, AuthorizationLevel.System)]
-        [InlineData("system2value", "test-system-2", null, AuthorizationLevel.System)]
-        public async Task GetAuthorizationLevelOrNullAsync_ReturnsExpectedResult(string keyValue, string expectedKeyName, string functionName, AuthorizationLevel expectedLevel)
+        [Fact]
+        public async Task GetOrCreateSystemKey_StaleStartupContextCache_DoesNotOverwriteExistingStorageKey()
         {
+            using var directory = new TempDirectory();
+
+            const string extensionKeyName = "eventgrid_extension";
+
+            // Seed storage with an existing extension system key, simulating a key that was previously
+            // generated and published (e.g. baked into an already-registered EventGrid subscription URL).
+            string existingKeyValue = SecretGenerator.GenerateSystemKeyValue();
+            using (var seedManager = CreateSecretManager(directory.Path, simulateWriteConversion: false, setStaleValue: false))
+            {
+                await seedManager.AddOrUpdateFunctionSecretAsync(extensionKeyName, existingKeyValue, HostKeyScopes.SystemKeys, ScriptSecretsType.Host);
+            }
+
+            // Seed a STALE startup context snapshot that predates the extension key. This is what
+            // SecretManager.InitializeCache() loads into the authoritative in-memory host secrets cache.
+            _startupContextProvider.Context = new StartupContextProvider.StartupContext
+            {
+                Secrets = new FunctionAppSecrets
+                {
+                    Host = new FunctionAppSecrets.HostSecrets
+                    {
+                        Master = "test-master-key",
+                        Function = new Dictionary<string, string>(),
+                        System = new Dictionary<string, string>
+                        {
+                            { "some-other-system-key", "othervalue" }
+                        }
+                    },
+                    Function = Array.Empty<FunctionAppSecrets.FunctionSecrets>()
+                }
+            };
+
+            using var secretManager = CreateSecretManager(directory.Path, simulateWriteConversion: false, setStaleValue: false);
+
+            // The cache is authoritative and stale: it does not contain the extension key even though storage does.
+            var cachedSecrets = await secretManager.GetHostSecretsAsync();
+            Assert.False(cachedSecrets.SystemKeys.ContainsKey(extensionKeyName));
+
+            // Drive the real extension registration path (IScriptWebHookProvider.GetUrl), exactly as an
+            // extension does when it registers its webhook handler during host startup.
+            var webHookProvider = new DefaultScriptWebHookProvider(new TestSecretManagerProvider(secretManager), _hostNameProvider);
+            var url = webHookProvider.GetUrl(new TestEventGridExtensionConfigProvider());
+
+            // The returned webhook URL must use the EXISTING storage key, not a regenerated one.
+            Assert.Equal($"https://test.azurewebsites.net/runtime/webhooks/eventgrid?code={existingKeyValue}", url.ToString());
+
+            // And the key in storage must be untouched (not clobbered by a regenerated value).
+            _startupContextProvider.Context = null;
+            using var verifyManager = CreateSecretManager(directory.Path, simulateWriteConversion: false, setStaleValue: false);
+            var storageSecrets = await verifyManager.GetHostSecretsAsync();
+            Assert.Equal(existingKeyValue, storageSecrets.SystemKeys[extensionKeyName]);
+        }
+
+        [Fact]
+        public async Task GetOrCreateSystemKey_KeyMissing_GeneratesIdentifiableKeyAndPersistsToStorage()
+        {
+            using var directory = new TempDirectory();
+
+            const string extensionKeyName = "eventgrid_extension";
+
+            using var secretManager = CreateSecretManager(directory.Path, simulateWriteConversion: false, setStaleValue: false);
+
+            // The key does not exist yet, in cache or in storage.
+            var initialSecrets = await secretManager.GetHostSecretsAsync();
+            Assert.False(initialSecrets.SystemKeys.ContainsKey(extensionKeyName));
+
+            string createdKeyValue = await secretManager.GetOrCreateSystemKeyAsync(extensionKeyName);
+
+            // The generated value must be a valid identifiable system key.
+            SecretGeneratorTests.ValidateSecret(createdKeyValue, SecretGenerator.SystemKeySeed);
+
+            // The key must have been written to storage, not just cached in memory.
+            using var verifyManager = CreateSecretManager(directory.Path, simulateWriteConversion: false, setStaleValue: false);
+            var storageSecrets = await verifyManager.GetHostSecretsAsync();
+            Assert.Equal(createdKeyValue, storageSecrets.SystemKeys[extensionKeyName]);
+        }
+
+        [Fact]
+        public async Task GetOrCreateSystemKey_ConcurrentCalls_ReturnSameKey()
+        {
+            using var directory = new TempDirectory();
+
+            const string extensionKeyName = "eventgrid_extension";
+
+            using var secretManager = CreateSecretManager(directory.Path, simulateWriteConversion: false, setStaleValue: false);
+
+            var tasks = Enumerable.Range(0, 10).Select(_ => Task.Run(() => secretManager.GetOrCreateSystemKeyAsync(extensionKeyName))).ToArray();
+            string[] results = await Task.WhenAll(tasks);
+
+            // All callers must observe the same key, and it must be the value that was persisted.
+            Assert.Single(results.Distinct(StringComparer.Ordinal));
+
+            using var verifyManager = CreateSecretManager(directory.Path, simulateWriteConversion: false, setStaleValue: false);
+            var storageSecrets = await verifyManager.GetHostSecretsAsync();
+            Assert.Equal(results[0], storageSecrets.SystemKeys[extensionKeyName]);
+        }
+
+        [Theory]
+        [InlineData(false, false)]
+        [InlineData(false, true)]
+        [InlineData(true, false)]
+        [InlineData(true, true)]
+        [Trait(TestTraits.Group, TestTraits.HISSecretsTests)]
+        public async Task GetAuthorizationLevelOrNullAsync_DoesNotAuthenticateNonHISSecrets(bool strictHISEnabled, bool strictHISWarnEnabled)
+        {
+            string featureFlags = "Foo,Bar";
+            if (strictHISEnabled)
+            {
+                featureFlags += "," + ScriptConstants.FeatureFlagStrictHISModeEnabled;
+            }
+            if (strictHISWarnEnabled)
+            {
+                featureFlags += "," + ScriptConstants.FeatureFlagStrictHISModeWarn;
+            }
+
             using (var directory = new TempDirectory())
+            using (var scopedEnv = new TestScopedEnvironmentVariable(EnvironmentSettingNames.AzureWebJobsFeatureFlags, featureFlags))
+            {
+                string expectedTraceMessage = Resources.TraceStaleHostSecretRefresh;
+
+                string functionName = "function1";
+                string hisFunctionKeyValue = SecretGenerator.GenerateFunctionKeyValue();
+                string nonHISFunctionKeyValue = "TestValue1";
+
+                FunctionSecrets functionSecrets = new FunctionSecrets();
+                functionSecrets.Keys.Add(new Key("NonHISKey", nonHISFunctionKeyValue));
+                functionSecrets.Keys.Add(new Key("HISKey", hisFunctionKeyValue));
+                string functionSecretsJson = JsonConvert.SerializeObject(functionSecrets);
+
+                File.WriteAllText(Path.Combine(directory.Path, functionName + ".json"), functionSecretsJson);
+
+                var metricsLogger = new TestMetricsLogger();
+                using (var secretManager = CreateSecretManager(directory.Path, metricsLogger: metricsLogger, simulateWriteConversion: false))
+                {
+                    // run the test a few times to exercise caching, etc.
+                    for (int i = 0; i < 3; i++)
+                    {
+                        var nonHISKeyResult = await secretManager.GetAuthorizationLevelOrNullAsync(nonHISFunctionKeyValue, functionName);
+                        var hISKeyResult = await secretManager.GetAuthorizationLevelOrNullAsync(hisFunctionKeyValue, functionName);
+
+                        if (strictHISEnabled)
+                        {
+                            Assert.Equal(AuthorizationLevel.Anonymous, nonHISKeyResult.Level);
+                            Assert.Equal(AuthorizationLevel.Function, hISKeyResult.Level);
+                        }
+                        else
+                        {
+                            Assert.Equal(AuthorizationLevel.Function, nonHISKeyResult.Level);
+                            Assert.Equal(AuthorizationLevel.Function, hISKeyResult.Level);
+                        }
+                    }
+                }
+            }
+        }
+
+        [Theory]
+        [InlineData(false, false)]
+        [InlineData(false, true)]
+        [InlineData(true, false)]
+        [InlineData(true, true)]
+        [Trait(TestTraits.Group, TestTraits.HISSecretsTests)]
+        public async Task CachedSecrets_HISValidationPerformedOnLoad(bool strictHISEnabled, bool strictHISWarnEnabled)
+        {
+            string featureFlags = "Foo,Bar";
+            if (strictHISEnabled)
+            {
+                featureFlags += "," + ScriptConstants.FeatureFlagStrictHISModeEnabled;
+            }
+            if (strictHISWarnEnabled)
+            {
+                featureFlags += "," + ScriptConstants.FeatureFlagStrictHISModeWarn;
+            }
+
+            using (var directory = new TempDirectory())
+            using (var scopedEnv = new TestScopedEnvironmentVariable(EnvironmentSettingNames.AzureWebJobsFeatureFlags, featureFlags))
             {
                 string startupContextPath = Path.Combine(directory.Path, Guid.NewGuid().ToString());
                 _testEnvironment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteStartupContextCache, startupContextPath);
-                _testEnvironment.SetEnvironmentVariable(EnvironmentSettingNames.WebSiteAuthEncryptionKey, TestEncryptionKey);
+                _testEnvironment.SetEnvironmentVariable(EnvironmentSettingNames.WebSiteAuthEncryptionKey, TestHelpers.EncryptionKey);
 
                 WriteStartContextCache(startupContextPath);
 
-                using (var secretManager = CreateSecretManager(directory.Path))
+                var metricsLogger = new TestMetricsLogger();
+                using (var secretManager = CreateSecretManager(directory.Path, metricsLogger: metricsLogger, simulateWriteConversion: false))
                 {
-                    for (int i = 0; i < 3; i++)
-                    {
-                        (string, AuthorizationLevel) result = await secretManager.GetAuthorizationLevelOrNullAsync(keyValue, functionName);
-                        Assert.Equal(result.Item2, expectedLevel);
-                        Assert.Equal(result.Item1, expectedKeyName);
-                    }
+                    var functionSecrets = await secretManager.GetFunctionSecretsAsync("function1");
+
+                    Assert.Equal(2, functionSecrets.Count);
+                    Assert.Equal("function1value1", functionSecrets["test-function1-1"]);
+                    Assert.Equal("function1value2", functionSecrets["test-function1-2"]);
+
+                    var hostSecrets = await secretManager.GetHostSecretsAsync();
+
+                    Assert.Equal("test-master-key", hostSecrets.MasterKey);
+                    Assert.Equal(2, hostSecrets.FunctionKeys.Count);
+                    Assert.Equal("hostfunction1value", hostSecrets.FunctionKeys["test-host-function-1"]);
+                    Assert.Equal("hostfunction2value", hostSecrets.FunctionKeys["test-host-function-2"]);
+                    Assert.Equal(2, hostSecrets.SystemKeys.Count);
+                    Assert.Equal("system1value", hostSecrets.SystemKeys["test-system-1"]);
+                    Assert.Equal("system2value", hostSecrets.SystemKeys["test-system-2"]);
+                }
+
+                var logs = _loggerProvider.GetAllLogMessages().ToArray();
+                Assert.Equal($"Sentinel watcher initialized for path {directory.Path}", logs[0].FormattedMessage);
+                Assert.Equal($"Loading startup context from {startupContextPath}", logs[1].FormattedMessage);
+                Assert.Equal($"Loaded keys for 2 functions from startup context", logs[2].FormattedMessage);
+
+                LogLevel expectedLevel = strictHISEnabled ? LogLevel.Error : LogLevel.Warning;
+                if (strictHISEnabled || strictHISWarnEnabled)
+                {
+                    Assert.Equal(13, logs.Length);
+
+                    VerifyHISDiagnosticEvent(expectedLevel, logs[3], "Function", "test-function1-1", "function1");
+                    VerifyHISDiagnosticEvent(expectedLevel, logs[4], "Function", "test-function1-2", "function1");
+                    VerifyHISDiagnosticEvent(expectedLevel, logs[5], "Function", "test-function2-1", "function2");
+                    VerifyHISDiagnosticEvent(expectedLevel, logs[6], "Function", "test-function2-2", "function2");
+
+                    Assert.Equal($"Loaded host keys from startup context", logs[7].FormattedMessage);
+
+                    VerifyHISDiagnosticEvent(expectedLevel, logs[8], "Master", "_master");
+                    VerifyHISDiagnosticEvent(expectedLevel, logs[9], "Function", "test-host-function-1");
+                    VerifyHISDiagnosticEvent(expectedLevel, logs[10], "Function", "test-host-function-2");
+                    VerifyHISDiagnosticEvent(expectedLevel, logs[11], "System", "test-system-1");
+                    VerifyHISDiagnosticEvent(expectedLevel, logs[12], "System", "test-system-2");
+
+                    var metricEvents = metricsLogger.LoggedEvents.GroupBy(p => p).ToDictionary(p => p.Key, p => p.Count());
+                    Assert.Equal(3, metricEvents.Count);
+                    Assert.Equal(2, metricEvents["host.secrets.nonidentifiable_function1"]);
+                    Assert.Equal(2, metricEvents["host.secrets.nonidentifiable_function2"]);
+                    Assert.Equal(5, metricEvents["host.secrets.nonidentifiable"]);
+                }
+                else
+                {
+                    Assert.Equal($"Loaded host keys from startup context", logs[3].FormattedMessage);
                 }
             }
         }
 
-        private FunctionAppSecrets WriteStartContextCache(string path)
+        [Theory]
+        [InlineData(false, false)]
+        [InlineData(false, true)]
+        [InlineData(true, false)]
+        [InlineData(true, true)]
+        [Trait(TestTraits.Group, TestTraits.HISSecretsTests)]
+        public async Task GetHostSecrets_HISValidationPerformed(bool strictHISEnabled, bool strictHISWarnEnabled)
         {
-            var secrets = new FunctionAppSecrets();
-            secrets.Host = new FunctionAppSecrets.HostSecrets
+            string featureFlags = "Foo,Bar";
+            if (strictHISEnabled)
             {
-                Master = "test-master-key"
-            };
-            secrets.Host.Function = new Dictionary<string, string>
+                featureFlags += "," + ScriptConstants.FeatureFlagStrictHISModeEnabled;
+            }
+            if (strictHISWarnEnabled)
             {
-                { "test-host-function-1", "hostfunction1value" },
-                { "test-host-function-2", "hostfunction2value" }
-            };
-            secrets.Host.System = new Dictionary<string, string>
-            {
-                { "test-system-1", "system1value" },
-                { "test-system-2", "system2value" }
-            };
-            secrets.Function = new FunctionAppSecrets.FunctionSecrets[]
-            {
-                new FunctionAppSecrets.FunctionSecrets
-                {
-                    Name = "function1",
-                    Secrets = new Dictionary<string, string>
-                    {
-                        { "test-function1-1", "function1value1" },
-                        { "test-function1-2", "function1value2" }
-                    }
-                },
-                new FunctionAppSecrets.FunctionSecrets
-                {
-                    Name = "function2",
-                    Secrets = new Dictionary<string, string>
-                    {
-                        { "test-function2-1", "function2value1" },
-                        { "test-function2-2", "function2value2" }
-                    }
-                }
-            };
+                featureFlags += "," + ScriptConstants.FeatureFlagStrictHISModeWarn;
+            }
 
-            var context = new JObject
-            {
-                { "secrets", JObject.FromObject(secrets) }
-            };
+            string hisFunctionKey = SecretGenerator.GenerateFunctionKeyValue();
+            string hisSystemKey = SecretGenerator.GenerateSystemKeyValue();
 
-            string json = JsonConvert.SerializeObject(context);
-            var encryptionKey = Convert.FromBase64String(TestEncryptionKey);
-            string encryptedJson = SimpleWebTokenHelper.Encrypt(json, encryptionKey);
-
-            File.WriteAllText(path, encryptedJson);
-
-            return secrets;
-        }
-
-        [Fact]
-        public async Task MergedSecrets_PrioritizesFunctionSecrets()
-        {
             using (var directory = new TempDirectory())
+            using (var scopedEnv = new TestScopedEnvironmentVariable(EnvironmentSettingNames.AzureWebJobsFeatureFlags, featureFlags))
             {
-                string hostSecrets =
-                    @"{
-    'masterKey': {
-        'name': 'master',
-        'value': '1234',
-        'encrypted': false
-    },
-    'functionKeys': [
-        {
-            'name': 'Key1',
-            'value': 'HostValue1',
-            'encrypted': false
-        },
-        {
-            'name': 'Key3',
-            'value': 'HostValue3',
-            'encrypted': false
-        }
-    ]
-}";
-                string functionSecrets =
-                    @"{
-    'keys': [
-        {
-            'name': 'Key1',
-            'value': 'FunctionValue1',
-            'encrypted': false
-        },
-        {
-            'name': 'Key2',
-            'value': 'FunctionValue2',
-            'encrypted': false
-        }
-    ]
-}";
-                File.WriteAllText(Path.Combine(directory.Path, ScriptConstants.HostMetadataFileName), hostSecrets);
-                File.WriteAllText(Path.Combine(directory.Path, "testfunction.json"), functionSecrets);
+                string expectedTraceMessage = Resources.TraceStaleHostSecretRefresh;
 
-                IDictionary<string, string> result;
-                using (var secretManager = CreateSecretManager(directory.Path))
+                HostSecrets hostSecrets = new HostSecrets();
+                hostSecrets.MasterKey = new Key("master", "1234");
+                hostSecrets.FunctionKeys = new List<Key>
                 {
-                    result = await secretManager.GetFunctionSecretsAsync("testfunction", true);
-                }
+                    new Key("Key1", "HostValue1"),
+                    new Key("Key2", hisFunctionKey)
+                };
+                hostSecrets.SystemKeys = new List<Key>
+                {
+                    new Key("SystemKey1", "SystemHostValue1"),
+                    new Key("SystemKey2", hisSystemKey)
+                };
+                string hostSecretsJson = JsonConvert.SerializeObject(hostSecrets);
 
-                Assert.Contains("Key1", result.Keys);
-                Assert.Contains("Key2", result.Keys);
-                Assert.Contains("Key3", result.Keys);
-                Assert.Equal("FunctionValue1", result["Key1"]);
-                Assert.Equal("FunctionValue2", result["Key2"]);
-                Assert.Equal("HostValue3", result["Key3"]);
+                File.WriteAllText(Path.Combine(directory.Path, ScriptConstants.HostMetadataFileName), hostSecretsJson);
+
+                var metricsLogger = new TestMetricsLogger();
+                HostSecretsInfo hostSecretsInfo = null;
+                using (var secretManager = CreateSecretManager(directory.Path, metricsLogger: metricsLogger, simulateWriteConversion: false))
+                {
+                    hostSecretsInfo = await secretManager.GetHostSecretsAsync();
+
+                    Assert.Equal("1234", hostSecretsInfo.MasterKey);
+                    Assert.Equal("HostValue1", hostSecrets.FunctionKeys[0].Value);
+                    Assert.Equal(hisFunctionKey, hostSecrets.FunctionKeys[1].Value);
+                    Assert.Equal("SystemHostValue1", hostSecrets.SystemKeys[0].Value);
+                    Assert.Equal(hisSystemKey, hostSecrets.SystemKeys[1].Value);
+
+                    var logs = _loggerProvider.GetAllLogMessages().Where(p => p.Level >= LogLevel.Warning).ToArray();
+                    var metricEvents = metricsLogger.LoggedEvents.GroupBy(p => p).ToDictionary(p => p.Key, p => p.Count());
+
+                    LogLevel expectedLevel = strictHISEnabled ? LogLevel.Error : LogLevel.Warning;
+                    if (strictHISEnabled || strictHISWarnEnabled)
+                    {
+                        Assert.Equal(3, logs.Length);
+                        VerifyHISDiagnosticEvent(expectedLevel, logs[0], "Master", "_master");
+                        VerifyHISDiagnosticEvent(expectedLevel, logs[1], "Function", "Key1");
+                        VerifyHISDiagnosticEvent(expectedLevel, logs[2], "System", "SystemKey1");
+                    }
+                    else
+                    {
+                        Assert.Empty(logs);
+                    }
+
+                    Assert.Equal(5, metricsLogger.LoggedEvents.Count);
+                    Assert.Equal(3, metricEvents["host.secrets.nonidentifiable"]);
+                    Assert.Equal(2, metricEvents["host.secrets.identifiable"]);
+                }
             }
         }
 
-        [Fact]
-        public async Task GetFunctionSecrets_UpdatesStaleSecrets()
+        [Theory]
+        [InlineData(false, false)]
+        [InlineData(false, true)]
+        [InlineData(true, false)]
+        [InlineData(true, true)]
+        [Trait(TestTraits.Group, TestTraits.HISSecretsTests)]
+        public async Task GetFunctionSecrets_HISValidationPerformed(bool strictHISEnabled, bool strictHISWarnEnabled)
         {
-            using (var directory = new TempDirectory())
+            string featureFlags = "Foo,Bar";
+            if (strictHISEnabled)
             {
-                string functionName = "testfunction";
-                string expectedTraceMessage = string.Format(Resources.TraceStaleFunctionSecretRefresh, functionName);
-                string functionSecretsJson =
-                 @"{
-    'keys': [
-        {
-            'name': 'Key1',
-            'value': 'FunctionValue1',
-            'encrypted': false
-        },
-        {
-            'name': 'Key2',
-            'value': 'FunctionValue2',
-            'encrypted': false
-        }
-    ]
-}";
+                featureFlags += "," + ScriptConstants.FeatureFlagStrictHISModeEnabled;
+            }
+            if (strictHISWarnEnabled)
+            {
+                featureFlags += "," + ScriptConstants.FeatureFlagStrictHISModeWarn;
+            }
+
+            string hisFunctionKey = SecretGenerator.GenerateFunctionKeyValue();
+
+            using (var directory = new TempDirectory())
+            using (var scopedEnv = new TestScopedEnvironmentVariable(EnvironmentSettingNames.AzureWebJobsFeatureFlags, featureFlags))
+            {
+                string expectedTraceMessage = Resources.TraceStaleHostSecretRefresh;
+
+                string functionName = "function1";
+                FunctionSecrets functionSecrets = new FunctionSecrets();
+                functionSecrets.Keys.Add(new Key("Key1", "TestValue1"));
+                functionSecrets.Keys.Add(new Key("Key2", "TestValue2"));
+                functionSecrets.Keys.Add(new Key("Key3", hisFunctionKey));
+                string functionSecretsJson = JsonConvert.SerializeObject(functionSecrets);
+
                 File.WriteAllText(Path.Combine(directory.Path, functionName + ".json"), functionSecretsJson);
 
-                IDictionary<string, string> functionSecrets;
-                using (var secretManager = CreateSecretManager(directory.Path))
+                var metricsLogger = new TestMetricsLogger();
+                IDictionary<string, string> returnedSecrets = null;
+                using (var secretManager = CreateSecretManager(directory.Path, metricsLogger: metricsLogger, simulateWriteConversion: false))
                 {
-                    functionSecrets = await secretManager.GetFunctionSecretsAsync(functionName);
+                    returnedSecrets = await secretManager.GetFunctionSecretsAsync(functionName);
+
+                    Assert.Equal("TestValue1", returnedSecrets["Key1"]);
+                    Assert.Equal("TestValue2", returnedSecrets["Key2"]);
+                    Assert.Equal(hisFunctionKey, returnedSecrets["Key3"]);
+
+                    var logs = _loggerProvider.GetAllLogMessages().Where(p => p.Level >= LogLevel.Warning).ToArray();
+                    var metricEvents = metricsLogger.LoggedEvents.GroupBy(p => p).ToDictionary(p => p.Key, p => p.Count());
+
+                    LogLevel expectedLevel = strictHISEnabled ? LogLevel.Error : LogLevel.Warning;
+                    if (strictHISEnabled || strictHISWarnEnabled)
+                    {
+                        Assert.Equal(2, logs.Length);
+                        VerifyHISDiagnosticEvent(expectedLevel, logs[0], "Function", "Key1", "function1");
+                        VerifyHISDiagnosticEvent(expectedLevel, logs[1], "Function", "Key2", "function1");
+                    }
+                    else
+                    {
+                        Assert.Empty(logs);
+                    }
+
+                    Assert.Equal(3, metricsLogger.LoggedEvents.Count);
+                    Assert.Equal(2, metricEvents["host.secrets.nonidentifiable_function1"]);
+                    Assert.Equal(1, metricEvents["host.secrets.identifiable_function1"]);
                 }
-
-                // Read the persisted content
-                var result = JsonConvert.DeserializeObject<FunctionSecrets>(File.ReadAllText(Path.Combine(directory.Path, functionName + ".json")));
-                bool functionSecretsConverted = functionSecrets.Values.Zip(result.Keys, (r1, r2) => string.Equals("!" + r1, r2.Value)).All(r => r);
-
-                Assert.Equal(2, result.Keys.Count);
-                Assert.True(functionSecretsConverted, "Function secrets were not persisted");
             }
+        }
+
+        [Theory]
+        [InlineData(ScriptSecretsType.Function, "TestFunction", SecretGenerator.FunctionKeySeed)]
+        [InlineData(ScriptSecretsType.Function, null, SecretGenerator.FunctionKeySeed)]
+        [InlineData(ScriptSecretsType.Host, HostKeyScopes.FunctionKeys, SecretGenerator.FunctionKeySeed)]
+        [InlineData(ScriptSecretsType.Host, HostKeyScopes.SystemKeys, SecretGenerator.SystemKeySeed)]
+        [InlineData(ScriptSecretsType.Host, "invalid", 0)]
+        public void GetKeySeed_ReturnsExpectedResult(ScriptSecretsType secretsType, string keyScope, ulong expectedSeed)
+        {
+            Assert.Equal(expectedSeed, SecretManager.GetKeySeed(secretsType, keyScope));
         }
 
         [Fact]
@@ -392,6 +596,210 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Security
             }
         }
 
+        [Theory]
+        [InlineData("function1value1", "test-function1-1", "function1", AuthorizationLevel.Function)]
+        [InlineData("function1value2", "test-function1-2", "function1", AuthorizationLevel.Function)]
+        [InlineData("function2value1", "test-function2-1", "function2", AuthorizationLevel.Function)]
+        [InlineData("function2value2", "test-function2-2", "function2", AuthorizationLevel.Function)]
+        [InlineData("function2value1", null, "function1", AuthorizationLevel.Anonymous)]
+        [InlineData("function1value1", null, "function2", AuthorizationLevel.Anonymous)]
+        [InlineData("invalid", null, "function1", AuthorizationLevel.Anonymous)]
+        [InlineData("invalid", null, "function2", AuthorizationLevel.Anonymous)]
+        [InlineData("hostfunction1value", "test-host-function-1", "function1", AuthorizationLevel.Function)]
+        [InlineData("hostfunction2value", "test-host-function-2", "function1", AuthorizationLevel.Function)]
+        [InlineData("hostfunction1value", "test-host-function-1", "function2", AuthorizationLevel.Function)]
+        [InlineData("hostfunction2value", "test-host-function-2", "function2", AuthorizationLevel.Function)]
+        [InlineData("test-master-key", "master", "function1", AuthorizationLevel.Admin)]
+        [InlineData("test-master-key", "master", "function2", AuthorizationLevel.Admin)]
+        [InlineData("test-master-key", "master", null, AuthorizationLevel.Admin)]
+        [InlineData("system1value", "test-system-1", null, AuthorizationLevel.System)]
+        [InlineData("system2value", "test-system-2", null, AuthorizationLevel.System)]
+        public async Task GetAuthorizationLevelOrNullAsync_ReturnsExpectedResult(string keyValue, string expectedKeyName, string functionName, AuthorizationLevel expectedLevel)
+        {
+            using (var directory = new TempDirectory())
+            {
+                string startupContextPath = Path.Combine(directory.Path, Guid.NewGuid().ToString());
+                _testEnvironment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteStartupContextCache, startupContextPath);
+                _testEnvironment.SetEnvironmentVariable(EnvironmentSettingNames.WebSiteAuthEncryptionKey, TestHelpers.EncryptionKey);
+
+                WriteStartContextCache(startupContextPath);
+
+                using (var secretManager = CreateSecretManager(directory.Path))
+                {
+                    for (int i = 0; i < 3; i++)
+                    {
+                        (string, AuthorizationLevel) result = await secretManager.GetAuthorizationLevelOrNullAsync(keyValue, functionName);
+                        Assert.Equal(result.Item2, expectedLevel);
+                        Assert.Equal(result.Item1, expectedKeyName);
+                    }
+                }
+            }
+        }
+
+        [Fact]
+        public async Task GetAuthorizationLevelOrNullAsync_DoesNotReuseCachedAuthorizationForCollidingInputs()
+        {
+            using var directory = new TempDirectory();
+
+            string startupContextPath = Path.Combine(directory.Path, Guid.NewGuid().ToString());
+            _testEnvironment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteStartupContextCache, startupContextPath);
+            _testEnvironment.SetEnvironmentVariable(EnvironmentSettingNames.WebSiteAuthEncryptionKey, TestHelpers.EncryptionKey);
+
+            WriteStartContextCache(
+                startupContextPath,
+                new FunctionAppSecrets.FunctionSecrets
+                {
+                    Name = "functiondata",
+                    Secrets = new Dictionary<string, string>
+                    {
+                            { "test-source-key", "sourcekeyvalue" }
+                    }
+                },
+                new FunctionAppSecrets.FunctionSecrets
+                {
+                    Name = "data",
+                    Secrets = new Dictionary<string, string>
+                    {
+                            { "test-target-key", "targetkeyvalue" }
+                    }
+                });
+
+            using var secretManager = CreateSecretManager(directory.Path);
+
+            var (keyName, level) = await secretManager.GetAuthorizationLevelOrNullAsync("sourcekeyvalue", "functiondata");
+
+            Assert.Equal(AuthorizationLevel.Function, level);
+            Assert.Equal("test-source-key", keyName);
+
+            var result = await secretManager.GetAuthorizationLevelOrNullAsync("sourcekeyvaluefunction", "data");
+
+            Assert.Equal(AuthorizationLevel.Anonymous, result.Level);
+            Assert.Null(result.KeyName);
+        }
+
+        [Fact]
+        public async Task GetAuthorizationLevelOrNullAsync_DoesNotReuseCachedAuthorizationForKeyValueWithDifferentCasing()
+        {
+            using var directory = new TempDirectory();
+
+            string startupContextPath = Path.Combine(directory.Path, Guid.NewGuid().ToString());
+            _testEnvironment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteStartupContextCache, startupContextPath);
+            _testEnvironment.SetEnvironmentVariable(EnvironmentSettingNames.WebSiteAuthEncryptionKey, TestHelpers.EncryptionKey);
+
+            WriteStartContextCache(startupContextPath);
+
+            using var secretManager = CreateSecretManager(directory.Path);
+            var (keyName, level) = await secretManager.GetAuthorizationLevelOrNullAsync("function1value1", "function1");
+
+            Assert.Equal(AuthorizationLevel.Function, level);
+            Assert.Equal("test-function1-1", keyName);
+
+            var result = await secretManager.GetAuthorizationLevelOrNullAsync("FUNCTION1VALUE1", "function1");
+
+            Assert.Equal(AuthorizationLevel.Anonymous, result.Level);
+            Assert.Null(result.KeyName);
+        }
+
+        private FunctionAppSecrets WriteStartContextCache(string path, params FunctionAppSecrets.FunctionSecrets[] additionalFunctionSecrets)
+        {
+            var secrets = new FunctionAppSecrets
+            {
+                Host = new FunctionAppSecrets.HostSecrets
+                {
+                    Master = "test-master-key"
+                }
+            };
+
+            secrets.Host.Function = new Dictionary<string, string>
+            {
+                { "test-host-function-1", "hostfunction1value" },
+                { "test-host-function-2", "hostfunction2value" }
+            };
+
+            secrets.Host.System = new Dictionary<string, string>
+            {
+                { "test-system-1", "system1value" },
+                { "test-system-2", "system2value" }
+            };
+
+            var functionSecrets = new List<FunctionAppSecrets.FunctionSecrets>
+            {
+                new FunctionAppSecrets.FunctionSecrets
+                {
+                    Name = "function1",
+                    Secrets = new Dictionary<string, string>
+                    {
+                        { "test-function1-1", "function1value1" },
+                        { "test-function1-2", "function1value2" }
+                    }
+                },
+                new FunctionAppSecrets.FunctionSecrets
+                {
+                    Name = "function2",
+                    Secrets = new Dictionary<string, string>
+                    {
+                        { "test-function2-1", "function2value1" },
+                        { "test-function2-2", "function2value2" }
+                    }
+                }
+            };
+
+            functionSecrets.AddRange(additionalFunctionSecrets);
+            secrets.Function = [.. functionSecrets];
+
+            var context = new JObject
+            {
+                { "secrets", JObject.FromObject(secrets) }
+            };
+
+            string json = JsonConvert.SerializeObject(context);
+            var encryptionKey = Convert.FromBase64String(TestHelpers.EncryptionKey);
+            string encryptedJson = EncryptionHelper.Encrypt(json, encryptionKey);
+
+            File.WriteAllText(path, encryptedJson);
+
+            return secrets;
+        }
+
+        [Fact]
+        public async Task GetFunctionSecrets_UpdatesStaleSecrets()
+        {
+            using (var directory = new TempDirectory())
+            {
+                string functionName = "testfunction";
+                string expectedTraceMessage = string.Format(Resources.TraceStaleFunctionSecretRefresh, functionName);
+                string functionSecretsJson =
+                 @"{
+    'keys': [
+        {
+            'name': 'Key1',
+            'value': 'FunctionValue1',
+            'encrypted': false
+        },
+        {
+            'name': 'Key2',
+            'value': 'FunctionValue2',
+            'encrypted': false
+        }
+    ]
+}";
+                File.WriteAllText(Path.Combine(directory.Path, functionName + ".json"), functionSecretsJson);
+
+                IDictionary<string, string> functionSecrets;
+                using (var secretManager = CreateSecretManager(directory.Path))
+                {
+                    functionSecrets = await secretManager.GetFunctionSecretsAsync(functionName);
+                }
+
+                // Read the persisted content
+                var result = JsonConvert.DeserializeObject<FunctionSecrets>(File.ReadAllText(Path.Combine(directory.Path, functionName + ".json")));
+                bool functionSecretsConverted = functionSecrets.Values.Zip(result.Keys, (r1, r2) => string.Equals("!" + r1, r2.Value)).All(r => r);
+
+                Assert.Equal(2, result.Keys.Count);
+                Assert.True(functionSecretsConverted, "Function secrets were not persisted");
+            }
+        }
+
         [Fact]
         public async Task GetFunctionSecretsAsync_SecretGenerationIsSerialized()
         {
@@ -444,6 +852,130 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Security
 
                 // verify generated master and function keys are valid
                 tasks.Select(p => p.Result).All(q => ValidateHostSecrets(q));
+            }
+        }
+
+        [Fact]
+        public async Task SecretsRepository_SimultaneousCreates_Throws_Conflict()
+        {
+            var mockValueConverterFactory = GetConverterFactoryMock(false, false);
+            var metricsLogger = new TestMetricsLogger();
+
+            // Test repository that will fail on WriteAsync() due to a conflict, but will replicate a success when LoadSecretsAsync() is called
+            // indicating that there was race condition
+            var testRepository = new TestSecretsRepository(true, true, true);
+            string testFunctionName = "host";
+
+            using (var secretManager = new SecretManager(testRepository, mockValueConverterFactory.Object, _logger, metricsLogger, _hostNameProvider, _startupContextProvider))
+            {
+                var tasks = new List<Task<HostSecretsInfo>>();
+                for (int i = 0; i < 2; i++)
+                {
+                    tasks.Add(secretManager.GetHostSecretsAsync());
+                }
+
+                // Ensure nothing is there.
+                HostSecrets secretsContent = await testRepository.ReadAsync(ScriptSecretsType.Host, testFunctionName) as HostSecrets;
+                Assert.Null(secretsContent);
+                await Task.WhenAll(tasks);
+
+                // verify all calls return the same result
+                var masterKey = tasks.First().Result.MasterKey;
+                var functionKey = tasks.First().Result.FunctionKeys.First();
+                Assert.True(tasks.Select(p => p.Result).All(q => q.MasterKey == masterKey));
+                Assert.True(tasks.Select(p => p.Result).All(q => q.FunctionKeys.First().Value == functionKey.Value));
+
+                // verify generated master and function keys are valid
+                tasks.Select(p => p.Result).All(q => ValidateHostSecrets(q));
+            }
+        }
+
+        [Fact]
+        public async Task FunctionSecrets_SimultaneousCreates_Throws_Conflict()
+        {
+            var mockValueConverterFactory = GetConverterFactoryMock(false, false);
+            var metricsLogger = new TestMetricsLogger();
+            var testRepository = new TestSecretsRepository(true, true, true);
+            string testFunctionName = $"TestFunction";
+
+            using (var secretManager = new SecretManager(testRepository, mockValueConverterFactory.Object, _logger, metricsLogger, _hostNameProvider, _startupContextProvider))
+            {
+                var tasks = new List<Task<IDictionary<string, string>>>();
+                for (int i = 0; i < 2; i++)
+                {
+                    tasks.Add(secretManager.GetFunctionSecretsAsync(testFunctionName));
+                }
+
+                await Task.WhenAll(tasks);
+
+                // verify all calls return the same result
+                Assert.Equal(1, testRepository.FunctionSecrets.Count);
+                var functionSecrets = (FunctionSecrets)testRepository.FunctionSecrets[testFunctionName];
+                string defaultKeyValue = functionSecrets.Keys.Where(p => p.Name == "default").Single().Value;
+                SecretGeneratorTests.ValidateSecret(defaultKeyValue, SecretGenerator.FunctionKeySeed);
+                Assert.True(tasks.Select(p => p.Result).All(t => t["default"] == defaultKeyValue));
+            }
+        }
+
+        [Fact]
+        public async Task GetHostSecretsAsync_ConcurrentCalls_OnlyLoadsSecretsOnce()
+        {
+            using (var directory = new TempDirectory())
+            {
+                _testEnvironment.SetEnvironmentVariable(EnvironmentSettingNames.WebSiteAuthEncryptionKey, TestHelpers.EncryptionKey);
+
+                using (var secretManager = CreateSecretManager(directory.Path, simulateWriteConversion: false, setStaleValue: false))
+                {
+                    var tasks = new List<Task<HostSecretsInfo>>();
+                    for (int i = 0; i < 10; i++)
+                    {
+                        tasks.Add(secretManager.GetHostSecretsAsync());
+                    }
+
+                    await Task.WhenAll(tasks);
+
+                    // Verify all calls return the same result
+                    var hostSecrets = tasks.Select(p => p.Result).ToList();
+                    var masterKey = hostSecrets.First().MasterKey;
+                    Assert.True(hostSecrets.All(q => q.MasterKey == masterKey));
+
+                    // Verify that "Loading host secrets" was logged only once due to double-check locking
+                    var loadingLogs = _loggerProvider.GetAllLogMessages()
+                        .Where(m => m.FormattedMessage == "Loading host secrets")
+                        .ToList();
+                    Assert.Single(loadingLogs);
+                }
+            }
+        }
+
+        [Fact]
+        public async Task GetFunctionSecretsAsync_ConcurrentCalls_OnlyLoadsSecretsOnce()
+        {
+            using (var directory = new TempDirectory())
+            {
+                _testEnvironment.SetEnvironmentVariable(EnvironmentSettingNames.WebSiteAuthEncryptionKey, TestHelpers.EncryptionKey);
+                string functionName = "TestFunction";
+
+                using (var secretManager = CreateSecretManager(directory.Path, simulateWriteConversion: false, setStaleValue: false))
+                {
+                    var tasks = new List<Task<IDictionary<string, string>>>();
+                    for (int i = 0; i < 10; i++)
+                    {
+                        tasks.Add(secretManager.GetFunctionSecretsAsync(functionName));
+                    }
+
+                    var results = await Task.WhenAll(tasks);
+
+                    // Verify all calls return the same result
+                    var defaultKey = results.First()["default"];
+                    Assert.True(results.All(q => q["default"] == defaultKey));
+
+                    // Verify that "Loading secrets for function" was logged only once due to double-check locking
+                    var loadingLogs = _loggerProvider.GetAllLogMessages()
+                        .Where(m => m.FormattedMessage == $"Loading secrets for function '{functionName.ToLowerInvariant()}'")
+                        .ToList();
+                    Assert.Single(loadingLogs);
+                }
             }
         }
 
@@ -532,7 +1064,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Security
 
                 KeyOperationResult result;
 
-                ISecretsRepository repository = new TestSecretsRepository(false, true, HttpStatusCode.InternalServerError);
+                ISecretsRepository repository = new TestSecretsRepository(false, true, false, HttpStatusCode.InternalServerError);
                 using (var secretManager = CreateSecretManager(directory.Path, simulateWriteConversion: false, secretsRepository: repository))
                 {
                     try
@@ -746,10 +1278,188 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Security
             Assert.NotNull(persistedSecrets.MasterKey);
         }
 
+        [Theory]
+        [InlineData(false, false)]
+        [InlineData(false, true)]
+        [InlineData(true, false)]
+        [InlineData(true, true)]
+        [Trait(TestTraits.Group, TestTraits.HISSecretsTests)]
+        public async Task AddOrUpdateFunctionSecret_PerformsHISValidation(bool strictHISEnabled, bool strictHISWarnEnabled)
+        {
+            string featureFlags = "Foo,Bar";
+            if (strictHISEnabled)
+            {
+                featureFlags += "," + ScriptConstants.FeatureFlagStrictHISModeEnabled;
+            }
+            if (strictHISWarnEnabled)
+            {
+                featureFlags += "," + ScriptConstants.FeatureFlagStrictHISModeWarn;
+            }
+
+            string functionName = "TestFunction";
+            using (var directory = new TempDirectory())
+            using (var scopedEnv = new TestScopedEnvironmentVariable(EnvironmentSettingNames.AzureWebJobsFeatureFlags, featureFlags))
+            {
+                var metricsLogger = new TestMetricsLogger();
+                using (var secretManager = CreateSecretManager(directory.Path, simulateWriteConversion: false, metricsLogger: metricsLogger))
+                {
+                    // add a non-HIS key
+                    var result = await secretManager.AddOrUpdateFunctionSecretAsync("function-key-1", "9876", functionName, ScriptSecretsType.Function);
+                    OperationResult expected = strictHISEnabled ? OperationResult.BadRequest : OperationResult.Created;
+                    Assert.Equal(expected, result.Result);
+
+                    // add an HIS key with an explicit value
+                    string hisFunctionKey = SecretGenerator.GenerateFunctionKeyValue();
+                    result = await secretManager.AddOrUpdateFunctionSecretAsync("function-key-2", hisFunctionKey, functionName, ScriptSecretsType.Function);
+                    Assert.Equal(OperationResult.Created, result.Result);
+
+                    // add an HIS key with a generated value
+                    result = await secretManager.AddOrUpdateFunctionSecretAsync("function-key-3", null, functionName, ScriptSecretsType.Function);
+                    Assert.Equal(OperationResult.Created, result.Result);
+
+                    // update with a non-HIS key
+                    expected = strictHISEnabled ? OperationResult.BadRequest : OperationResult.Updated;
+                    result = await secretManager.AddOrUpdateFunctionSecretAsync("function-key-3", "9876", functionName, ScriptSecretsType.Function);
+                    Assert.Equal(expected, result.Result);
+
+                    // update with an HIS key
+                    result = await secretManager.AddOrUpdateFunctionSecretAsync("function-key-3", hisFunctionKey, functionName, ScriptSecretsType.Function);
+                    Assert.Equal(OperationResult.Updated, result.Result);
+
+                    // force the secrets to load, at which time we perform validation
+                    var secrets = await secretManager.GetFunctionSecretsAsync(functionName);
+                    if (strictHISEnabled)
+                    {
+                        Assert.Equal(2, secrets.Count);
+                        Assert.Equal(hisFunctionKey, secrets["function-key-2"]);
+                        Assert.Equal(hisFunctionKey, secrets["function-key-3"]);
+                    }
+                    else if (strictHISWarnEnabled)
+                    {
+                        Assert.Equal(3, secrets.Count);
+                        Assert.Equal("9876", secrets["function-key-1"]);
+                        Assert.Equal(hisFunctionKey, secrets["function-key-2"]);
+                        Assert.Equal(hisFunctionKey, secrets["function-key-3"]);
+                    }
+                }
+
+                var warningLogs = _loggerProvider.GetAllLogMessages().Where(p => p.Level >= LogLevel.Warning).ToArray();
+                var errorLogs = _loggerProvider.GetAllLogMessages().Where(p => p.Level >= LogLevel.Error).ToArray();
+                var metricEvents = metricsLogger.LoggedEvents.GroupBy(p => p).ToDictionary(p => p.Key, p => p.Count());
+                if (strictHISEnabled)
+                {
+                    Assert.Empty(warningLogs);
+                    Assert.Empty(errorLogs);
+
+                    Assert.Equal(2, metricsLogger.LoggedEvents.Count);
+                    Assert.Equal(2, metricEvents["host.secrets.identifiable_testfunction"]);
+                }
+                else if (strictHISWarnEnabled)
+                {
+                    Assert.Empty(errorLogs);
+                    Assert.Equal(1, warningLogs.Length);
+
+                    VerifyHISDiagnosticEvent(LogLevel.Warning, warningLogs.Single(), "Function", "function-key-1", "testfunction");
+
+                    Assert.Equal(3, metricsLogger.LoggedEvents.Count);
+                    Assert.Equal(1, metricEvents["host.secrets.nonidentifiable_testfunction"]);
+                    Assert.Equal(2, metricEvents["host.secrets.identifiable_testfunction"]);
+                }
+                else
+                {
+                    Assert.Empty(warningLogs);
+                    Assert.Empty(errorLogs);
+
+                    Assert.Equal(3, metricsLogger.LoggedEvents.Count);
+                    Assert.Equal(1, metricEvents["host.secrets.nonidentifiable_testfunction"]);
+                    Assert.Equal(2, metricEvents["host.secrets.identifiable_testfunction"]);
+                }
+            }
+        }
+
+        [Theory]
+        [InlineData(false, false)]
+        [InlineData(false, true)]
+        [InlineData(true, false)]
+        [InlineData(true, true)]
+        [Trait(TestTraits.Group, TestTraits.HISSecretsTests)]
+        public async Task SetMasterKey_PerformsHISValidation(bool strictHISEnabled, bool strictHISWarnEnabled)
+        {
+            string featureFlags = "Foo,Bar";
+            if (strictHISEnabled)
+            {
+                featureFlags += "," + ScriptConstants.FeatureFlagStrictHISModeEnabled;
+            }
+            if (strictHISWarnEnabled)
+            {
+                featureFlags += "," + ScriptConstants.FeatureFlagStrictHISModeWarn;
+            }
+
+            using (var directory = new TempDirectory())
+            using (var scopedEnv = new TestScopedEnvironmentVariable(EnvironmentSettingNames.AzureWebJobsFeatureFlags, featureFlags))
+            {
+                var metricsLogger = new TestMetricsLogger();
+                using (var secretManager = CreateSecretManager(directory.Path, simulateWriteConversion: false, metricsLogger: metricsLogger))
+                {
+                    // set to an HIS key with a generated value
+                    var result = await secretManager.SetMasterKeyAsync(null);
+                    Assert.Equal(OperationResult.Created, result.Result);
+
+                    // set to an HIS key with an explicit value
+                    string hisFunctionKey = SecretGenerator.GenerateMasterKeyValue();
+                    result = await secretManager.SetMasterKeyAsync(hisFunctionKey);
+                    Assert.Equal(OperationResult.Updated, result.Result);
+
+                    // set to a non-HIS key
+                    result = await secretManager.SetMasterKeyAsync("9876");
+                    OperationResult expected = strictHISEnabled ? OperationResult.BadRequest : OperationResult.Updated;
+                    Assert.Equal(expected, result.Result);
+
+                    // force the secrets to load, at which time we perform validation
+                    // we don't expect any errors
+                    var secrets = await secretManager.GetHostSecretsAsync();
+
+                    if (strictHISEnabled)
+                    {
+                        Assert.Equal(hisFunctionKey, secrets.MasterKey);
+                    }
+                    else
+                    {
+                        Assert.Equal("9876", secrets.MasterKey);
+                    }
+                }
+
+                var logs = _loggerProvider.GetAllLogMessages().Where(p => p.Level >= LogLevel.Warning).ToArray();
+                var metricEvents = metricsLogger.LoggedEvents.GroupBy(p => p).ToDictionary(p => p.Key, p => p.Count());
+                if (strictHISEnabled)
+                {
+                    Assert.Equal(2, metricsLogger.LoggedEvents.Count);
+                    Assert.Equal(2, metricEvents["host.secrets.identifiable"]);
+                }
+                else if (strictHISWarnEnabled)
+                {
+                    Assert.Equal(2, metricsLogger.LoggedEvents.Count);
+                    Assert.Equal(1, metricEvents["host.secrets.nonidentifiable"]);
+                    Assert.Equal(1, metricEvents["host.secrets.identifiable"]);
+
+                    Assert.Equal(1, logs.Length);
+                    VerifyHISDiagnosticEvent(LogLevel.Warning, logs.Single(), "Master", ScriptConstants.MasterKeyName);
+                }
+                else
+                {
+                    Assert.Equal(0, logs.Length);
+
+                    Assert.Equal(2, metricsLogger.LoggedEvents.Count);
+                    Assert.Equal(1, metricEvents["host.secrets.nonidentifiable"]);
+                    Assert.Equal(1, metricEvents["host.secrets.identifiable"]);
+                }
+            }
+        }
+
         [Fact]
         public async Task SetMasterKey_WithProvidedKey_UsesProvidedKeyAndPersistsFile()
         {
-            string testSecret = "abcde0123456789abcde0123456789abcde0123456789";
+            string testSecret = "PLACEHOLDER";
             using (var directory = new TempDirectory())
             {
                 KeyOperationResult result;
@@ -951,9 +1661,24 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Security
                 Assert.True(backupCount >= ScriptConstants.MaximumSecretBackupCount);
 
                 Assert.True(Directory.GetFiles(directory.Path, $"{functionName}.{ScriptConstants.Snapshot}*").Length >= ScriptConstants.MaximumSecretBackupCount);
+
+                // There will be two log entries of the expectedTraceMessage:
+                // 1) Debug level log entry
                 Assert.True(_loggerProvider.GetAllLogMessages().Any(
                     t => t.Level == LogLevel.Debug && t.FormattedMessage.IndexOf(expectedTraceMessage, StringComparison.OrdinalIgnoreCase) > -1),
                     "Expected Trace message not found");
+
+                // 2) Diagnostic event with LogLevel.Error, indicating that the app will not be able to start; this will be shown to the user in the Portal.
+                var expectedDiagnosticEvent = _loggerProvider.GetAllLogMessages().LastOrDefault();
+                Assert.True(expectedDiagnosticEvent != null &&
+                            expectedDiagnosticEvent.Level == LogLevel.Error &&
+                            expectedDiagnosticEvent.FormattedMessage.IndexOf(expectedTraceMessage, StringComparison.OrdinalIgnoreCase) > -1,
+                            "Expected Diagnostic event log entry not found");
+
+                // Validate diagnostic event MS_HelpLink and MS_ErrorCode
+                var myDictionary = (Dictionary<string, object>)expectedDiagnosticEvent.State;
+                Assert.Equal(myDictionary.GetValueOrDefault("MS_HelpLink").ToString(), DiagnosticEventConstants.MaximumSecretBackupCountHelpLink);
+                Assert.Equal(myDictionary.GetValueOrDefault("MS_ErrorCode").ToString(), DiagnosticEventConstants.MaximumSecretBackupCountErrorCode);
             }
         }
 
@@ -1155,6 +1880,76 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Security
             }
         }
 
+        [Theory]
+        [InlineData("../../../etc/shadow")]
+        [InlineData("foo/../../etc/passwd")]
+        public async Task FileSystemSecretsRepository_ReadAsync_PathTraversal_Throws(string maliciousFunctionName)
+        {
+            using (var directory = new TempDirectory())
+            {
+                var repository = new FileSystemSecretsRepository(directory.Path, _logger, _testEnvironment);
+
+                var ex = await Assert.ThrowsAsync<ArgumentException>(
+                    () => repository.ReadAsync(ScriptSecretsType.Function, maliciousFunctionName));
+
+                Assert.Contains("outside the secrets directory", ex.Message);
+            }
+        }
+
+        [Theory]
+        [InlineData("../../../etc/shadow")]
+        [InlineData("foo/../../etc/passwd")]
+        public async Task FileSystemSecretsRepository_WriteAsync_PathTraversal_Throws(string maliciousFunctionName)
+        {
+            using (var directory = new TempDirectory())
+            {
+                var repository = new FileSystemSecretsRepository(directory.Path, _logger, _testEnvironment);
+                var secrets = new FunctionSecrets();
+
+                var ex = await Assert.ThrowsAsync<ArgumentException>(
+                    () => repository.WriteAsync(ScriptSecretsType.Function, maliciousFunctionName, secrets));
+
+                Assert.Contains("outside the secrets directory", ex.Message);
+            }
+        }
+
+        [Fact]
+        public async Task FileSystemSecretsRepository_ReadAsync_ValidFunctionName_DoesNotThrow()
+        {
+            using (var directory = new TempDirectory())
+            {
+                var repository = new FileSystemSecretsRepository(directory.Path, _logger, _testEnvironment);
+
+                var result = await repository.ReadAsync(ScriptSecretsType.Function, "MyFunction");
+
+                Assert.Null(result);
+            }
+        }
+
+        [Fact]
+        public async Task FileSystemSecretsRepository_ReadAsync_NullFunctionName_Throws()
+        {
+            using (var directory = new TempDirectory())
+            {
+                var repository = new FileSystemSecretsRepository(directory.Path, _logger, _testEnvironment);
+
+                await Assert.ThrowsAsync<ArgumentNullException>(
+                    () => repository.ReadAsync(ScriptSecretsType.Function, null));
+            }
+        }
+
+        [Fact]
+        public async Task FileSystemSecretsRepository_ReadAsync_EmptyFunctionName_Throws()
+        {
+            using (var directory = new TempDirectory())
+            {
+                var repository = new FileSystemSecretsRepository(directory.Path, _logger, _testEnvironment);
+
+                await Assert.ThrowsAsync<ArgumentException>(
+                    () => repository.ReadAsync(ScriptSecretsType.Function, string.Empty));
+            }
+        }
+
         private Mock<IKeyValueConverterFactory> GetConverterFactoryMock(bool simulateWriteConversion = true, bool setStaleValue = true)
         {
             var mockValueReader = new Mock<IKeyValueReader>();
@@ -1259,12 +2054,44 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Security
             File.WriteAllText(Path.Combine(path, "testfunction.json"), functionSecrets);
         }
 
+        private void VerifyHISDiagnosticEvent(LogLevel expectedLevel, LogMessage logMessage, string keyType, string keyName, string functionName = null)
+        {
+            Assert.Equal(expectedLevel, logMessage.Level);
+
+            VerifyHISMessage(logMessage.FormattedMessage, keyType, keyName, functionName);
+
+            var state = logMessage.State.ToDictionary(p => p.Key, p => p.Value);
+            Assert.Equal(string.Empty, state[ScriptConstants.DiagnosticEventKey]);
+            Assert.Equal(DiagnosticEventConstants.NonHISSecretLoaded, state[ScriptConstants.ErrorCodeKey]);
+            Assert.Equal(DiagnosticEventConstants.NonHISSecretLoadedHelpLink, state[ScriptConstants.HelpLinkKey]);
+        }
+
+        private void VerifyHISMessage(string message, string keyType, string keyName, string functionName = null)
+        {
+            string expectedMessage = string.Format(Resources.NonHISSecret, keyType, keyName, functionName);
+            Assert.Equal(expectedMessage, message);
+        }
+
+        [Extension("EventGrid", "EventGrid")]
+        private class TestEventGridExtensionConfigProvider : IExtensionConfigProvider, IAsyncConverter<HttpRequestMessage, HttpResponseMessage>
+        {
+            public Task<HttpResponseMessage> ConvertAsync(HttpRequestMessage input, CancellationToken cancellationToken)
+            {
+                throw new NotImplementedException();
+            }
+
+            public void Initialize(ExtensionConfigContext context)
+            {
+            }
+        }
+
         private class TestSecretsRepository : ISecretsRepository
         {
             private int _writeCount = 0;
             private Random _rand = new Random();
             private bool _enforceSerialWrites = false;
             private bool _forceWriteErrors = false;
+            private bool _shouldSuceedAfterFailing = false;
             private HttpStatusCode _httpstaus;
 
             public TestSecretsRepository(bool enforceSerialWrites)
@@ -1272,10 +2099,11 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Security
                 _enforceSerialWrites = enforceSerialWrites;
             }
 
-            public TestSecretsRepository(bool enforceSerialWrites, bool forceWriteErrors, HttpStatusCode httpstaus = HttpStatusCode.InternalServerError)
+            public TestSecretsRepository(bool enforceSerialWrites, bool forceWriteErrors, bool shouldSucceedAfterFailing = false, HttpStatusCode httpstaus = HttpStatusCode.InternalServerError)
                 : this(enforceSerialWrites)
             {
                 _forceWriteErrors = forceWriteErrors;
+                _shouldSuceedAfterFailing = shouldSucceedAfterFailing;
                 _httpstaus = httpstaus;
             }
 
@@ -1319,6 +2147,11 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Security
             {
                 if (_forceWriteErrors)
                 {
+                    // Replicate making the first write fail, but succeed on the second attempt
+                    if (_shouldSuceedAfterFailing)
+                    {
+                        await WriteAsyncHelper(type, functionName, secrets);
+                    }
                     throw new RequestFailedException((int)_httpstaus, "Error");
                 }
 
@@ -1327,6 +2160,11 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Security
                     throw new Exception("Concurrent writes detected!");
                 }
 
+                await WriteAsyncHelper(type, functionName, secrets);
+            }
+
+            private async Task WriteAsyncHelper(ScriptSecretsType type, string functionName, ScriptSecrets secrets)
+            {
                 Interlocked.Increment(ref _writeCount);
 
                 await Task.Delay(_rand.Next(100, 300));

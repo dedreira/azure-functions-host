@@ -7,8 +7,10 @@ using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Host.Loggers;
+using Microsoft.Azure.WebJobs.Logging;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
+using Microsoft.Azure.WebJobs.Script.Metrics;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 
@@ -20,15 +22,17 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
 
         private readonly IMetricsLogger _metrics;
         private readonly IFunctionMetadataManager _metadataManager;
+        private readonly IHostMetrics _hostMetrics;
         private ConcurrentDictionary<(string, string, bool, bool), string> _eventDataCache = new ConcurrentDictionary<(string, string, bool, bool), string>();
         private ConcurrentDictionary<BindingMetadata, string> _bindingMetricEventNames = new ConcurrentDictionary<BindingMetadata, string>();
 
         public FunctionInstanceLogger(
             IFunctionMetadataManager metadataManager,
             IMetricsLogger metrics,
+            IHostMetrics hostMetrics,
             IConfiguration configuration,
             ILoggerFactory loggerFactory)
-            : this(metadataManager, metrics)
+            : this(metadataManager, metrics, hostMetrics)
         {
             ArgumentNullException.ThrowIfNull(configuration);
             ArgumentNullException.ThrowIfNull(loggerFactory);
@@ -40,9 +44,10 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
             }
         }
 
-        internal FunctionInstanceLogger(IFunctionMetadataManager metadataManager, IMetricsLogger metrics)
+        internal FunctionInstanceLogger(IFunctionMetadataManager metadataManager, IMetricsLogger metrics, IHostMetrics hostMetrics)
         {
             _metrics = metrics ?? throw new ArgumentNullException(nameof(metrics));
+            _hostMetrics = hostMetrics ?? throw new ArgumentNullException(nameof(hostMetrics));
             _metadataManager = metadataManager ?? throw new ArgumentNullException(nameof(metadataManager));
         }
 
@@ -62,6 +67,8 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
 
         private void StartFunction(FunctionInstanceLogEntry item)
         {
+            _hostMetrics.IncrementStartedInvocationCount();
+
             if (_metadataManager.TryGetFunctionMetadata(item.LogName, out FunctionMetadata function))
             {
                 var startedEvent = new FunctionStartedEvent(item.FunctionInstanceId, function);
@@ -112,7 +119,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
                 data = string.Format(Microsoft.Azure.WebJobs.Script.Properties.Resources.FunctionInvocationMetricsData, startedEvent.FunctionMetadata.Language, functionName, success, Stopwatch.IsHighResolution);
                 _eventDataCache[key] = data;
             }
-            _metrics.LogEvent(eventName, startedEvent.FunctionName, data);
+            _metrics.LogEvent(eventName, startedEvent.FunctionName, Sanitizer.Sanitize(data));
 
             startedEvent.Data = data;
             _metrics.EndEvent(startedEvent);
@@ -124,6 +131,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
             }
 
             _metrics.EndEvent(invokeLatencyEvent);
+            _hostMetrics.TrackFunctionExecutionDuration(item.Duration.TotalSeconds, functionName);
         }
 
         public Task FlushAsync(CancellationToken cancellationToken = default(CancellationToken)) => Task.CompletedTask;

@@ -2,42 +2,62 @@
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Host.Executors;
+using Microsoft.Azure.WebJobs.Hosting;
 using Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.WebHost.Helpers;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.WebJobs.Script.Tests;
+using Azure.Data.Tables;
 using Moq;
 using Moq.Protected;
 using Xunit;
-using System.Linq;
-using Microsoft.Azure.Cosmos.Table;
-using System.Collections.Generic;
-using System.Collections.Concurrent;
+using Microsoft.Azure.WebJobs.Script.Tests.Integration.Fixtures;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Diagnostics
 {
-    public class DiagnosticEventTableStorageRepositoryTests
+    [Trait(TestTraits.Group, TestTraits.NonE2EStorage)]
+    public class DiagnosticEventTableStorageRepositoryTests : IClassFixture<AzuriteFixture>
     {
         private const string TestHostId = "testhostid";
         private readonly IHostIdProvider _hostIdProvider;
         private readonly TestLoggerProvider _loggerProvider;
-        private IConfiguration _configuration;
-        private ILogger<DiagnosticEventTableStorageRepository> _logger;
+        private readonly IAzureTableStorageProvider _azureTableStorageProvider;
+        private readonly AzuriteFixture _azurite;
 
-        public DiagnosticEventTableStorageRepositoryTests()
+        private ILogger<DiagnosticEventTableStorageRepository> _logger;
+        private Mock<IScriptHostManager> _scriptHostMock;
+
+        public DiagnosticEventTableStorageRepositoryTests(AzuriteFixture azurite)
         {
-            _configuration = new ConfigurationBuilder().AddEnvironmentVariables().Build();
+            _azurite = azurite;
             _hostIdProvider = new FixedHostIdProvider(TestHostId);
+
+            var mockPrimaryHostStateProvider = new Mock<IPrimaryHostStateProvider>(MockBehavior.Strict);
+            mockPrimaryHostStateProvider.Setup(p => p.IsPrimary).Returns(false);
+
+            _scriptHostMock = new Mock<IScriptHostManager>(MockBehavior.Strict);
+            _scriptHostMock.As<IServiceProvider>().Setup(m => m.GetService(typeof(IPrimaryHostStateProvider))).Returns(mockPrimaryHostStateProvider.Object);
 
             _loggerProvider = new TestLoggerProvider();
             ILoggerFactory loggerFactory = new LoggerFactory();
             loggerFactory.AddProvider(_loggerProvider);
             _logger = loggerFactory.CreateLogger<DiagnosticEventTableStorageRepository>();
+
+            var configuration = new ConfigurationBuilder()
+                .AddInMemoryCollection(new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    { "AzureWebJobsStorage", _azurite.GetConnectionString() },
+                })
+                .Build();
+            _azureTableStorageProvider = TestHelpers.GetAzureTableStorageProvider(configuration);
         }
 
         [Fact]
@@ -46,9 +66,12 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Diagnostics
             IEnvironment testEnvironment = new TestEnvironment();
             int flushInterval = 10;
             Mock<DiagnosticEventTableStorageRepository> mockDiagnosticEventTableStorageRepository = new Mock<DiagnosticEventTableStorageRepository>
-                (_configuration, _hostIdProvider, testEnvironment, NullLogger<DiagnosticEventTableStorageRepository>.Instance, flushInterval);
+                (_hostIdProvider, testEnvironment, _scriptHostMock.Object, _azureTableStorageProvider, NullLogger<DiagnosticEventTableStorageRepository>.Instance, flushInterval);
 
             DiagnosticEventTableStorageRepository repository = mockDiagnosticEventTableStorageRepository.Object;
+
+            // Write a diagnostic event to trigger the timer
+            mockDiagnosticEventTableStorageRepository.Object.WriteDiagnosticEvent(DateTime.UtcNow, "eh1", LogLevel.Information, "This is the message", "https://fwlink/", new Exception("exception message"));
 
             int numFlushes = 0;
             mockDiagnosticEventTableStorageRepository.Protected().Setup("OnFlushLogs", ItExpr.IsAny<object>())
@@ -63,17 +86,38 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Diagnostics
         }
 
         [Fact]
-        public void WriteDiagnostic_LogsError_whenHostIdNotSet()
+        public void TimerFlush_NotStartedWithRepositoryDisabled()
+        {
+            IEnvironment testEnvironment = new TestEnvironment();
+            testEnvironment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
+
+            var configuration = new ConfigurationBuilder().Build();
+            var localStorageProvider = TestHelpers.GetAzureTableStorageProvider(configuration);
+            DiagnosticEventTableStorageRepository repository =
+                new DiagnosticEventTableStorageRepository(_hostIdProvider, testEnvironment, _scriptHostMock.Object, localStorageProvider, _logger);
+
+            repository.WriteDiagnosticEvent(DateTime.UtcNow, "eh1", LogLevel.Information, "This is the message", "https://fwlink/", new Exception("exception message"));
+
+            var flushLogsTimerField = typeof(DiagnosticEventTableStorageRepository)
+            .GetField("_flushLogsTimer", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            var lazyTimer = flushLogsTimerField.GetValue(repository) as Lazy<Timer>;
+
+            Assert.False(repository.IsEnabled());
+            Assert.False(lazyTimer.IsValueCreated, "Timer should not be created when repository is disabled");
+        }
+
+        [Fact]
+        public void WriteDiagnostic_LogsError_WhenHostIdNotSet()
         {
             IEnvironment testEnvironment = new TestEnvironment();
 
             DiagnosticEventTableStorageRepository repository =
-                new DiagnosticEventTableStorageRepository(_configuration, null, testEnvironment, _logger);
+                new DiagnosticEventTableStorageRepository(null, testEnvironment, _scriptHostMock.Object, _azureTableStorageProvider, _logger);
 
             repository.WriteDiagnosticEvent(DateTime.UtcNow, "eh1", LogLevel.Information, "This is the message", "https://fwlink/", new Exception("exception message"));
 
             var messages = _loggerProvider.GetAllLogMessages();
-            Assert.Equal(messages[0].FormattedMessage, "Unable to write diagnostic events. Host id is set to null.");
+            Assert.Equal(0, repository.Events.Values.Count());
         }
 
         [Fact]
@@ -83,7 +127,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Diagnostics
             testEnvironment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
 
             DiagnosticEventTableStorageRepository repository =
-                new DiagnosticEventTableStorageRepository(_configuration, _hostIdProvider, testEnvironment, _logger);
+                new DiagnosticEventTableStorageRepository(_hostIdProvider, testEnvironment, _scriptHostMock.Object, _azureTableStorageProvider, _logger);
 
             var eventTask1 = Task.Run(() =>
             {
@@ -122,34 +166,46 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Diagnostics
         }
 
         [Fact]
-        public void GetDiagnosticEventsTable_ReturnsExpectedValue_WhenSpecialized()
+        public async Task GetDiagnosticEventsTable_ReturnsExpectedValue_WhenSpecialized()
         {
             IEnvironment testEnvironment = new TestEnvironment();
             testEnvironment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
 
             DiagnosticEventTableStorageRepository repository =
-                new DiagnosticEventTableStorageRepository(_configuration, _hostIdProvider, testEnvironment, _logger);
+                new DiagnosticEventTableStorageRepository(_hostIdProvider, testEnvironment, _scriptHostMock.Object, _azureTableStorageProvider, _logger);
+            
             DateTime dateTime = new DateTime(2021, 1, 1);
-            var cloudTable = repository.GetDiagnosticEventsTable(dateTime);
+            var cloudTable = await repository.GetDiagnosticEventsTableAsync(dateTime);
             Assert.NotNull(cloudTable);
             Assert.NotNull(repository.TableClient);
             Assert.Equal(cloudTable.Name, $"{DiagnosticEventTableStorageRepository.TableNamePrefix}202101");
         }
 
         [Fact]
-        public void GetDiagnosticEventsTable_LogsError_StorageConnectionStringIsNotPresent()
+        public async Task GetDiagnosticEventsTable_LogsError_StorageConnectionStringIsNotPresent()
         {
             IEnvironment testEnvironment = new TestEnvironment();
             testEnvironment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
 
             var configuration = new ConfigurationBuilder().Build();
+            var localStorageProvider = TestHelpers.GetAzureTableStorageProvider(configuration);
             DiagnosticEventTableStorageRepository repository =
-                new DiagnosticEventTableStorageRepository(configuration, _hostIdProvider, testEnvironment, _logger);
+                new DiagnosticEventTableStorageRepository(_hostIdProvider, testEnvironment, _scriptHostMock.Object, localStorageProvider, _logger);
+
+            // Service should start enabled
+            Assert.True(repository.IsEnabled());
+
+            // FlushLogs triggers initialization, which will fail and disable the service
+            await repository.FlushLogs();
+
             DateTime dateTime = new DateTime(2021, 1, 1);
-            var cloudTable = repository.GetDiagnosticEventsTable(dateTime);
+            var cloudTable = await repository.GetDiagnosticEventsTableAsync(dateTime);
             Assert.Null(cloudTable);
+            Assert.False(repository.IsEnabled());
+
             var messages = _loggerProvider.GetAllLogMessages();
-            Assert.Equal(messages[0].FormattedMessage, "Azure Storage connection string is empty or invalid. Unable to write diagnostic events.");
+            var errorIntializingPresent = messages.Any(m => m.FormattedMessage.Contains("We couldn\u2019t initialize the Table Storage Client"));
+            Assert.True(errorIntializingPresent);
         }
 
         [Fact]
@@ -159,22 +215,23 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Diagnostics
             testEnvironment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
 
             DiagnosticEventTableStorageRepository repository =
-                new DiagnosticEventTableStorageRepository(_configuration, _hostIdProvider, testEnvironment, _logger);
+                new DiagnosticEventTableStorageRepository(_hostIdProvider, testEnvironment, _scriptHostMock.Object, _azureTableStorageProvider, _logger);
 
             // delete any existing non-current diagnostics events tables
             string tablePrefix = DiagnosticEventTableStorageRepository.TableNamePrefix;
-            var currentTable = repository.GetDiagnosticEventsTable();
+            var currentTable = await repository.GetDiagnosticEventsTableAsync();
             var tables = await TableStorageHelpers.ListOldTablesAsync(currentTable, repository.TableClient, tablePrefix);
             foreach (var table in tables)
             {
-                await table.DeleteIfExistsAsync();
+                await table.DeleteAsync();
             }
 
             // create 3 old tables
             for (int i = 0; i < 3; i++)
             {
-                var table = repository.TableClient.GetTableReference($"{tablePrefix}Test{i}");
-                await TableStorageHelpers.CreateIfNotExistsAsync(table, 2);
+                var tableId = Guid.NewGuid().ToString("N").Substring(0, 5);
+                var table = repository.TableClient.GetTableClient($"{tablePrefix}Test{tableId}");
+                await TableStorageHelpers.CreateIfNotExistsAsync(table, repository.TableClient, 2);
             }
 
             // verify tables were created
@@ -193,27 +250,148 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Diagnostics
         }
 
         [Fact]
-        public async Task FlushLogs_LogsErrorAndClearsEvents_WhenTableCreatingFails()
+        public async Task QueueBackgroundDiagnosticsEventsTablePurge_PurgesOnlyDiagnosticTables()
         {
-            // Clear events by flush logs if table creation attempts fail
             IEnvironment testEnvironment = new TestEnvironment();
             testEnvironment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
 
             DiagnosticEventTableStorageRepository repository =
-                new DiagnosticEventTableStorageRepository(_configuration, _hostIdProvider, testEnvironment, _logger);
+                new DiagnosticEventTableStorageRepository(_hostIdProvider, testEnvironment, _scriptHostMock.Object, _azureTableStorageProvider, _logger);
 
-            var tableClient = repository.TableClient;
-            var cloudTable = tableClient.GetTableReference("aa");
+            // delete any existing non-current diagnostics events tables
+            string tablePrefix = DiagnosticEventTableStorageRepository.TableNamePrefix;
+            var currentTable = await repository.GetDiagnosticEventsTableAsync();
+            var tables = await TableStorageHelpers.ListOldTablesAsync(currentTable, repository.TableClient, tablePrefix);
+            foreach (var table in tables)
+            {
+                await table.DeleteAsync();
+            }
 
-            repository.WriteDiagnosticEvent(DateTime.UtcNow, "eh1", LogLevel.Information, "This is the message", "https://fwlink/", new Exception("exception message"));
+            // create 1 old table
+            var tableId = Guid.NewGuid().ToString("N").Substring(0, 5);
+            var oldTable = repository.TableClient.GetTableClient($"{tablePrefix}Test{tableId}");
+            await TableStorageHelpers.CreateIfNotExistsAsync(oldTable, repository.TableClient, 2);
 
-            Assert.Equal(1, repository.Events.Values.Count());
+            // create a non-diagnostic table
+            var nonDiagnosticTable = repository.TableClient.GetTableClient("NonDiagnosticTable");
+            await TableStorageHelpers.CreateIfNotExistsAsync(nonDiagnosticTable, repository.TableClient, 2);
 
-            await repository.FlushLogs(cloudTable);
+            // verify tables were created
+            Assert.True(await TableStorageHelpers.TableExistAsync(oldTable, repository.TableClient));
+            Assert.True(await TableStorageHelpers.TableExistAsync(nonDiagnosticTable, repository.TableClient));
 
-            Assert.Equal(0, repository.Events.Values.Count());
-            var logMessage = _loggerProvider.GetAllLogMessages()[0];
-            Assert.True(logMessage.FormattedMessage.StartsWith("Unable to create table 'aa'"));
+            // queue the background purge
+            TableStorageHelpers.QueueBackgroundTablePurge(currentTable, repository.TableClient, tablePrefix, NullLogger.Instance, 0);
+
+            // wait for the purge to complete
+            await TestHelpers.Await(async () =>
+            {
+                // verify that only the diagnostic table was deleted
+                var diagnosticTableExist = await TableStorageHelpers.TableExistAsync(oldTable, repository.TableClient);
+                var nonDiagnosticTableExists = await TableStorageHelpers.TableExistAsync(nonDiagnosticTable, repository.TableClient);
+
+                return !diagnosticTableExist && nonDiagnosticTableExists;
+            }, timeout: 5000);
+        }
+
+        [Fact]
+        public async Task FlushLogs_OnPrimaryHost_DoesNotTryToPurgeEvents_WhenTableClientNotInitialized()
+        {
+            // Arrange
+            IEnvironment testEnvironment = new TestEnvironment();
+            testEnvironment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
+
+            var testData = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                { "AzureWebJobsStorage", null }
+            };
+
+            var configuration = new ConfigurationBuilder()
+                .AddEnvironmentVariables()
+                .AddInMemoryCollection(testData)
+                .Build();
+
+            var mockPrimaryHostStateProvider = new Mock<IPrimaryHostStateProvider>(MockBehavior.Strict);
+            mockPrimaryHostStateProvider.Setup(p => p.IsPrimary).Returns(true);
+
+            var scriptHostMock = new Mock<IScriptHostManager>(MockBehavior.Strict);
+            scriptHostMock.As<IServiceProvider>().Setup(m => m.GetService(typeof(IPrimaryHostStateProvider))).Returns(mockPrimaryHostStateProvider.Object);
+
+            var localStorageProvider = TestHelpers.GetAzureTableStorageProvider(configuration);
+            DiagnosticEventTableStorageRepository repository =
+                new DiagnosticEventTableStorageRepository(_hostIdProvider, testEnvironment, scriptHostMock.Object, localStorageProvider, _logger);
+
+            // Act
+            await repository.FlushLogs();
+
+            // Assert
+            var createFailureMessagePresent = _loggerProvider.GetAllLogMessages().Any(m => m.FormattedMessage.Contains("We couldn’t initialize the Table Storage Client using the 'AzureWebJobsStorage' connection string. We are unable to record diagnostic events, so the diagnostic logging service is being stopped. Please check the 'AzureWebJobsStorage' connection string in Application Settings."));
+            Assert.True(createFailureMessagePresent);
+
+            var purgeEventMessagePresent = _loggerProvider.GetAllLogMessages().Any(m => m.FormattedMessage.Contains("Purging diagnostic events with versions older than"));
+            Assert.False(purgeEventMessagePresent);
+
+        }
+
+        [Theory]
+        [InlineData("", 0, true)] // event version not present
+        [InlineData("2021-01-01", 0, true)] // outdated version
+        [InlineData("2024-05-01", 1, true)] // current version
+        [InlineData("anything", 1, false)] // empty table gets skipped
+        public async Task FlushLogs_OnPrimaryHost_PurgesPreviousEventVersionTables(string testEventVersion, int expectedTableCount, bool fillTable)
+        {
+            // Arrange
+            IEnvironment testEnvironment = new TestEnvironment();
+            testEnvironment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
+
+            var mockPrimaryHostStateProvider = new Mock<IPrimaryHostStateProvider>(MockBehavior.Strict);
+            mockPrimaryHostStateProvider.Setup(p => p.IsPrimary).Returns(true);
+
+            var scriptHostMock = new Mock<IScriptHostManager>(MockBehavior.Strict);
+            scriptHostMock.As<IServiceProvider>().Setup(m => m.GetService(typeof(IPrimaryHostStateProvider))).Returns(mockPrimaryHostStateProvider.Object);
+
+            DiagnosticEventTableStorageRepository repository =
+                new DiagnosticEventTableStorageRepository(_hostIdProvider, testEnvironment, scriptHostMock.Object, _azureTableStorageProvider, _logger);
+
+            // delete existing tables
+            string tablePrefix = DiagnosticEventTableStorageRepository.TableNamePrefix;
+            var currentTable = await repository.GetDiagnosticEventsTableAsync();
+            var tables = await TableStorageHelpers.ListOldTablesAsync(currentTable, repository.TableClient, tablePrefix);
+            foreach (var table in tables)
+            {
+                await table.DeleteAsync();
+            }
+
+            var tableId = Guid.NewGuid().ToString("N").Substring(0, 5);
+            var testTable = repository.TableClient.GetTableClient($"{tablePrefix}Test{tableId}");
+            await TableStorageHelpers.CreateIfNotExistsAsync(testTable, repository.TableClient, 2);
+
+            // verify table were created
+            tables = await TableStorageHelpers.ListOldTablesAsync(currentTable, repository.TableClient, tablePrefix);
+            Assert.Equal(1, tables.Count());
+
+            if (fillTable)
+            {
+                // add test diagnostic event
+                var diagnosticEvent = CreateDiagnosticEvent(DateTime.UtcNow, "eh1", LogLevel.Information, "This is the message", "https://fwlink/", new Exception("exception message"), testEventVersion);
+                await testTable.AddEntityAsync(diagnosticEvent);
+            }
+
+            // Act
+            await repository.FlushLogs();
+
+            // Assert
+            await TestHelpers.Await(async () =>
+            {
+                var logMessage = _loggerProvider.GetAllLogMessages().SingleOrDefault(m => m.FormattedMessage.Contains("Purging diagnostic events with versions older than"));
+                Assert.NotNull(logMessage);
+
+                tables = await TableStorageHelpers.ListOldTablesAsync(currentTable, repository.TableClient, tablePrefix);
+                Assert.Equal(expectedTableCount, tables.Count());
+
+                return true;
+
+            }, timeout: 5000);
         }
 
         [Fact]
@@ -223,10 +401,10 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Diagnostics
             testEnvironment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
 
             DiagnosticEventTableStorageRepository repository =
-                new DiagnosticEventTableStorageRepository(_configuration, _hostIdProvider, testEnvironment, _logger);
+                new DiagnosticEventTableStorageRepository(_hostIdProvider, testEnvironment, _scriptHostMock.Object, _azureTableStorageProvider, _logger);
 
-            var table = repository.GetDiagnosticEventsTable();
-            await TableStorageHelpers.CreateIfNotExistsAsync(table, 2);
+            var table = await repository.GetDiagnosticEventsTableAsync();
+            await TableStorageHelpers.CreateIfNotExistsAsync(table, repository.TableClient, 2);
             await EmptyTableAsync(table);
 
             var dateTime = DateTime.UtcNow;
@@ -235,7 +413,29 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Diagnostics
             events.TryAdd("EC123", diagnosticEvent);
             await repository.ExecuteBatchAsync(events, table);
 
-            var results = ExecuteQuery(table, new TableQuery());
+            var results = ExecuteQuery(repository.TableClient, table);
+            Assert.Equal(results.Count(), 1);
+        }
+
+        [Fact]
+        public async Task FlushLogs_WritesToTableStorage()
+        {
+            IEnvironment testEnvironment = new TestEnvironment();
+            testEnvironment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
+
+            DiagnosticEventTableStorageRepository repository =
+                new DiagnosticEventTableStorageRepository(_hostIdProvider, testEnvironment, _scriptHostMock.Object, _azureTableStorageProvider, _logger);
+
+            var table = await repository.GetDiagnosticEventsTableAsync();
+            await TableStorageHelpers.CreateIfNotExistsAsync(table, repository.TableClient, 2);
+            await EmptyTableAsync(table);
+
+            var dateTime = DateTime.UtcNow;
+            var diagnosticEvent = new DiagnosticEvent("hostId", dateTime);
+            repository.Events.TryAdd("EC123", diagnosticEvent);
+            await repository.FlushLogs(table);
+
+            var results = ExecuteQuery(repository.TableClient, table);
             Assert.Equal(results.Count(), 1);
         }
 
@@ -246,10 +446,13 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Diagnostics
             testEnvironment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
 
             DiagnosticEventTableStorageRepository repository =
-                new DiagnosticEventTableStorageRepository(_configuration, _hostIdProvider, testEnvironment, _logger);
+                new DiagnosticEventTableStorageRepository(_hostIdProvider, testEnvironment, _scriptHostMock.Object, _azureTableStorageProvider, _logger);
+
+            // Ensure initialization happens by calling the async method
+            await repository.GetDiagnosticEventsTableAsync();
 
             var tableClient = repository.TableClient;
-            var table = tableClient.GetTableReference("aa");
+            var table = tableClient.GetTableClient("aa");
 
             var dateTime = DateTime.UtcNow;
             var diagnosticEvent = new DiagnosticEvent("hostId", dateTime);
@@ -258,44 +461,115 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Diagnostics
             events.TryAdd("EC123", diagnosticEvent);
             await repository.ExecuteBatchAsync(events, table);
 
-            ExecuteQuery(table, new TableQuery());
             string message = _loggerProvider.GetAllLogMessages()[0].FormattedMessage;
             Assert.True(message.StartsWith("Unable to write diagnostic events to table storage"));
         }
 
-        private async Task EmptyTableAsync(CloudTable table)
+        [Fact]
+        public void Dispose_DoesNotInvokeStorageProvider()
         {
-            var results = ExecuteQuery(table, new TableQuery());
-            if (results.Any())
+            IEnvironment testEnvironment = new TestEnvironment();
+            testEnvironment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "1");
+
+            var storageProviderMock = new Mock<IAzureTableStorageProvider>(MockBehavior.Strict);
+
+            DiagnosticEventTableStorageRepository repository =
+                new DiagnosticEventTableStorageRepository(_hostIdProvider, testEnvironment, _scriptHostMock.Object, storageProviderMock.Object, _logger);
+
+            // Dispose should not trigger any storage calls when in placeholder mode (never initialized)
+            repository.Dispose();
+
+            storageProviderMock.VerifyNoOtherCalls();
+        }
+
+        [Fact]
+        public void Dispose_DoesNotInvokeStorageProvider_WhenNotInPlaceholderModeAndNotInitialized()
+        {
+            IEnvironment testEnvironment = new TestEnvironment();
+            testEnvironment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
+
+            var storageProviderMock = new Mock<IAzureTableStorageProvider>(MockBehavior.Strict);
+
+            DiagnosticEventTableStorageRepository repository =
+                new DiagnosticEventTableStorageRepository(_hostIdProvider, testEnvironment, _scriptHostMock.Object, storageProviderMock.Object, _logger);
+
+            // Repository has never been initialized, so the TableClient should be null
+            Assert.Null(repository.TableClient);
+
+            // Dispose should not trigger any storage calls or initialization when not in placeholder mode but never initialized
+            repository.Dispose();
+
+            storageProviderMock.VerifyNoOtherCalls();
+        }
+
+        [Fact]
+        public async Task FlushLogs_DisablesService_NoPermissions()
+        {
+            IEnvironment testEnvironment = new TestEnvironment();
+            testEnvironment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
+
+            // Tamper the connection string to simulate a permissions issue, we need a valid base64 connection string to create the TableServiceClient.
+            var connectionString = _azurite.GetConnectionString();
+            var configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
             {
-                TableBatchOperation batch = new TableBatchOperation();
-                foreach (var entity in results)
-                {
-                    batch.Add(TableOperation.Delete(entity));
+                { "AzureWebJobsStorage", connectionString.Replace(AzuriteFixture.AccountKey, TamperKey(AzuriteFixture.AccountKey)) },
+            })
+            .Build();
+            var localStorageProvider = TestHelpers.GetAzureTableStorageProvider(configuration);
 
-                    if (batch.Count == 1)
-                    {
-                        var result = await table.ExecuteBatchAsync(batch);
-                        batch = new TableBatchOperation();
-                    }
-                }
+            DiagnosticEventTableStorageRepository repository =
+                new DiagnosticEventTableStorageRepository(_hostIdProvider, testEnvironment, _scriptHostMock.Object, localStorageProvider, _logger);
 
-                if (batch.Count > 0)
-                {
-                    await table.ExecuteBatchAsync(batch);
-                }
+            // The repository should be initially enabled and then disabled after failing to initialize the TableServiceClient while flushing Logs.
+            Assert.True(repository.IsEnabled());
+            await repository.FlushLogs();
+            Assert.False(repository.IsEnabled());
+        }
+
+        private DiagnosticEvent CreateDiagnosticEvent(DateTime timestamp, string errorCode, LogLevel level, string message, string helpLink, Exception exception, string eventVersion)
+        {
+            var diagnosticEvent = new DiagnosticEvent(TestHostId, timestamp)
+            {
+                ErrorCode = errorCode,
+                HelpLink = helpLink,
+                Message = message,
+                LogLevel = level,
+                Details = exception?.ToFormattedString(),
+                HitCount = 1
+            };
+
+            diagnosticEvent.EventVersion = eventVersion ?? DiagnosticEvent.CurrentEventVersion;
+            return diagnosticEvent;
+        }
+
+        private async Task EmptyTableAsync(TableClient table)
+        {
+            var results = table.QueryAsync<TableEntity>();
+
+            await foreach (var entity in results)
+            {
+                await table.DeleteEntityAsync(entity.PartitionKey, entity.RowKey);
             }
         }
 
-        internal IEnumerable<DynamicTableEntity> ExecuteQuery(CloudTable table, TableQuery query)
+        internal IEnumerable<TableEntity> ExecuteQuery(TableServiceClient tableClient, TableClient table)
         {
-            if (!table.Exists())
+            if (!tableClient.Query(p => p.Name == table.Name).Any())
             {
-                return Enumerable.Empty<DynamicTableEntity>();
+                return Enumerable.Empty<TableEntity>();
             }
 
-            return table.ExecuteQuery(query);
+            return table.Query<TableEntity>();
         }
+
+        private string TamperKey(string key) =>
+            string.Create(key.Length, key, (destination, source) =>
+            {
+                source.AsSpan().CopyTo(destination);
+                // We simply replace the first character to maintain a well-formed base64 key
+                destination[0] = destination[0] == 'A' ? 'B' : 'A';
+            });
 
         private class FixedHostIdProvider : IHostIdProvider
         {

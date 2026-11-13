@@ -3,10 +3,14 @@
 
 using System;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
 using Microsoft.Azure.WebJobs.Extensions.Http;
+using Microsoft.Azure.WebJobs.Script.Diagnostics.HealthChecks;
 using Microsoft.Azure.WebJobs.Script.Extensions;
 using Microsoft.Azure.WebJobs.Script.WebHost.Configuration;
+using Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics.HealthChecks;
 using Microsoft.Azure.WebJobs.Script.WebHost.Middleware;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
@@ -15,16 +19,18 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
 {
     public static class WebJobsApplicationBuilderExtension
     {
-        public static IApplicationBuilder UseWebJobsScriptHost(this IApplicationBuilder builder, IApplicationLifetime applicationLifetime)
+        public static IApplicationBuilder UseWebJobsScriptHost(this IApplicationBuilder builder)
         {
-            return UseWebJobsScriptHost(builder, applicationLifetime, null);
+            return UseWebJobsScriptHost(builder, null);
         }
 
-        public static IApplicationBuilder UseWebJobsScriptHost(this IApplicationBuilder builder, IApplicationLifetime applicationLifetime, Action<WebJobsRouteBuilder> routes)
+        public static IApplicationBuilder UseWebJobsScriptHost(this IApplicationBuilder builder, Action<WebJobsRouteBuilder> routes)
         {
             IEnvironment environment = builder.ApplicationServices.GetService<IEnvironment>() ?? SystemEnvironment.Instance;
             IOptionsMonitor<StandbyOptions> standbyOptionsMonitor = builder.ApplicationServices.GetService<IOptionsMonitor<StandbyOptions>>();
             IOptionsMonitor<HttpBodyControlOptions> httpBodyControlOptionsMonitor = builder.ApplicationServices.GetService<IOptionsMonitor<HttpBodyControlOptions>>();
+            IOptionsMonitor<ResponseCompressionOptions> responseCompressionOptionsMonitor = builder.ApplicationServices.GetService<IOptionsMonitor<ResponseCompressionOptions>>();
+
             IServiceProvider serviceProvider = builder.ApplicationServices;
 
             StandbyOptions standbyOptions = standbyOptionsMonitor.CurrentValue;
@@ -37,16 +43,38 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             builder.UseMiddleware<ClrOptimizationMiddleware>();
             builder.UseMiddleware<HttpRequestBodySizeMiddleware>();
             builder.UseMiddleware<SystemTraceMiddleware>();
-            builder.UseMiddleware<HostnameFixupMiddleware>();
+            builder.UseMiddleware<HandleCancellationMiddleware>();
+
+            if (environment.FrontEndRoutingEnsured())
+            {
+                builder.UseMiddleware<HostnameFixupMiddleware>();
+            }
+
+            // Health is registered early in the pipeline to ensure it can avoid failures from the rest of the pipeline.
+            builder.UseHealthChecks();
+
             if (environment.IsAnyLinuxConsumption() || environment.IsAnyKubernetesEnvironment())
             {
                 builder.UseMiddleware<EnvironmentReadyCheckMiddleware>();
             }
 
+#if PLACEHOLDER_SIMULATION
+            if (standbyOptions.InStandbyMode)
+            {
+                builder.UseMiddleware<SpecializationSimulatorMiddleware>();
+            }
+#endif
+
             if (standbyOptions.InStandbyMode)
             {
                 builder.UseMiddleware<PlaceholderSpecializationMiddleware>();
             }
+
+            // Enable response compression only after PlaceholderSpecializationMiddleware, as it requires customer opt-in feature flag value.
+            builder.UseWhen(_ => responseCompressionOptionsMonitor.CurrentValue.EnableResponseCompression, config =>
+            {
+                config.UseResponseCompression();
+            });
 
             // Specialization can change the CompatMode setting, so this must run later than
             // the PlaceholderSpecializationMiddleware
@@ -66,9 +94,12 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
                 config.UseMiddleware<HostWarmupMiddleware>();
             });
 
-            // This middleware must be registered before any other middleware depending on
-            // JobHost/ScriptHost scoped services.
-            builder.UseMiddleware<ScriptHostRequestServiceProviderMiddleware>();
+            builder.UseWhen(context => !context.Request.IsAdminResumeRequest(), config =>
+            {
+                // This middleware must be registered before any other middleware depending on
+                // JobHost/ScriptHost scoped services.
+                config.UseMiddleware<ScriptHostRequestServiceProviderMiddleware>();
+            });
 
             if (environment.IsLinuxAzureManagedHosting())
             {
@@ -95,10 +126,51 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             // source here: https://github.com/aspnet/Mvc/blob/master/src/Microsoft.AspNetCore.Mvc.Core/Builder/MvcApplicationBuilderExtensions.cs
             builder.UseMvc();
 
+            builder.UseMiddleware<ReservedRouteGuardMiddleware>();
+
             // Ensure the HTTP binding routing is registered after all middleware
-            builder.UseHttpBindingRouting(applicationLifetime, routes);
+            builder.UseHttpBindingRouting(routes);
 
             return builder;
+        }
+
+        private static void UseHealthChecks(this IApplicationBuilder app)
+        {
+            // To start we are putting health under 'admin' to:
+            // 1. Avoid conflicts with function routes.
+            // 2. Allow for the same auth model as other admin APIs.
+            // 3. Ensure this is always available to platform callers.
+            // 4. Bypass easy-auth auth.
+            const string healthPrefix = "/admin/health";
+            static bool Predicate(HttpContext context)
+            {
+                return context.Request.Path.StartsWithSegments(healthPrefix);
+            }
+
+            app.MapWhen(Predicate, app =>
+            {
+                app.UseMiddleware<HealthCheckAuthMiddleware>();
+
+                // This supports the ?wait={seconds} query string.
+                app.UseMiddleware<HealthCheckWaitMiddleware>();
+
+                app.UseHealthChecks(healthPrefix, new HealthCheckOptions
+                {
+                    ResponseWriter = HealthCheckResponseWriter.WriteResponseAsync,
+                });
+
+                app.UseHealthChecks($"{healthPrefix}/live", new HealthCheckOptions
+                {
+                    Predicate = r => r.Tags.Contains(HealthCheckTags.Liveness),
+                    ResponseWriter = HealthCheckResponseWriter.WriteResponseAsync,
+                });
+
+                app.UseHealthChecks($"{healthPrefix}/ready", new HealthCheckOptions
+                {
+                    Predicate = r => r.Tags.Contains(HealthCheckTags.Readiness),
+                    ResponseWriter = HealthCheckResponseWriter.WriteResponseAsync,
+                });
+            });
         }
     }
 }

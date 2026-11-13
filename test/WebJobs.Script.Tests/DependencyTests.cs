@@ -3,11 +3,15 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Linq;
+using System.Reflection;
+using System.Runtime.Versioning;
 using System.Text;
 using Microsoft.Azure.WebJobs.Script.Description;
+using Microsoft.Azure.WebJobs.Script.WebHost;
 using Microsoft.Extensions.DependencyModel;
 using Xunit;
 
@@ -15,13 +19,22 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 {
     public class DependencyTests
     {
+#if RELEASE
+        private const string Config = "release";
+#else
+        private const string Config = "debug";
+#endif
+
         // These are changed often and controlled by us, so we don't need to fail if they are updated.
         private static readonly string[] _excludedList = new[]
         {
+            "Azure.Functions.Rpc.Server.dll",
             "Microsoft.Azure.WebJobs.Script.dll",
             "Microsoft.Azure.WebJobs.Script.Grpc.dll",
             "Microsoft.Azure.WebJobs.Script.WebHost.dll",
             "Microsoft.Azure.WebJobs.dll",
+            "Microsoft.Azure.WebJobs.Script.dll",
+            "Microsoft.Azure.WebJobs.Script.Grpc.dll",
             "Microsoft.Azure.WebJobs.Host.dll",
             "Microsoft.Azure.WebJobs.Logging.ApplicationInsights.dll",
             "Microsoft.Azure.WebJobs.Script.Abstractions.dll",
@@ -43,14 +56,14 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         {
             string depsJsonFileName = "Microsoft.Azure.WebJobs.Script.WebHost.deps.json";
             string oldDepsJson = Path.GetFullPath(depsJsonFileName);
-            string webhostBinPath = Path.Combine("..", "..", "..", "..", "..", "src", "WebJobs.Script.WebHost", "bin");
+            string webhostBinPath = Path.Combine("..", "..", "WebJobs.Script.WebHost", Config);
             string newDepsJson = Directory.GetFiles(Path.GetFullPath(webhostBinPath), depsJsonFileName, SearchOption.AllDirectories).FirstOrDefault();
 
             Assert.True(File.Exists(oldDepsJson), $"{oldDepsJson} not found.");
             Assert.True(File.Exists(newDepsJson), $"{newDepsJson} not found.");
 
-            IEnumerable<RuntimeFile> oldAssets = GetRuntimeFiles(oldDepsJson);
-            IEnumerable<RuntimeFile> newAssets = GetRuntimeFiles(newDepsJson);
+            IEnumerable<RuntimeFile> oldAssets = GetRuntimeFiles(oldDepsJson).ToList();
+            IEnumerable<RuntimeFile> newAssets = GetRuntimeFiles(newDepsJson).ToList();
 
             var comparer = new RuntimeFileComparer();
 
@@ -151,8 +164,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             public int GetHashCode([DisallowNull] RuntimeFile obj)
             {
-                string code = obj.Path + obj.AssemblyVersion + obj.FileVersion;
-                return code.GetHashCode();
+                return HashCode.Combine(obj.Path, obj.AssemblyVersion, obj.FileVersion);
             }
         }
     }

@@ -1,12 +1,11 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 namespace Microsoft.Azure.WebJobs.Script.Workers.Rpc
 {
     public static class RpcWorkerConstants
     {
-        public const string FunctionWorkerRuntimeSettingName = "FUNCTIONS_WORKER_RUNTIME";
-        // semicolon seperated string - list of runtimes to start in placeholder mode
+        // Semicolon separated string - list of runtimes to start in placeholder mode
         public const string FunctionWorkerPlaceholderModeListSettingName = "FUNCTIONS_WORKER_RUNTIME_PLACEHOLDER_MODE_LIST";
         public const string FunctionWorkerRuntimeVersionSettingName = "FUNCTIONS_WORKER_RUNTIME_VERSION";
         public const string FunctionsWorkerProcessCountSettingName = "FUNCTIONS_WORKER_PROCESS_COUNT";
@@ -21,11 +20,15 @@ namespace Microsoft.Azure.WebJobs.Script.Workers.Rpc
         public const string JavaLanguageWorkerName = "java";
         public const string PowerShellLanguageWorkerName = "powershell";
         public const string PythonLanguageWorkerName = "python";
+        public const string CustomHandlerLanguageWorkerName = "custom";
         public const string WorkerConfigFileName = "worker.config.json";
         public const string DefaultWorkersDirectoryName = "workers";
+        public const string FunctionsWorkersDirectoryName = "functionsworkers";
 
         // Section names in host.json or AppSettings
         public const string LanguageWorkersSectionName = "languageWorkers";
+        public const string WorkerProbingPathsSectionName = "probingPaths";
+        public const string HostRequirementsSectionName = "hostRequirements";
 
         // Worker description constants
         public const string WorkerDescriptionLanguage = "language";
@@ -55,6 +58,12 @@ namespace Microsoft.Azure.WebJobs.Script.Workers.Rpc
         public const string HandlesWorkerWarmupMessage = "HandlesWorkerWarmupMessage";
         public const string WorkerApplicationInsightsLoggingEnabled = nameof(WorkerApplicationInsightsLoggingEnabled);
         public const string HttpUri = "HttpUri";
+        public const string WorkerOpenTelemetryEnabled = nameof(WorkerOpenTelemetryEnabled);
+
+        /// <summary>
+        /// Indicates whether the RpcHttp request should include the route parameters when the request is being proxied to an HTTP worker.
+        /// </summary>
+        public const string RequiresRouteParameters = "RequiresRouteParameters";
 
         /// <summary>
         /// Indicates whether empty entries in the trigger message should be included when sending RpcInvocation data to OOP workers.
@@ -84,5 +93,11 @@ namespace Microsoft.Azure.WebJobs.Script.Workers.Rpc
 
         public const string WorkerIndexingEnabled = "WORKER_INDEXING_ENABLED";
         public const string WorkerIndexingDisabledApps = "WORKER_INDEXING_DISABLED_APPS";
+        public const string WorkersAvailableForDynamicResolution = "WORKERS_AVAILABLE_FOR_DYNAMIC_RESOLUTION";
+        public const string IgnoredWorkerVersions = "IGNORED_WORKER_VERSIONS";
+        public const string RevertWorkerShutdownBehavior = "REVERT_WORKER_SHUTDOWN_BEHAVIOR";
+        public const string ShutdownWebhostWorkerChannelsOnHostShutdown = "ShutdownWebhostWorkerChannelsOnHostShutdown";
+        public const string ThrowOnMissingFunctionsWorkerRuntime = "THROW_ON_MISSING_FUNCTIONS_WORKER_RUNTIME";
+        public const string WorkerRuntimeStrictValidationEnabled = "WORKER_RUNTIME_STRICT_VALIDATION_ENABLED";
     }
 }

@@ -1,0 +1,198 @@
+jobs:
+- job: RunNonE2EIntegrationTests
+  displayName: Run Non-E2E Integration Tests
+
+  pool:
+    name: 1es-pool-azfunc
+    image: 1es-windows-2022
+    os: windows
+
+  variables:
+    test_projects: test/WebJobs.Script.Tests.Integration/WebJobs.Script.Tests.Integration.csproj
+
+  steps:
+  - template: /eng/ci/templates/install-dotnet.yml@self
+
+  - template: /eng/ci/templates/steps/configure-user-nuget-cfs.yml@self
+
+  - task: UseNode@1
+    inputs:
+      version: 22.x
+
+  - task: JavaToolInstaller@0
+    inputs:
+      versionSpec: '11'
+      jdkArchitectureOption: x64
+      jdkSourceOption: PreInstalled
+
+  - task: npmAuthenticate@0
+    inputs:
+      workingFile: $(Build.SourcesDirectory)/eng/ci/.npmrc
+
+  - script: |
+      npm install -g azurite
+    displayName: Install Azurite
+    env:
+      NPM_CONFIG_USERCONFIG: $(Build.SourcesDirectory)/eng/ci/.npmrc
+
+  - task: DotNetCoreCLI@2
+    displayName: Restore
+    inputs:
+      command: custom
+      custom: restore
+      arguments: -v m
+      projects: $(test_projects)
+
+  - task: DotNetCoreCLI@2
+    displayName: Build
+    inputs:
+      command: build
+      arguments: -v m -c release --no-restore
+      projects: $(test_projects)
+
+  - task: AzurePowerShell@5
+    displayName: Checkout secrets
+    inputs:
+      azureSubscription: Azure-Functions-Host-CI-internal
+      azurePowerShellVersion: 'LatestVersion'
+      pwsh: true
+      ScriptPath: eng/script/checkout-secrets.ps1
+
+  - task: AzureKeyVault@2
+    inputs:
+      # Note: This is actually a Service Connection in DevOps, not an Azure subscription name
+      azureSubscription: Azure-Functions-Host-CI-internal
+      keyVaultName: azure-functions-host-$(LeaseBlob)
+      secretsFilter: '*'
+
+  - task: AzureCLI@2
+    displayName: 'Setup Azure environment'
+    inputs:
+      azureSubscription: Azure-Functions-Host-CI-internal
+      addSpnToEnvironment: true
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: |
+        echo "##vso[task.setvariable variable=ARM_CLIENT_ID]$servicePrincipalId"
+        echo "##vso[task.setvariable variable=ARM_ID_TOKEN]$idToken"
+        echo "##vso[task.setvariable variable=ARM_TENANT_ID]$tenantId"
+
+  - task: PowerShell@2
+    displayName: Start CosmosDB Emulator
+    inputs:
+      targetType: inline
+      script: |
+        Import-Module "$env:ProgramFiles\Azure Cosmos DB Emulator\PSModules\Microsoft.Azure.CosmosDB.Emulator"
+        Start-CosmosDbEmulator -NoFirewall -NoUI
+
+        # [SuppressMessage("Microsoft.Security", "CS002:SecretInNextLine", Justification="public emulator key, not confidential")]
+        Write-Host "##vso[task.setvariable variable=CosmosDB]AccountEndpoint=https://localhost:8081/;AccountKey=C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM+4QDU5DE2nQ9nDuVTqobD4b8mGGyPMbIZnqyMsEcaGQy67XIw/Jw==;"
+
+  # This step ensures the azure context defined by the previous task is persisted
+  # and available to subsequent steps/tasks.
+  - bash: |
+      az login --service-principal -u $(ARM_CLIENT_ID) --tenant $(ARM_TENANT_ID) --allow-no-subscriptions --federated-token $(ARM_ID_TOKEN)
+    displayName: 'Login to Azure'
+
+  - task: DotNetCoreCLI@2
+    displayName: 'Specialization tests'
+    condition: succeededOrFailed()
+    inputs:
+      command: test
+      testRunTitle: 'Specialization'
+      arguments: '--filter "Category!=E2E&Group=NonE2E_Specialization" -c release --no-build'
+      projects: $(test_projects)
+    env:
+      AzureWebJobsStorage: $(Storage)
+
+  - task: DotNetCoreCLI@2
+    displayName: 'WebHost EndToEnd tests'
+    condition: succeededOrFailed()
+    inputs:
+      command: test
+      testRunTitle: 'WebHost EndToEnd'
+      arguments: '--filter "Category!=E2E&Group=NonE2E_WebHost" -c release --no-build'
+      projects: $(test_projects)
+    env:
+      AzureWebJobsStorage: $(Storage) 
+
+  - task: DotNetCoreCLI@2
+    displayName: 'IIS Express startup timeout test'
+    condition: succeededOrFailed()
+    inputs:
+      command: test
+      testRunTitle: 'IIS Express startup timeout'
+      arguments: '--filter "Category!=E2E&Group=NonE2E_IisExpress" -c release --no-build'
+      projects: $(test_projects)
+    env:
+      FUNCTIONS_RUN_IIS_EXPRESS_TESTS: '1'
+
+  - task: DotNetCoreCLI@2
+    displayName: 'Timeout tests'
+    condition: succeededOrFailed()
+    inputs:
+      command: test
+      testRunTitle: 'Timeout'
+      arguments: '--filter "Category!=E2E&Group=NonE2E_Timeout" -c release --no-build'
+      projects: $(test_projects)
+    env:
+      AzureWebJobsStorage: $(Storage)
+
+  - task: DotNetCoreCLI@2
+    displayName: 'AppInsights & Worker tests'
+    condition: succeededOrFailed()
+    inputs:
+      command: test
+      testRunTitle: 'AppInsights & Worker'
+      arguments: '--filter "Category!=E2E&Group=NonE2E_AppInsights" -c release --no-build'
+      projects: $(test_projects)
+    env:
+      AzureWebJobsStorage: $(Storage)
+
+  - task: DotNetCoreCLI@2
+    displayName: 'Controllers & Host tests'
+    condition: succeededOrFailed()
+    inputs:
+      command: test
+      testRunTitle: 'Controllers & Host'
+      arguments: '--filter "Category!=E2E&Group=NonE2E_Controllers" -c release --no-build'
+      projects: $(test_projects)
+    env:
+      AzureWebJobsStorage: $(Storage)
+
+  - task: DotNetCoreCLI@2
+    displayName: 'Storage & Misc tests'
+    condition: succeededOrFailed()
+    inputs:
+      command: test
+      testRunTitle: 'Storage & Misc'
+      arguments: '--filter "Category!=E2E&Group=NonE2E_Storage" -c release --no-build'
+      projects: $(test_projects)
+    env:
+      AzureWebJobsStorage: $(Storage)
+      ConnectionStrings__CosmosDB: $(CosmosDB)
+
+  - task: DotNetCoreCLI@2
+    displayName: 'Ungrouped tests'
+    condition: succeededOrFailed()
+    inputs:
+      command: test
+      testRunTitle: 'Ungrouped'
+      arguments: '--filter "Category!=E2E&Group!=NonE2E_Specialization&Group!=NonE2E_WebHost&Group!=NonE2E_IisExpress&Group!=NonE2E_AppInsights&Group!=NonE2E_Timeout&Group!=NonE2E_Controllers&Group!=NonE2E_Storage" -c release --no-build'
+      projects: $(test_projects)
+    env:
+      AzureWebJobsStorage: $(Storage)
+      AzureWebJobsSecretStorageKeyVaultUri: $(KeyVaultUri)
+      AzureWebJobsSecretStorageKeyVaultTenantId: $(AzureTenantId)
+      AzureWebJobsSecretStorageKeyVaultClientId: $(AzureClientId)
+      AzureWebJobsSecretStorageKeyVaultClientSecret: $(AzureClientSecret)
+
+  - task: AzurePowerShell@5
+    condition: and(always(), ne(variables['LeaseBlob'], ''))
+    displayName: Checkin secrets
+    inputs:
+      azureSubscription: Azure-Functions-Host-CI-internal
+      azurePowerShellVersion: 'LatestVersion'
+      pwsh: true
+      ScriptPath: eng/script/checkin-secrets.ps1
+      ScriptArguments: '-leaseBlob $(LeaseBlob) -leaseToken $(LeaseToken)'

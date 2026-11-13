@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.IO;
@@ -11,13 +11,16 @@ using Microsoft.Azure.WebJobs.Script.Management.Models;
 using Microsoft.Azure.WebJobs.Script.WebHost.Authentication;
 using Microsoft.Azure.WebJobs.Script.WebHost.Management;
 using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Moq;
+using Microsoft.WebJobs.Script.Tests;
 using WebJobs.Script.Tests;
 using Xunit;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.WebHostEndToEnd
 {
+    [Trait(TestTraits.Group, TestTraits.NonE2EWebHost)]
     public class CodelessEndToEndTests
     {
         [Theory]
@@ -28,7 +31,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.WebHostEndToEnd
             var sourceFunctionApp = Path.Combine(Environment.CurrentDirectory, "TestScripts", path);
             var settings = new Dictionary<string, string>()
             {
-                [RpcWorkerConstants.FunctionWorkerRuntimeSettingName] = workerRuntime
+                [EnvironmentSettingNames.FunctionWorkerRuntime] = workerRuntime
             };
             var testEnvironment = new TestEnvironment(settings);
 
@@ -40,7 +43,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.WebHostEndToEnd
                 var provider = new TestCodelessFunctionProvider(metadata, null);
 
                 var functions = allowedList != null ? new[] { allowedList, "testFn" } : null;
-                using (var host = StartLocalHost(baseTestPath, sourceFunctionApp, functions, new List<IFunctionProvider>() { provider }, testEnvironment))
+                await using (var host = StartLocalHost(baseTestPath, sourceFunctionApp, functions, new List<IFunctionProvider>() { provider }, testEnvironment))
                 {
 
                     // Make sure unauthorized does not work
@@ -76,7 +79,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.WebHostEndToEnd
             var sourceFunctionApp = Path.Combine(Environment.CurrentDirectory, "TestScripts", path);
             var settings = new Dictionary<string, string>()
             {
-                [RpcWorkerConstants.FunctionWorkerRuntimeSettingName] = workerRuntime
+                [EnvironmentSettingNames.FunctionWorkerRuntime] = workerRuntime
             };
             var testEnvironment = new TestEnvironment(settings);
 
@@ -88,7 +91,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.WebHostEndToEnd
                 var provider = new TestCodelessFunctionProvider(metadata, null);
 
                 var functions = allowedList != null ? new[] { "testFn2", allowedList } : new[] { "testFn2" };
-                using (var host = StartLocalHost(baseTestPath, sourceFunctionApp, functions, new List<IFunctionProvider>() { provider }, testEnvironment))
+                await using (var host = StartLocalHost(baseTestPath, sourceFunctionApp, functions, new List<IFunctionProvider>() { provider }, testEnvironment))
                 {
                     // Make sure unauthorized does not work
                     var unauthResponse = await host.HttpClient.GetAsync("http://localhost/api/testFn2?name=Ankit");
@@ -123,7 +126,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.WebHostEndToEnd
             var sourceFunctionApp = Path.Combine(Environment.CurrentDirectory, "TestScripts", path);
             var settings = new Dictionary<string, string>()
             {
-                [RpcWorkerConstants.FunctionWorkerRuntimeSettingName] = workerRuntime
+                [EnvironmentSettingNames.FunctionWorkerRuntime] = workerRuntime
             };
             var testEnvironment = new TestEnvironment(settings);
 
@@ -138,7 +141,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.WebHostEndToEnd
                 var providerTwo = new TestCodelessFunctionProvider(metadataList2, null);
 
                 var functions = allowedList != null ? new[] { allowedList, "testFn2", "testFn1" } : null;
-                using (var host = StartLocalHost(baseTestPath, sourceFunctionApp, functions, new List<IFunctionProvider>() { providerOne, providerTwo }, testEnvironment))
+                await using (var host = StartLocalHost(baseTestPath, sourceFunctionApp, functions, new List<IFunctionProvider>() { providerOne, providerTwo }, testEnvironment))
                 {
                     var testFn1Key = await host.GetFunctionSecretAsync("testFn1");
                     var testFn2Key = await host.GetFunctionSecretAsync("testFn2");
@@ -163,7 +166,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.WebHostEndToEnd
         }
 
         [Theory]
-        [InlineData("Node", "node", "HttpTrigger", 33)]
+        [InlineData("Node", "node", "HttpTrigger", 35)]
         [InlineData("NoFunction", "node", null, 0)]
         public async Task CodelessFunction_DoesNot_ListFunctions(string path, string workerRuntime, string allowedList, int listCount)
         {
@@ -171,7 +174,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.WebHostEndToEnd
             var sourceFunctionApp = Path.Combine(Environment.CurrentDirectory, "TestScripts", path);
             var settings = new Dictionary<string, string>()
             {
-                [RpcWorkerConstants.FunctionWorkerRuntimeSettingName] = workerRuntime
+                [EnvironmentSettingNames.FunctionWorkerRuntime] = workerRuntime
             };
             var testEnvironment = new TestEnvironment(settings);
 
@@ -186,7 +189,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.WebHostEndToEnd
                 var providerTwo = new TestCodelessFunctionProvider(metadataList2, null);
 
                 var functions = allowedList != null ? new[] { allowedList, "testFn2", "testFn1" } : null;
-                using (var host = StartLocalHost(baseTestPath, sourceFunctionApp, functions, new List<IFunctionProvider>() { providerOne, providerTwo }, testEnvironment))
+                await using (var host = StartLocalHost(baseTestPath, sourceFunctionApp, functions, new List<IFunctionProvider>() { providerOne, providerTwo }, testEnvironment))
                 {
                     var masterKey = await host.GetMasterKeyAsync();
                     var listFunctionsResponse = await host.HttpClient.GetAsync($"http://localhost/admin/functions?code={masterKey}");
@@ -211,7 +214,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.WebHostEndToEnd
             var sourceFunctionApp = Path.Combine(Environment.CurrentDirectory, "TestScripts", path);
             var settings = new Dictionary<string, string>()
             {
-                [RpcWorkerConstants.FunctionWorkerRuntimeSettingName] = workerRuntime
+                [EnvironmentSettingNames.FunctionWorkerRuntime] = workerRuntime
             };
             var testEnvironment = new TestEnvironment(settings);
 
@@ -226,7 +229,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.WebHostEndToEnd
                 var providerTwo = new TestCodelessFunctionProvider(metadataList2, null);
 
                 var functions = allowedList != null ? new[] { allowedList, "testFn2", "testFn1" } : null;
-                using (var host = StartLocalHost(baseTestPath, sourceFunctionApp, functions, new List<IFunctionProvider>() { providerOne, providerTwo }, testEnvironment))
+                await using (var host = StartLocalHost(baseTestPath, sourceFunctionApp, functions, new List<IFunctionProvider>() { providerOne, providerTwo }, testEnvironment))
                 {
                     // Sanity check for sync triggers
                     string uri = "admin/host/synctriggers";
@@ -244,10 +247,14 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.WebHostEndToEnd
             string testLogPath = Path.Combine(baseTestPath, "Logs");
 
             var syncTriggerMock = new Mock<IFunctionsSyncManager>(MockBehavior.Strict);
-            syncTriggerMock.Setup(p => p.TrySyncTriggersAsync(It.IsAny<bool>())).ReturnsAsync(new SyncTriggersResult { Success = true });
+            syncTriggerMock.Setup(p => p.TrySyncTriggersAsync(It.IsAny<bool>())).ReturnsAsync(new TriggersOperationResult { Success = true });
 
             FileUtility.CopyDirectory(sourceFunctionApp, appContent);
             var host = new TestFunctionHost(sourceFunctionApp, testLogPath,
+                configureWebHostServices: s =>
+                {
+                    s.AddSingleton(testEnvironment);
+                },
                 configureScriptHostWebJobsBuilder: builder =>
                 {
                     foreach (var provider in providers)
@@ -268,6 +275,20 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.WebHostEndToEnd
                 configureScriptHostServices: s =>
                 {
                     s.AddSingleton(syncTriggerMock.Object);
+                },
+                configureWebHostAppConfiguration: config =>
+                {
+                    // Surface environment variables from TestEnvironment into IConfiguration,
+                    // matching production where ScriptEnvironmentVariablesConfigurationSource
+                    // reads real process env vars.
+                    string workerRuntime = testEnvironment.GetEnvironmentVariable(EnvironmentSettingNames.FunctionWorkerRuntime);
+                    if (workerRuntime is not null)
+                    {
+                        config.AddInMemoryCollection(new Dictionary<string, string>
+                        {
+                            [EnvironmentSettingNames.FunctionWorkerRuntime] = workerRuntime
+                        });
+                    }
                 });
 
             return host;

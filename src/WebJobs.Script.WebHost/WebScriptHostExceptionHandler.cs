@@ -1,10 +1,9 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
 using System.Runtime.ExceptionServices;
 using System.Threading.Tasks;
-using Microsoft.AspNetCore.Hosting;
 using Microsoft.Azure.WebJobs.Host;
 using Microsoft.Azure.WebJobs.Host.Timers;
 using Microsoft.Azure.WebJobs.Script.Workers;
@@ -14,14 +13,14 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
 {
     public class WebScriptHostExceptionHandler : IWebJobsExceptionHandler
     {
-        private readonly IApplicationLifetime _applicationLifetime;
+        private readonly IScriptApplicationLifetime _applicationLifetime;
         private readonly ILogger _logger;
-        private readonly IFunctionInvocationDispatcherFactory _functionInvocationDispatcherFactory;
+        private readonly IScriptHostWorkerManager _workerManager;
 
-        public WebScriptHostExceptionHandler(IApplicationLifetime applicationLifetime, ILogger<WebScriptHostExceptionHandler> logger, IFunctionInvocationDispatcherFactory functionInvocationDispatcherFactory)
+        public WebScriptHostExceptionHandler(IScriptApplicationLifetime applicationLifetime, ILogger<WebScriptHostExceptionHandler> logger, IScriptHostWorkerManager workerManager)
         {
             _applicationLifetime = applicationLifetime ?? throw new ArgumentNullException(nameof(applicationLifetime));
-            _functionInvocationDispatcherFactory = functionInvocationDispatcherFactory;
+            _workerManager = workerManager;
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         }
 
@@ -48,14 +47,21 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             // explicitly in order to pass the timeout.
             // Task ignoreTask = _hostManager.StopAsync();
             // Give the manager and all running tasks some time to shut down gracefully.
-            //await Task.Delay(timeoutGracePeriod);
-            IFunctionInvocationDispatcher functionInvocationDispatcher = _functionInvocationDispatcherFactory.GetFunctionDispatcher();
-            if (!functionInvocationDispatcher.State.Equals(FunctionInvocationDispatcherState.Default))
+            // await Task.Delay(timeoutGracePeriod);
+            if (!_workerManager.State.Equals(WorkerManagerState.Default))
             {
+                if (timeoutException.InstanceId == Guid.Empty)
+                {
+                    // Empty guid indicates this is from worker channel shutdown; the restart will already have been initiated by the original failure.
+                    return;
+                }
+
                 _logger.LogWarning($"A function timeout has occurred. Restarting worker process executing invocationId '{timeoutException.InstanceId}'.", exceptionInfo.SourceException);
+
                 // If invocation id is not found in any of the workers => worker is already disposed. No action needed.
-                await functionInvocationDispatcher.RestartWorkerWithInvocationIdAsync(timeoutException.InstanceId.ToString());
-                _logger.LogWarning("Restart of language worker process(es) completed.", exceptionInfo.SourceException);
+                await _workerManager.RestartWorkerWithInvocationIdAsync(timeoutException.InstanceId.ToString(), timeoutException);
+
+                _logger.LogWarning("Attempt to restart language worker process(es) completed.", exceptionInfo.SourceException);
             }
             else
             {

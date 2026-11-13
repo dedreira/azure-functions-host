@@ -8,11 +8,13 @@ using System.IO;
 using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.WebJobs.Script.Tests;
 using Xunit;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Controllers
 {
-    public class WarmupScenarios : IDisposable
+    [Trait(TestTraits.Group, TestTraits.NonE2EControllers)]
+    public class WarmupScenarios : IAsyncLifetime
     {
         private static readonly TimeSpan SemaphoreWaitTimeout = TimeSpan.FromSeconds(30);
 
@@ -62,9 +64,14 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Controllers
                 $"Instead found {response.StatusCode}");
         }
 
-        public void Dispose()
+        public Task InitializeAsync() => Task.CompletedTask;
+
+        public async Task DisposeAsync()
         {
-            _testHost?.Dispose();
+            if (_testHost is not null)
+            {
+                await _testHost.DisposeAsync();
+            }
         }
 
         private class PausingScriptHostBuilder : IScriptHostBuilder
@@ -72,9 +79,9 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Controllers
             private readonly DefaultScriptHostBuilder _inner;
             private readonly IOptionsMonitor<ScriptApplicationHostOptions> _options;
 
-            public PausingScriptHostBuilder(IOptionsMonitor<ScriptApplicationHostOptions> options, IServiceProvider root, IServiceScopeFactory scope)
+            public PausingScriptHostBuilder(IOptionsMonitor<ScriptApplicationHostOptions> options, IServiceProvider rootServiceProvider, IServiceCollection rootServices)
             {
-                _inner = new DefaultScriptHostBuilder(options, root, scope);
+                _inner = new DefaultScriptHostBuilder(options, rootServices, rootServiceProvider);
                 _options = options;
             }
 

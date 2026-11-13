@@ -1,8 +1,9 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
 using System.Collections.Generic;
+using System.Collections.Immutable;
 using System.IO;
 using System.IO.Abstractions;
 using System.Linq;
@@ -12,10 +13,13 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Host.Executors;
+using Microsoft.Azure.WebJobs.Host.Scale;
+using Microsoft.Azure.WebJobs.Host.Storage;
 using Microsoft.Azure.WebJobs.Script.Config;
+using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.WebHost;
 using Microsoft.Azure.WebJobs.Script.WebHost.Management;
-using Microsoft.Azure.WebJobs.Script.Workers.Http;
+using Microsoft.Azure.WebJobs.Script.Workers;
 using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -26,6 +30,7 @@ using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using Xunit;
 using static Microsoft.Azure.WebJobs.Script.Tests.TestHelpers;
+using FunctionMetadata = Microsoft.Azure.WebJobs.Script.Description.FunctionMetadata;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
 {
@@ -49,9 +54,18 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
         private readonly Mock<ISecretManagerProvider> _secretManagerProviderMock;
         private readonly Mock<ISecretManager> _secretManagerMock;
         private readonly TestScriptHostService _scriptHostManager; // To refresh underlying IConfiguration for IAzureBlobStorageProvider
+        private readonly IHostIdProvider _hostIdProvider;
+        private readonly IOptionsMonitor<ScriptApplicationHostOptions> _optionsMonitor;
+        private readonly ILoggerFactory _loggerFactory;
+        private readonly IHttpClientFactory _httpClientFactory;
+        private readonly IFunctionMetadataManager _functionMetadataManager;
+        private readonly IAzureBlobStorageProvider _azureBlobStorageProvider;
+        private readonly IScriptHostManager _syncScriptHostManager;
         private string _function1;
         private bool _emptyContent;
         private bool _secretsEnabled;
+        private JObject _testHostOptions;
+        private string _sku = ScriptConstants.DynamicSku;
 
         public FunctionsSyncManagerTests()
         {
@@ -65,8 +79,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
                 ScriptPath = Path.Combine("x:", "root"),
                 IsSelfHost = false,
                 LogPath = Path.Combine("x:", "tmp", "log"),
-                SecretsPath = Path.Combine("x:", "secrets"),
-                TestDataPath = Path.Combine("x:", "sampledata")
+                SecretsPath = Path.Combine("x:", "secrets")
             };
 
             var jobHostOptions = new ScriptJobHostOptions
@@ -116,7 +129,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
                     { "TestFunctionKey1", "aaa" },
                     { "TestFunctionKey2", "bbb" }
                 };
-            _secretManagerMock.Setup(p => p.GetFunctionSecretsAsync("function1", false)).ReturnsAsync(functionSecretsResponse);
+            _secretManagerMock.Setup(p => p.GetFunctionSecretsAsync("function1")).ReturnsAsync(functionSecretsResponse);
             _secretManagerMock.Setup(p => p.ClearCache());
 
             var configuration = ScriptSettingsManager.BuildDefaultConfiguration();
@@ -128,6 +141,8 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
             _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteArmCacheEnabled)).Returns("1");
             _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady)).Returns("1");
             _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.CoreToolsEnvironment)).Returns((string)null);
+            _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.AppKind)).Returns((string)null);
+            _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.FunctionWorkerRuntime)).Returns("dotnet");
             _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.WebSiteAuthEncryptionKey)).Returns("1");
             _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteInstanceId)).Returns("1");
             _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteHostName)).Returns(testHostName);
@@ -139,33 +154,158 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
             _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteName)).Returns((string)null);
             _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteSlotName)).Returns((string)null);
             _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.AzureWebJobsFeatureFlags)).Returns((string)null);
-            _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteSku)).Returns((string)ScriptConstants.DynamicSku);
+            _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteSku)).Returns(() => _sku);
+            _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.FunctionsNotifyPlatformOnSync)).Returns((string)null);
+            _mockEnvironment.Setup(p => p.Platform).Returns(System.Runtime.InteropServices.OSPlatform.Windows);
 
             _hostNameProvider = new HostNameProvider(_mockEnvironment.Object);
 
-            var functionMetadataProvider = new HostFunctionMetadataProvider(optionsMonitor, NullLogger<HostFunctionMetadataProvider>.Instance, new TestMetricsLogger(), SystemEnvironment.Instance);
+            var workerRuntimeResolverMock = new Mock<IWorkerRuntimeResolver>(MockBehavior.Strict);
+            workerRuntimeResolverMock.Setup(p => p.GetWorkerRuntime(It.IsAny<string>())).Returns((string)null);
+
+            var functionMetadataProvider = new HostFunctionMetadataProvider(optionsMonitor, NullLogger<HostFunctionMetadataProvider>.Instance, new TestMetricsLogger(), workerRuntimeResolverMock.Object);
             var defaultProvider = new FunctionMetadataProvider(NullLogger<FunctionMetadataProvider>.Instance, null, functionMetadataProvider, new OptionsWrapper<FunctionsHostingConfigOptions>(new FunctionsHostingConfigOptions()), _mockEnvironment.Object);
-            var functionMetadataManager = TestFunctionMetadataManager.GetFunctionMetadataManager(new OptionsWrapper<ScriptJobHostOptions>(jobHostOptions), defaultProvider, null, new OptionsWrapper<HttpWorkerOptions>(new HttpWorkerOptions()), loggerFactory, new TestOptionsMonitor<LanguageWorkerOptions>(CreateLanguageWorkerConfigSettings()));
+            var functionMetadataManager = TestFunctionMetadataManager.GetFunctionMetadataManager(new OptionsWrapper<ScriptJobHostOptions>(jobHostOptions), defaultProvider, null, loggerFactory, new TestOptionsMonitor<LanguageWorkerOptions>(CreateLanguageWorkerConfigSettings()));
 
             _scriptHostManager = new TestScriptHostService(configuration);
             var azureBlobStorageProvider = TestHelpers.GetAzureBlobStorageProvider(configuration, scriptHostManager: _scriptHostManager);
 
-            _functionsSyncManager = new FunctionsSyncManager(configuration, hostIdProviderMock.Object, optionsMonitor, loggerFactory.CreateLogger<FunctionsSyncManager>(), httpClientFactory, _secretManagerProviderMock.Object, _mockWebHostEnvironment.Object, _mockEnvironment.Object, _hostNameProvider, functionMetadataManager, azureBlobStorageProvider);
+            var mockHostOptionsProvider = new Mock<IHostOptionsProvider>(MockBehavior.Strict);
+            mockHostOptionsProvider.Setup(p => p.GetOptions()).Returns(() => _testHostOptions);
+            var mockScriptHostManager = new Mock<IScriptHostManager>(MockBehavior.Strict);
+            var scriptHostManagerServiceProviderMock = mockScriptHostManager.As<IServiceProvider>();
+            scriptHostManagerServiceProviderMock.Setup(p => p.GetService(typeof(IHostOptionsProvider))).Returns(() => mockHostOptionsProvider.Object);
+
+            var concurrencyOptions = new ConcurrencyOptions
+            {
+                DynamicConcurrencyEnabled = true,
+                MaximumFunctionConcurrency = 100,
+                CPUThreshold = 0.85f
+            };
+            var extensions = new JObject()
+            {
+                { "testExtension1", new JObject()  { { "p1", 1 }, { "p2", 2 } } },
+                { "testExtension2", new JObject()  { { "p1", 1 }, { "p2", 2 }, { "pwd", "secret password!" } } }
+            };
+            _testHostOptions = new JObject
+            {
+                { "extensions", extensions },
+                { "concurrency", JObject.FromObject(concurrencyOptions) }
+            };
+
+            _hostIdProvider = hostIdProviderMock.Object;
+            _optionsMonitor = optionsMonitor;
+            _loggerFactory = loggerFactory;
+            _httpClientFactory = httpClientFactory;
+            _functionMetadataManager = functionMetadataManager;
+            _azureBlobStorageProvider = azureBlobStorageProvider;
+            _syncScriptHostManager = mockScriptHostManager.Object;
+
+            _functionsSyncManager = CreateFunctionsSyncManager();
+        }
+
+        private FunctionsSyncManager CreateFunctionsSyncManager(IMeshServiceClient meshServiceClient = null)
+        {
+            return new FunctionsSyncManager(
+                _hostIdProvider,
+                _optionsMonitor,
+                _loggerFactory.CreateLogger<FunctionsSyncManager>(),
+                _httpClientFactory,
+                _secretManagerProviderMock.Object,
+                _mockWebHostEnvironment.Object,
+                _mockEnvironment.Object,
+                _hostNameProvider,
+                _functionMetadataManager,
+                _azureBlobStorageProvider,
+                _syncScriptHostManager,
+                meshServiceClient);
         }
 
         private string GetExpectedTriggersPayload(string postedConnection = DefaultTestConnection, string postedTaskHub = DefaultTestTaskHub, string durableVersion = "V2")
         {
-            string taskHubSegment = postedTaskHub != null ? $",\"taskHubName\":\"{postedTaskHub}\"" : "";
-            string storageProviderSegment = postedConnection != null && durableVersion == "V2" ? $",\"storageProvider\":{{\"connectionStringName\":\"DurableConnection\"}}" : "";
-            return "[{\"authLevel\":\"anonymous\",\"type\":\"httpTrigger\",\"direction\":\"in\",\"name\":\"req\",\"functionName\":\"function1\"}," +
-                $"{{\"name\":\"myQueueItem\",\"type\":\"orchestrationTrigger\",\"direction\":\"in\",\"queueName\":\"myqueue-items\",\"connection\":\"{postedConnection}\",\"functionName\":\"function2\"{taskHubSegment}{storageProviderSegment}}}," +
-                $"{{\"name\":\"myQueueItem\",\"type\":\"activityTrigger\",\"direction\":\"in\",\"queueName\":\"myqueue-items\",\"connection\":\"{postedConnection}\",\"functionName\":\"function3\"{taskHubSegment}{storageProviderSegment}}}]";
+            JArray triggers = new JArray();
+
+            void AddDurableExtendedProperties(JObject f)
+            {
+                if (postedTaskHub != null)
+                {
+                    f.Add("taskHubName", postedTaskHub);
+                }
+                if (postedConnection != null && durableVersion == "V2")
+                {
+                    f.Add("storageProvider", new JObject { { "connectionStringName", "DurableConnection" } });
+                }
+            }
+
+            JObject f1 = new JObject
+            {
+                { "authLevel", "anonymous" },
+                { "type", "httpTrigger" },
+                { "direction", "in" },
+                { "name", "req" },
+                { "functionName", "function1" }
+            };
+            if (_mockEnvironment.Object.IsFlexConsumptionSku())
+            {
+                f1.Add("functionGroup", "http");
+            }
+            triggers.Add(f1);
+
+            JObject f2 = new JObject
+            {
+                { "name", "myQueueItem" },
+                { "type", "orchestrationTrigger" },
+                { "direction", "in" },
+                { "queueName", "myqueue-items" },
+                { "connection", postedConnection ?? string.Empty },
+                { "functionName", "function2" }
+            };
+            if (_mockEnvironment.Object.IsFlexConsumptionSku())
+            {
+                f2.Add("functionGroup", "durable");
+            }
+            AddDurableExtendedProperties(f2);
+            triggers.Add(f2);
+
+            JObject f3 = new JObject
+            {
+                { "name", "myQueueItem" },
+                { "type", "activityTrigger" },
+                { "direction", "in" },
+                { "queueName", "myqueue-items" },
+                { "connection", postedConnection  ?? string.Empty },
+                { "functionName", "function3" }
+            };
+            if (_mockEnvironment.Object.IsFlexConsumptionSku())
+            {
+                f3.Add("functionGroup", "durable");
+            }
+            AddDurableExtendedProperties(f3);
+            triggers.Add(f3);
+
+            return triggers.ToString(Formatting.None);
         }
 
         private void ResetMockFileSystem(string hostJsonContent = null, string extensionsJsonContent = null)
         {
             var fileSystem = CreateFileSystem(_hostOptions, hostJsonContent, extensionsJsonContent);
             FileUtility.Instance = fileSystem;
+        }
+
+        [Fact]
+        public async Task GetTriggersAsync_ReturnsExpectedContent()
+        {
+            // Act
+            var result = await _functionsSyncManager.GetTriggersAsync();
+
+            // Assert
+            Assert.True(result.Success);
+            Assert.Null(result.Error);
+            Assert.NotNull(result.Content);
+
+            var content = JObject.Parse(result.Content);
+            var triggers = content["triggers"];
+            Assert.Equal(GetExpectedTriggersPayload(durableVersion: "V1"), triggers.ToString(Formatting.None));
         }
 
         [Fact]
@@ -181,13 +321,98 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
             }
         }
 
-        [Theory]
-        [InlineData(ScriptConstants.DynamicSku)]
-        [InlineData(ScriptConstants.FlexConsumptionSku)]
-        public async Task TrySyncTriggers_MaxSyncTriggersPayloadSize_Succeeds(string sku)
+        [Fact]
+        public async Task TrySyncTriggers_PlaceholderWarmupPayload_DoesNotPublish()
         {
-            _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteSku)).Returns(sku);
+            // Repro for the SyncTriggers race in azure-functions-host#10169.
+            //
+            // When a specialization times out (the placeholder env-reload exceeds its 30s
+            // timeout), the host is torn down but an inbound (foreground) SyncTriggers request
+            // that raced the deploy can still be served by the host while it is only exposing
+            // the placeholder "WarmUp" function. InStandbyMode has already latched to false by
+            // this point (placeholder mode is cleared early during specialization), so the
+            // existing standby guard does NOT catch this window. The result is that the
+            // placeholder WarmUp trigger payload gets published via SetTriggers, and because
+            // foreground syncs bypass the hash blob the app can stay stuck showing only WarmUp.
+            //
+            // Fix 1: while the active host is still the placeholder/standby host (its job host
+            // options report IsStandbyConfiguration), SyncTriggers must never publish, so the
+            // placeholder WarmUp trigger payload can't reach the FrontEnd.
+            var warmupMetadata = new FunctionMetadata
+            {
+                Name = Microsoft.Azure.WebJobs.Script.WebHost.WarmUpConstants.FunctionName,
+                ScriptFile = "run.csx"
+            };
+            warmupMetadata.Bindings.Add(new BindingMetadata
+            {
+                Name = "req",
+                Type = "httpTrigger",
+                Direction = BindingDirection.In,
+                Raw = new JObject
+                {
+                    { "authLevel", "anonymous" },
+                    { "type", "httpTrigger" },
+                    { "direction", "in" },
+                    { "name", "req" },
+                    { "methods", new JArray("get", "post") },
+                    { "route", "{x:regex(^(warmup|csharphttpwarmup)$)}" }
+                }
+            });
 
+            var metadataManagerMock = new Mock<IFunctionMetadataManager>(MockBehavior.Strict);
+            metadataManagerMock
+                .Setup(m => m.GetFunctionMetadata(It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<bool>()))
+                .Returns(ImmutableArray.Create(warmupMetadata));
+
+            // Keep the test on the minimal-payload path; the guard must prevent the publish
+            // regardless of whether the ARM cache (extended payload) is enabled.
+            _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteArmCacheEnabled)).Returns("0");
+
+            // The active host is still the placeholder/standby host during the specialization
+            // race window. Model that by exposing a job host whose options report the standby
+            // configuration - this is the reliable signal the guard checks (InStandbyMode and the
+            // webhost-level options both latch out of standby too early to catch this window).
+            var standbyJobHostOptions = new OptionsWrapper<ScriptJobHostOptions>(new ScriptJobHostOptions { IsStandbyConfiguration = true });
+            var standbyScriptHostManagerMock = new Mock<IScriptHostManager>(MockBehavior.Strict);
+            standbyScriptHostManagerMock.As<IServiceProvider>()
+                .Setup(p => p.GetService(typeof(IOptions<ScriptJobHostOptions>)))
+                .Returns(standbyJobHostOptions);
+
+            var syncManager = new FunctionsSyncManager(
+                _hostIdProvider,
+                _optionsMonitor,
+                _loggerFactory.CreateLogger<FunctionsSyncManager>(),
+                _httpClientFactory,
+                _secretManagerProviderMock.Object,
+                _mockWebHostEnvironment.Object,
+                _mockEnvironment.Object,
+                _hostNameProvider,
+                metadataManagerMock.Object,
+                _azureBlobStorageProvider,
+                standbyScriptHostManagerMock.Object,
+                null);
+
+            using (var env = new TestScopedEnvironmentVariable(_vars))
+            {
+                _mockHttpHandler.Reset();
+
+                // Foreground sync (isBackgroundSync: false) - the racing inbound request.
+                var result = await syncManager.TrySyncTriggersAsync();
+
+                // No SetTriggers request should have been made for a placeholder-only payload.
+                Assert.Equal(0, _mockHttpHandler.RequestCount);
+                Assert.Equal(0, _contentBuilder.Length);
+
+                // The standby guard blocks the publish and reports failure, matching the existing
+                // standby/placeholder skip contract (surfaced as a 500 by the admin/host/synctriggers endpoint).
+                Assert.False(result.Success);
+                Assert.Equal("Active host is in standby configuration. Skipping SyncTriggers to avoid publishing placeholder triggers.", result.Error);
+            }
+        }
+
+        [Fact]
+        public async Task TrySyncTriggers_MaxSyncTriggersPayloadSize_Succeeds()
+        {
             // create a dummy file that pushes us over size
             string maxString = new string('x', ScriptConstants.MaxTriggersStringLength + 1);
             _function1 = $"{{ bindings: [], test: '{maxString}'}}";
@@ -203,19 +428,14 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
                 Assert.True(syncString.Length < ScriptConstants.MaxTriggersStringLength);
                 var syncContent = JObject.Parse(syncString);
 
-                if (_mockEnvironment.Object.IsFlexConsumptionSku())
-                {
-                    Assert.Equal(2, syncContent.Count);
-                    Assert.Equal("testhostid123", syncContent["hostId"]);
-                }
-                else
-                {
-                    Assert.Equal(1, syncContent.Count);
-                    Assert.Equal(null, syncContent["hostId"]);
-                }
-                
+                Assert.Equal(3, syncContent.Count);
+                Assert.Equal("testhostid123", syncContent["hostId"]);
+
                 JArray triggers = (JArray)syncContent["triggers"];
                 Assert.Equal(2, triggers.Count);
+
+                JObject hostConfig = (JObject)syncContent["hostConfig"];
+                Assert.Equal(2, hostConfig.Count);
             }
         }
 
@@ -229,6 +449,62 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
                 Assert.False(result.Success);
                 var expectedMessage = "Invalid environment for SyncTriggers operation.";
                 Assert.Equal(expectedMessage, result.Error);
+            }
+        }
+
+        [Fact]
+        public async Task TrySyncTriggers_ManagedAppEnv_WithNo_AzureWebJobsStorage_ReturnsTrue()
+        {
+            _vars.Add("AzureWebJobsStorage", null);
+            _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteArmCacheEnabled)).Returns("0");
+
+            using (var env = new TestScopedEnvironmentVariable(_vars))
+            {
+                _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.ManagedEnvironment)).Returns("true");
+                _mockEnvironment.Setup(p => p.GetEnvironmentVariable("FUNCTIONS_API_SERVER")).Returns("https://appname.azurewebsites.net");
+                _mockEnvironment.Setup(p => p.GetEnvironmentVariable("CONTAINER_APP_NAME")).Returns("appname");
+                _mockEnvironment.Setup(p => p.GetEnvironmentVariable("CONTAINER_APP_NAMESPACE")).Returns("appns");
+                _mockEnvironment.Setup(p => p.GetEnvironmentVariable("CONTAINER_APP_REVISION")).Returns("appname--r1");
+
+                // _functionsSyncManager is initialized in the constructor with all the secrets from environment,
+                // so HostAzureBlobStorageProvider will have AzureWebJobsStorage defined in both ActiveHostConfigurationSource
+                // and the WebHost IConfiguration source from DI.
+                // The TestScopedEnvironmentVariable only changes the WebHost level IConfiguration
+                // When it is set to empty/null, the connection string from the ActiveHostConfigurationSource wins (never changed since it is set in
+                // constructor as mentioned).
+                // Therefore, we need to force refresh the configuration with an ActiveHostChanged event. This is because setting an empty/null environment variable
+                // removes it, but will not remove it from the ActiveHostConfigurationSource.
+                _scriptHostManager.OnActiveHostChanged();
+                var result = await _functionsSyncManager.TrySyncTriggersAsync(isBackgroundSync: true);
+                Assert.True(result.Success);
+                VerifyResultWithCacheOff(durableVersion: "V1");
+            }
+        }
+
+        [Fact]
+        public async Task TrySyncTriggers_KubernetesManagedEnv_WithNo_AzureWebJobsStorage_ReturnsTrue()
+        {
+            _vars.Add("AzureWebJobsStorage", null);
+            _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteArmCacheEnabled)).Returns("0");
+
+            using (var env = new TestScopedEnvironmentVariable(_vars))
+            {
+                _mockEnvironment.Setup(p => p.GetEnvironmentVariable("FUNCTIONS_API_SERVER")).Returns("https://appname.azurewebsites.net");
+                _mockEnvironment.Setup(p => p.GetEnvironmentVariable("KUBERNETES_SERVICE_HOST")).Returns("kubhost");
+                _mockEnvironment.Setup(p => p.GetEnvironmentVariable("POD_NAMESPACE")).Returns("podns");
+
+                // _functionsSyncManager is initialized in the constructor with all the secrets from environment,
+                // so HostAzureBlobStorageProvider will have AzureWebJobsStorage defined in both ActiveHostConfigurationSource
+                // and the WebHost IConfiguration source from DI.
+                // The TestScopedEnvironmentVariable only changes the WebHost level IConfiguration
+                // When it is set to empty/null, the connection string from the ActiveHostConfigurationSource wins (never changed since it is set in
+                // constructor as mentioned).
+                // Therefore, we need to force refresh the configuration with an ActiveHostChanged event. This is because setting an empty/null environment variable
+                // removes it, but will not remove it from the ActiveHostConfigurationSource.
+                _scriptHostManager.OnActiveHostChanged();
+                var result = await _functionsSyncManager.TrySyncTriggersAsync(isBackgroundSync: true);
+                Assert.True(result.Success);
+                VerifyResultWithCacheOff(durableVersion: "V1");
             }
         }
 
@@ -260,7 +536,6 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
                 // verify expected headers
                 Assert.Equal(ScriptConstants.FunctionsUserAgent, _mockHttpHandler.LastRequest.Headers.UserAgent.ToString());
                 Assert.True(_mockHttpHandler.LastRequest.Headers.Contains(ScriptConstants.AntaresLogIdHeaderName));
-                Assert.NotEmpty(_mockHttpHandler.LastRequest.Headers.GetValues(ScriptConstants.SiteRestrictedTokenHeaderName));
                 Assert.NotEmpty(_mockHttpHandler.LastRequest.Headers.GetValues(ScriptConstants.SiteTokenHeaderName));
 
                 if (cacheEnabled)
@@ -275,28 +550,25 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
         }
 
         [Theory]
-        [InlineData(ScriptConstants.DynamicSku)]
-        [InlineData(ScriptConstants.FlexConsumptionSku)]
-        public async Task TrySyncTriggers_PostsExpectedContent_BySku(string sku)
+        [InlineData(true)]
+        [InlineData(false)]
+        public async Task TrySyncTriggers_NotifiesPlatform_WhenEnabled(bool functionsNotifyPlatformOnSync)
         {
-            _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteSku)).Returns(sku);
+            _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.FunctionsNotifyPlatformOnSync))
+                .Returns(functionsNotifyPlatformOnSync.ToString());
+
+            var meshServiceClientMock = new Mock<IMeshServiceClient>(MockBehavior.Strict);
+            meshServiceClientMock.Setup(p => p.NotifyTriggersChanged()).Returns(Task.CompletedTask);
+            var syncManager = CreateFunctionsSyncManager(meshServiceClientMock.Object);
 
             using (var env = new TestScopedEnvironmentVariable(_vars))
             {
-                // Act
-                var syncResult = await _functionsSyncManager.TrySyncTriggersAsync();
+                var syncResult = await syncManager.TrySyncTriggersAsync();
 
-                // Assert
-                Assert.True(syncResult.Success, "SyncTriggers should return success true");
-                Assert.True(string.IsNullOrEmpty(syncResult.Error), "Error should be null or empty");
-
-                // verify expected headers
-                Assert.Equal(ScriptConstants.FunctionsUserAgent, _mockHttpHandler.LastRequest.Headers.UserAgent.ToString());
-                Assert.True(_mockHttpHandler.LastRequest.Headers.Contains(ScriptConstants.AntaresLogIdHeaderName));
-                Assert.NotEmpty(_mockHttpHandler.LastRequest.Headers.GetValues(ScriptConstants.SiteRestrictedTokenHeaderName));
-                Assert.NotEmpty(_mockHttpHandler.LastRequest.Headers.GetValues(ScriptConstants.SiteTokenHeaderName));
-
-                VerifyResultWithCacheOn(durableVersion: "V1");
+                Assert.True(syncResult.Success, $"SyncTriggers should return success true. Error: '{syncResult.Error}'");
+                meshServiceClientMock.Verify(
+                    p => p.NotifyTriggersChanged(),
+                    functionsNotifyPlatformOnSync ? Times.Once() : Times.Never());
             }
         }
 
@@ -339,16 +611,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
             string expectedTriggersPayload = GetExpectedTriggersPayload(postedConnection: connection, postedTaskHub: expectedTaskHub, durableVersion);
 
             var result = JObject.Parse(_contentBuilder.ToString());
-
-            bool isFlexConsumptionSku = _mockEnvironment.Object.IsFlexConsumptionSku();
-            if (isFlexConsumptionSku)
-            {
-                Assert.Equal("testhostid123", result["hostId"]);
-            }
-            else
-            {
-                Assert.Null(result["hostId"]);
-            }
+            Assert.Equal("testhostid123", result["hostId"]);
 
             // verify triggers
             var triggers = result["triggers"];
@@ -361,17 +624,15 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
             var triggersLog = log.FormattedMessage.Substring(startIdx, endIdx - startIdx).Trim();
             var logObject = JObject.Parse(triggersLog);
 
-            if (isFlexConsumptionSku)
-            {
-                Assert.Equal("testhostid123", logObject["hostId"]);
-            }
-            else
-            {
-                Assert.Null(logObject["hostId"]);
-            }
-            
+            Assert.Equal("testhostid123", logObject["hostId"]);
             Assert.Equal(expectedTriggersPayload, logObject["triggers"].ToString(Formatting.None));
             Assert.False(triggersLog.Contains("secrets"));
+
+            // verify hostConfig by spot checking a couple properties
+            var hostConfig = result["hostConfig"];
+            Assert.Equal(2, hostConfig["extensions"]["testExtension2"]["p2"]);
+            Assert.Equal("[Hidden Credential]", hostConfig["extensions"]["testExtension2"]["pwd"]);
+            Assert.Equal(0.85f, (float)hostConfig["concurrency"]["CPUThreshold"]);
 
             return result;
         }
@@ -908,6 +1169,122 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
             Assert.Equal(HttpMethod.Post, httpRequest.Method);
         }
 
+        [Fact]
+        public async Task GetSyncTriggersPayload_DeduplicatesFunctionMetadataByName_KeepsFirstOccurrence()
+        {
+            // Create two FunctionMetadata objects with the same name but different authLevels
+            var duplicateName = "DuplicateFunction";
+            var firstMetadata = new FunctionMetadata
+            {
+                Name = duplicateName,
+                ScriptFile = "file1.csx"
+            };
+            firstMetadata.Bindings.Add(new BindingMetadata
+            {
+                Name = "req",
+                Type = "httpTrigger",
+                Direction = BindingDirection.In,
+                Raw = new JObject
+                    {
+                        { "authLevel", "function" },
+                        { "type", "httpTrigger" },
+                        { "direction", "in" },
+                        { "name", "req" }
+                    }
+            });
+            firstMetadata.Bindings.Add(new BindingMetadata
+            {
+                Name = "$return",
+                Type = "http",
+                Direction = BindingDirection.Out,
+                Raw = new JObject
+                    {
+                        { "type", "http" },
+                        { "direction", "out" },
+                        { "name", "$return" }
+                    }
+            });
+
+            var secondMetadata = new FunctionMetadata
+            {
+                Name = duplicateName,
+                ScriptFile = "file2.csx"
+            };
+            secondMetadata.Bindings.Add(new BindingMetadata
+            {
+                Name = "req",
+                Type = "httpTrigger",
+                Direction = BindingDirection.In,
+                Raw = new JObject
+                    {
+                        { "authLevel", "anonymous" },
+                        { "type", "httpTrigger" },
+                        { "direction", "in" },
+                        { "name", "req" }
+                    }
+            });
+            secondMetadata.Bindings.Add(new BindingMetadata
+            {
+                Name = "$return",
+                Type = "http",
+                Direction = BindingDirection.Out,
+                Raw = new JObject
+                    {
+                        { "type", "http" },
+                        { "direction", "out" },
+                        { "name", "$return" }
+                    }
+            });
+
+            var functionMetadataManagerMock = new Mock<IFunctionMetadataManager>(MockBehavior.Strict);
+            functionMetadataManagerMock
+                .Setup(m => m.GetFunctionMetadata(It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<bool>()))
+                .Returns(ImmutableArray.Create(firstMetadata, secondMetadata));
+
+            var environmentMock = new Mock<IEnvironment>();
+            environmentMock.Setup(e => e.GetEnvironmentVariable(EnvironmentSettingNames.WebSiteAuthEncryptionKey))
+                                .Returns("non-null value");
+            environmentMock.Setup(e => e.GetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteArmCacheEnabled))
+                                .Returns("0");
+
+            var hostNameProviderMock = new Mock<HostNameProvider>(environmentMock.Object) { CallBase = true };
+
+            var scriptAppHostOptions = new ScriptApplicationHostOptions
+            {
+                ScriptPath = "somePath",
+                IsSelfHost = false,
+                LogPath = "rootLogPath"
+            };
+
+            var optionsMonitorMock = new Mock<IOptionsMonitor<ScriptApplicationHostOptions>>();
+            optionsMonitorMock.Setup(m => m.CurrentValue).Returns(scriptAppHostOptions);
+            optionsMonitorMock.Setup(m => m.Get(It.IsAny<string>())).Returns(scriptAppHostOptions);
+
+            var syncManager = new FunctionsSyncManager(
+                Mock.Of<IHostIdProvider>(),
+                optionsMonitorMock.Object,
+                NullLogger<FunctionsSyncManager>.Instance,
+                Mock.Of<IHttpClientFactory>(),
+                Mock.Of<ISecretManagerProvider>(),
+                Mock.Of<IScriptWebHostEnvironment>(),
+                environmentMock.Object,
+                hostNameProviderMock.Object,
+                functionMetadataManagerMock.Object,
+                Mock.Of<IAzureBlobStorageProvider>(),
+                Mock.Of<IScriptHostManager>());
+
+            // Use the public GetTriggersAsync method (main change is in a private method wrapped by this)
+            var result = await syncManager.GetTriggersAsync();
+
+            var content = JObject.Parse(result.Content);
+            var triggers = content["triggers"] as JArray;
+            Assert.NotNull(triggers);
+            Assert.Single(triggers);
+            Assert.Equal(duplicateName, triggers[0]["functionName"]?.ToString());
+            // check authLevel to verify first occurrence was kept
+            Assert.Equal("function", triggers[0]["authLevel"]?.ToString());
+        }
+
         private static LanguageWorkerOptions CreateLanguageWorkerConfigSettings()
         {
             return new LanguageWorkerOptions
@@ -919,7 +1296,6 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
         private IFileSystem CreateFileSystem(ScriptApplicationHostOptions hostOptions, string hostJsonContent = null, string extensionsJsonContent = null)
         {
             var rootPath = hostOptions.ScriptPath;
-            string testDataPath = hostOptions.TestDataPath;
 
             var fullFileSystem = new FileSystem();
             var fileSystem = new Mock<IFileSystem>();
@@ -1033,11 +1409,6 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
             {
                 return new MemoryStream(Encoding.UTF8.GetBytes(_function1));
             });
-            fileBase.Setup(f => f.Open(Path.Combine(testDataPath, "function1.dat"), It.IsAny<FileMode>(), It.IsAny<FileAccess>(), It.IsAny<FileShare>())).Returns(() =>
-            {
-                return new MemoryStream(Encoding.UTF8.GetBytes(_function1));
-            });
-
             fileBase.Setup(f => f.Exists(Path.Combine(rootPath, @"function2\function.json"))).Returns(true);
             fileBase.Setup(f => f.Exists(Path.Combine(rootPath, @"function2\main.js"))).Returns(true);
             fileBase.Setup(f => f.ReadAllText(Path.Combine(rootPath, @"function2\function.json"))).Returns(function2);
@@ -1045,21 +1416,12 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
             {
                 return new MemoryStream(Encoding.UTF8.GetBytes(function2));
             });
-            fileBase.Setup(f => f.Open(Path.Combine(testDataPath, "function2.dat"), It.IsAny<FileMode>(), It.IsAny<FileAccess>(), It.IsAny<FileShare>())).Returns(() =>
-            {
-                return new MemoryStream(Encoding.UTF8.GetBytes(_function1));
-            });
-
             fileBase.Setup(f => f.Exists(Path.Combine(rootPath, @"function3\function.json"))).Returns(true);
             fileBase.Setup(f => f.Exists(Path.Combine(rootPath, @"function3\main.js"))).Returns(true);
             fileBase.Setup(f => f.ReadAllText(Path.Combine(rootPath, @"function3\function.json"))).Returns(function3);
             fileBase.Setup(f => f.Open(Path.Combine(rootPath, @"function3\function.json"), It.IsAny<FileMode>(), It.IsAny<FileAccess>(), It.IsAny<FileShare>())).Returns(() =>
             {
                 return new MemoryStream(Encoding.UTF8.GetBytes(function3));
-            });
-            fileBase.Setup(f => f.Open(Path.Combine(testDataPath, "function3.dat"), It.IsAny<FileMode>(), It.IsAny<FileAccess>(), It.IsAny<FileShare>())).Returns(() =>
-            {
-                return new MemoryStream(Encoding.UTF8.GetBytes(_function1));
             });
 
             return fileSystem.Object;

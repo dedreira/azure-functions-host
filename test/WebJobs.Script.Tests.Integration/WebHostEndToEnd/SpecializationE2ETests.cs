@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
@@ -12,22 +12,29 @@ using System.Runtime;
 using System.Threading;
 using System.Threading.Tasks;
 using Azure.Storage.Blobs;
+using Azure.Storage.Queues;
 using Azure.Storage.Sas;
 using Microsoft.ApplicationInsights.Channel;
 using Microsoft.ApplicationInsights.DataContracts;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.TestHost;
-using Microsoft.Azure.Storage;
-using Microsoft.Azure.Storage.Queue;
+using Microsoft.Azure.WebJobs.Extensions.Http;
+using Microsoft.Azure.WebJobs.Host;
 using Microsoft.Azure.WebJobs.Host.Config;
+using Microsoft.Azure.WebJobs.Host.Scale;
 using Microsoft.Azure.WebJobs.Host.Storage;
 using Microsoft.Azure.WebJobs.Logging;
 using Microsoft.Azure.WebJobs.Logging.ApplicationInsights;
+using Microsoft.Azure.WebJobs.Script.Config;
 using Microsoft.Azure.WebJobs.Script.Configuration;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Grpc;
 using Microsoft.Azure.WebJobs.Script.WebHost;
+using Microsoft.Azure.WebJobs.Script.WebHost.Configuration;
+using Microsoft.Azure.WebJobs.Script.WebHost.Middleware;
+using Microsoft.Azure.WebJobs.Script.Workers;
 using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
+using Microsoft.Azure.WebJobs.Script.Workers.Rpc.Configuration;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -36,26 +43,37 @@ using Microsoft.Extensions.Options;
 using Microsoft.WebJobs.Script.Tests;
 using Xunit;
 using Xunit.Abstractions;
-using IApplicationLifetime = Microsoft.AspNetCore.Hosting.IApplicationLifetime;
 using LogLevel = Microsoft.Extensions.Logging.LogLevel;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests
 {
+    [Trait(TestTraits.Group, TestTraits.NonE2ESpecialization)]
     public class SpecializationE2ETests
     {
-        private static SemaphoreSlim _pauseBeforeHostBuild;
-        private static SemaphoreSlim _pauseAfterStandbyHostBuild;
-        private static SemaphoreSlim _buildCount;
+        private static readonly SemaphoreSlim _pauseBeforeHostBuild = new(1, 1);
+        private static readonly SemaphoreSlim _pauseAfterStandbyHostBuild = new(1, 1);
+        private static readonly SemaphoreSlim _buildCount = new(2, 2);
 
         private static readonly string _standbyPath = Path.Combine(Path.GetTempPath(), "functions", "standby", "wwwroot");
         private static readonly string _scriptRootConfigPath = ConfigurationPath.Combine(ConfigurationSectionNames.WebHost, nameof(ScriptApplicationHostOptions.ScriptPath));
+        private static readonly string _logPathConfigPath = ConfigurationPath.Combine(ConfigurationSectionNames.WebHost, nameof(ScriptApplicationHostOptions.LogPath));
+        private static readonly string _testLogPath = Path.Combine(Path.GetTempPath(), "Functions", "SpecializationE2ETests");
 
-        private static readonly string _dotnetIsolated60Path = Path.GetFullPath(@"..\..\..\..\DotNetIsolated60\bin\Debug\net6.0");
+        private static readonly string _dotnetIsolated60Path = Path.GetFullPath($@"..\..\DotNetIsolated60\{TestHelpers.BuildConfig}");
+        private static readonly string _dotnetIsolatedUnsuppportedPath = Path.GetFullPath($@"..\..\DotNetIsolatedUnsupportedWorker\{TestHelpers.BuildConfig}");
+        private static readonly string _dotnetIsolatedEmptyScriptRoot = Path.GetFullPath(@"..\..\..\..\EmptyScriptRoot");
+        private static readonly string _dotnetCustomHandlerPath = Path.GetFullPath($@"..\..\DotNetCustomHandler\{TestHelpers.BuildConfig}");
+        private static readonly string _dotnetIsolatedWithBundlesPath = Path.GetFullPath($@"..\..\DotNetIsolatedWithBundles\{TestHelpers.BuildConfig}");
+        private static readonly string _customHandlerWithBundlesPath = Path.GetFullPath(@"..\..\..\..\sample\CustomHandler");
+
+        private static Action<IServiceCollection> _customizeScriptHostServices;
 
         private const string _specializedScriptRoot = @"TestScripts\CSharp";
 
         private readonly TestEnvironment _environment;
         private readonly TestLoggerProvider _loggerProvider;
+        private TestLoggerProvider _scriptHostLoggerProvider;
+        private readonly TestMetricsLogger _testMetricsLogger = new();
 
         private readonly ITestOutputHelper _testOutputHelper;
 
@@ -72,11 +90,95 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             _environment = new TestEnvironment(settings);
             _loggerProvider = new TestLoggerProvider();
 
-            _pauseBeforeHostBuild = new SemaphoreSlim(1, 1);
-            _pauseAfterStandbyHostBuild = new SemaphoreSlim(1, 1);
-            _buildCount = new SemaphoreSlim(2, 2);
-
             _testOutputHelper = testOutputHelper;
+
+            // allow each test to override this
+            _customizeScriptHostServices = null;
+        }
+
+        [Fact]
+        public async Task ReservedRouteEnforcement_OptOutIsAppliedAfterSpecialization()
+        {
+            var builder = InitializeDotNetIsolatedPlaceholderBuilder(_dotnetIsolated60Path, _loggerProvider, "ReservedRouteCatchAll")
+                .ConfigureScriptHostServices(services =>
+                {
+                    services.PostConfigure<HttpOptions>(options => options.RoutePrefix = string.Empty);
+                });
+
+            await using var stoppable = new StoppableHost(builder.Build());
+            IHost webHost = stoppable.Inner;
+            await webHost.StartAsync();
+            HttpClient client = webHost.GetTestClient();
+
+            HttpResponseMessage response = await client.GetAsync("admin/foo");
+            Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+            Assert.Empty(await response.Content.ReadAsStringAsync());
+
+            _environment.SetEnvironmentVariable(
+                EnvironmentSettingNames.AzureWebJobsFeatureFlags,
+                $"{ScriptConstants.FeatureFlagEnableWorkerIndexing},{ScriptConstants.FeatureFlagDisableReservedRouteEnforcement}");
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady, "1");
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
+
+            response = await client.GetAsync("admin/foo");
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.Equal("customer catch-all", await response.Content.ReadAsStringAsync());
+
+            response = await client.GetAsync("admin/host/status");
+
+            Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+            Assert.Empty(await response.Content.ReadAsStringAsync());
+        }
+
+        [Fact]
+        public async Task ReservedRouteEnforcement_MatchingFunctionLogsErrorAfterSpecialization()
+        {
+            _scriptHostLoggerProvider = new TestLoggerProvider();
+            var builder = InitializeDotNetIsolatedPlaceholderBuilder(_dotnetIsolated60Path, _loggerProvider, "ReservedRouteCatchAll")
+                .ConfigureScriptHostServices(services =>
+                {
+                    services.PostConfigure<HttpOptions>(options => options.RoutePrefix = string.Empty);
+                });
+
+            await using var stoppable = new StoppableHost(builder.Build());
+            IHost webHost = stoppable.Inner;
+            await webHost.StartAsync();
+            HttpClient client = webHost.GetTestClient();
+
+            HttpResponseMessage response = await client.GetAsync("admin/foo");
+            Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+            Assert.Empty(await response.Content.ReadAsStringAsync());
+            Assert.DoesNotContain(
+                _loggerProvider.GetAllLogMessages(),
+                p => string.Equals(p.Category, typeof(ReservedRouteGuardMiddleware).FullName, StringComparison.Ordinal));
+            Assert.DoesNotContain(
+                _scriptHostLoggerProvider.GetAllLogMessages(),
+                p => string.Equals(p.Category, typeof(ReservedRouteGuardMiddleware).FullName, StringComparison.Ordinal));
+
+            _environment.SetEnvironmentVariable(
+                EnvironmentSettingNames.AzureWebJobsFeatureFlags,
+                ScriptConstants.FeatureFlagEnableWorkerIndexing);
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady, "1");
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
+
+            response = await client.GetAsync("admin/foo");
+
+            Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+            Assert.Empty(await response.Content.ReadAsStringAsync());
+
+            response = await client.GetAsync("runtime/foo");
+
+            Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+            Assert.Empty(await response.Content.ReadAsStringAsync());
+            LogMessage log = Assert.Single(
+                _scriptHostLoggerProvider.GetAllLogMessages(),
+                p => string.Equals(p.Category, typeof(ReservedRouteGuardMiddleware).FullName, StringComparison.Ordinal) &&
+                     p.Level == LogLevel.Error);
+            Assert.Contains("function 'ReservedRouteCatchAll'", log.FormattedMessage, StringComparison.Ordinal);
+            Assert.DoesNotContain(
+                _loggerProvider.GetAllLogMessages(),
+                p => string.Equals(p.Category, typeof(ReservedRouteGuardMiddleware).FullName, StringComparison.Ordinal));
         }
 
         [Fact]
@@ -88,7 +190,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             // operation id of this request and all host logs would as well.
             var channel = new TestTelemetryChannel();
 
-            var builder = CreateStandbyHostBuilder("OneSecondTimer", "FunctionExecutionContext")
+            var builder = CreateStandbyHostBuilder(_loggerProvider, "OneSecondTimer", "FunctionExecutionContext")
                 .ConfigureScriptHostServices(s =>
                 {
                     s.AddSingleton<ITelemetryChannel>(_ => channel);
@@ -111,154 +213,280 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                     });
                 });
 
-            // TODO: https://github.com/Azure/azure-functions-host/issues/4876
-            using (var testServer = new TestServer(builder))
+            await using var stoppable = new StoppableHost(builder.Build());
+
+            var webHost = stoppable.Inner;
+
+            await webHost.StartAsync();
+
+            var client = webHost.GetTestClient();
+
+
+            HttpResponseMessage response = await client.GetAsync("api/warmup");
+            Assert.True(response.IsSuccessStatusCode, _loggerProvider.GetLog());
+
+            // Now that standby mode is warmed up, set the specialization properties...
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady, "1");
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
+
+            // ...and issue a request which will force specialization.
+            response = await client.GetAsync("api/functionexecutioncontext");
+            Assert.True(response.IsSuccessStatusCode, _loggerProvider.GetLog());
+
+            // Wait until we have a few logs from the timer trigger.
+            IEnumerable<TraceTelemetry> timerLogs = null;
+            await TestHelpers.Await(() =>
             {
-                var client = testServer.CreateClient();
-
-                HttpResponseMessage response = await client.GetAsync("api/warmup");
-                Assert.True(response.IsSuccessStatusCode, _loggerProvider.GetLog());
-
-                // Now that standby mode is warmed up, set the specialization properties...
-                _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady, "1");
-                _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
-
-                // ...and issue a request which will force specialization.
-                response = await client.GetAsync("api/functionexecutioncontext");
-                Assert.True(response.IsSuccessStatusCode, _loggerProvider.GetLog());
-
-                // Wait until we have a few logs from the timer trigger.
-                IEnumerable<TraceTelemetry> timerLogs = null;
-                await TestHelpers.Await(() =>
-                {
-                    timerLogs = channel.Telemetries
-                        .OfType<TraceTelemetry>()
-                        .Where(p => p.Message == "OneSecondTimer fired!");
-
-                    return timerLogs.Count() >= 3;
-                });
-
-                var startupRequest = channel.Telemetries
-                    .OfType<RequestTelemetry>()
-                    .Where(p => p.Name == "FunctionExecutionContext")
-                    .Single();
-
-                // Make sure that auto-Http tracking worked with this request.
-                Assert.Equal("200", startupRequest.ResponseCode);
-
-                // The host logs should not be associated with this request.
-                var logsWithRequestId = channel.Telemetries
+                timerLogs = channel.Telemetries
                     .OfType<TraceTelemetry>()
-                    .Select(p => p.Context.Operation.Id)
-                    .Where(p => p == startupRequest.Context.Operation.Id);
+                    .Where(p => p.Message == "OneSecondTimer fired!");
 
-                // Just expect the "Executing" and "Executed" logs from the actual request.
-                Assert.Equal(2, logsWithRequestId.Count());
+                return timerLogs.Count() >= 3;
+            });
 
-                // And each of the timer invocations should have a different operation id, and none
-                // should match the request id.
-                var distinctOpIds = timerLogs.Select(p => p.Context.Operation.Id).Distinct();
-                Assert.Equal(timerLogs.Count(), distinctOpIds.Count());
-                Assert.Empty(timerLogs.Where(p => p.Context.Operation.Id == startupRequest.Context.Operation.Id));
-            }
+            var startupRequest = channel.Telemetries
+                .OfType<RequestTelemetry>()
+                .Where(p => p.Name == "FunctionExecutionContext")
+                .Single();
+
+            // Make sure that auto-Http tracking worked with this request.
+            Assert.Equal("200", startupRequest.ResponseCode);
+
+            // The host logs should not be associated with this request.
+            var logsWithRequestId = channel.Telemetries
+                .OfType<TraceTelemetry>()
+                .Select(p => p.Context.Operation.Id)
+                .Where(p => p == startupRequest.Context.Operation.Id);
+
+            // Just expect the "Executing" and "Executed" logs from the actual request.
+            Assert.Equal(2, logsWithRequestId.Count());
+
+            // And each of the timer invocations should have a different operation id, and none
+            // should match the request id.
+            var distinctOpIds = timerLogs.Select(p => p.Context.Operation.Id).Distinct();
+            Assert.Equal(timerLogs.Count(), distinctOpIds.Count());
+            Assert.Empty(timerLogs.Where(p => p.Context.Operation.Id == startupRequest.Context.Operation.Id));
         }
 
         [Fact]
         public async Task Specialization_ThreadUtilization()
         {
-            var builder = CreateStandbyHostBuilder("FunctionExecutionContext");
+            var builder = CreateStandbyHostBuilder(_loggerProvider, "FunctionExecutionContext");
 
-            // TODO: https://github.com/Azure/azure-functions-host/issues/4876
-            using (var testServer = new TestServer(builder))
+            await using var stoppable = new StoppableHost(builder.Build());
+
+            var host = stoppable.Inner;
+
+            await host.StartAsync();
+
+            var client = host.GetTestClient();
+
+            var response = await client.GetAsync("api/warmup");
+            response.EnsureSuccessStatusCode();
+
+            List<Task<HttpResponseMessage>> requestTasks = new List<Task<HttpResponseMessage>>();
+
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady, "1");
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
+
+            await _pauseBeforeHostBuild.WaitAsync();
+
+            ThreadPool.GetAvailableThreads(out int originalWorkerThreads, out int originalcompletionThreads);
+
+            for (int i = 0; i < 100; i++)
             {
-                var client = testServer.CreateClient();
+                requestTasks.Add(client.GetAsync("api/functionexecutioncontext"));
+            }
 
-                var response = await client.GetAsync("api/warmup");
-                response.EnsureSuccessStatusCode();
+            Thread.Sleep(5000);
+            ThreadPool.GetAvailableThreads(out int workerThreads, out int completionThreads);
 
-                List<Task<HttpResponseMessage>> requestTasks = new List<Task<HttpResponseMessage>>();
+            _pauseBeforeHostBuild.Release();
 
+            // Before the fix, when we issued the 100 requests, they would all enter the ThreadPool queue and
+            // a new thread would be taken from the thread pool every 500ms, resulting in thread starvation.
+            // After the fix, we should only be losing one (but other operations may also be using a thread, so 
+            // we'll leave a little wiggle-room).
+            int precision = 3;
+            Assert.True(workerThreads >= originalWorkerThreads - precision, $"Available ThreadPool threads should not have decreased by more than {precision}. Actual: {workerThreads}. Original: {originalWorkerThreads}.");
+
+            await Task.WhenAll(requestTasks);
+
+            void ValidateStatusCode(HttpStatusCode statusCode) => Assert.Equal(HttpStatusCode.OK, statusCode);
+            var validateStatusCodes = Enumerable.Repeat<Action<HttpStatusCode>>(ValidateStatusCode, 100).ToArray();
+            var actualStatusCodes = requestTasks.Select(t => t.Result.StatusCode);
+
+            try
+            {
+                Assert.Collection(actualStatusCodes, validateStatusCodes);
+            }
+            catch
+            {
+                foreach (var message in _loggerProvider.GetAllLogMessages())
+                {
+                    _testOutputHelper.WriteLine(message.FormattedMessage);
+                }
+
+                throw;
+            }
+        }
+
+        [Fact]
+        public async Task Specialization_SyncTriggers_DuringPlaceholderWindow_DoesNotPublishWarmup()
+        {
+            // E2E reproduction of the SyncTriggers race in azure-functions-host#10169.
+            //
+            // During specialization the placeholder-mode environment variable is cleared *before*
+            // the specialized host is built and its real functions are loaded. In that window the
+            // active host is still the standby host exposing only the placeholder "WarmUp" function,
+            // yet IsSyncTriggersEnvironment() now passes (InStandbyMode has already latched to false).
+            // A foreground SyncTriggers request that races a deploy therefore publishes the
+            // placeholder WarmUp trigger payload to the FrontEnd, which can leave the app stuck
+            // showing only WarmUp (foreground syncs bypass the hash blob so it never self-heals).
+            //
+            // Here we recreate that exact window deterministically: the InfiniteTimerStandbyManager
+            // never auto-specializes and we never send a request that would trigger specialization,
+            // so the standby (WarmUp-only) host stays active. We then flip the environment out of
+            // placeholder mode and drive a foreground SyncTriggers. The placeholder WarmUp trigger
+            // must NOT be published.
+            var capturedSetTriggersBodies = new System.Collections.Concurrent.ConcurrentBag<string>();
+
+            string encryptionKey = TestHelpers.GenerateKeyHexString();
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.WebSiteAuthEncryptionKey, encryptionKey);
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteHostName, "testsite.azurewebsites.test");
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteName, "testsite");
+
+            // Keep the payload on the minimal path (no per-function secret/file fetches) so the
+            // sync deterministically reaches SetTriggers with the placeholder trigger in current code.
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteArmCacheEnabled, "0");
+
+            var builder = CreateStandbyHostBuilder(_loggerProvider, "FunctionExecutionContext")
+                .ConfigureServices(services =>
+                {
+                    services.AddHttpClient(Options.DefaultName)
+                        .ConfigurePrimaryHttpMessageHandler(() => new CapturingHttpMessageHandler(capturedSetTriggersBodies));
+                });
+
+            using (new TestScopedEnvironmentVariable(EnvironmentSettingNames.WebSiteAuthEncryptionKey, encryptionKey))
+            {
+                await using var stoppable = new StoppableHost(builder.Build());
+
+                var host = stoppable.Inner;
+
+                await host.StartAsync();
+
+                var client = host.GetTestClient();
+
+                // Build the standby host and load the placeholder WarmUp function.
+                var warmupResponse = await client.GetAsync("api/warmup");
+                warmupResponse.EnsureSuccessStatusCode();
+
+                // Exit placeholder mode WITHOUT specializing - this is the race window. The active
+                // host is still the standby host (WarmUp only), but InStandbyMode has latched false.
                 _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady, "1");
                 _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
 
-                await _pauseBeforeHostBuild.WaitAsync();
+                var syncManager = host.Services.GetRequiredService<Microsoft.Azure.WebJobs.Script.WebHost.Management.IFunctionsSyncManager>();
 
-                ThreadPool.GetAvailableThreads(out int originalWorkerThreads, out int originalcompletionThreads);
+                // Foreground sync (the racing inbound request).
+                var result = await syncManager.TrySyncTriggersAsync();
 
-                for (int i = 0; i < 100; i++)
-                {
-                    requestTasks.Add(client.GetAsync("api/functionexecutioncontext"));
-                }
-
-                Thread.Sleep(5000);
-                ThreadPool.GetAvailableThreads(out int workerThreads, out int completionThreads);
-
-                _pauseBeforeHostBuild.Release();
-
-                // Before the fix, when we issued the 100 requests, they would all enter the ThreadPool queue and
-                // a new thread would be taken from the thread pool every 500ms, resulting in thread starvation.
-                // After the fix, we should only be losing one (but other operations may also be using a thread, so 
-                // we'll leave a little wiggle-room).
-                int precision = 3;
-                Assert.True(workerThreads >= originalWorkerThreads - precision, $"Available ThreadPool threads should not have decreased by more than {precision}. Actual: {workerThreads}. Original: {originalWorkerThreads}.");
-
-                await Task.WhenAll(requestTasks);
-
-                void ValidateStatusCode(HttpStatusCode statusCode) => Assert.Equal(HttpStatusCode.OK, statusCode);
-                var validateStatusCodes = Enumerable.Repeat<Action<HttpStatusCode>>(ValidateStatusCode, 100).ToArray();
-                var actualStatusCodes = requestTasks.Select(t => t.Result.StatusCode);
-
-                try
-                {
-                    Assert.Collection(actualStatusCodes, validateStatusCodes);
-                }
-                catch
-                {
-                    foreach (var message in _loggerProvider.GetAllLogMessages())
-                    {
-                        _testOutputHelper.WriteLine(message.FormattedMessage);
-                    }
-
-                    throw;
-                }
+                // The placeholder WarmUp trigger must never be published to the FrontEnd.
+                Assert.DoesNotContain(capturedSetTriggersBodies, body =>
+                    body.IndexOf(WarmUpConstants.FunctionName, StringComparison.OrdinalIgnoreCase) >= 0);
             }
+        }
+
+        [Fact]
+        public async Task Specialization_WebHostOptionsAreLogged()
+        {
+            const string optionsCategory = "Microsoft.Azure.WebJobs.Hosting.OptionsLoggingService";
+
+            var builder = CreateStandbyHostBuilder(_loggerProvider, "FunctionExecutionContext");
+
+            await using var stoppable = new StoppableHost(builder.Build());
+
+            var host = stoppable.Inner;
+
+            await host.StartAsync();
+
+            var client = host.GetTestClient();
+
+            var response = await client.GetAsync("api/warmup");
+            response.EnsureSuccessStatusCode();
+
+            // Specialize
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady, "1");
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
+
+            response = await client.GetAsync("api/functionexecutioncontext");
+            response.EnsureSuccessStatusCode();
+
+            // Wait for the OptionsLoggingService to process all queued log entries.
+            await TestHelpers.Await(() =>
+                _loggerProvider.GetAllLogMessages()
+                    .Any(m => string.Equals(m.Category, optionsCategory, StringComparison.Ordinal)
+                           && m.FormattedMessage.StartsWith(nameof(ScriptJobHostOptions), StringComparison.Ordinal)));
+
+            var allOptionsLogs = _loggerProvider.GetAllLogMessages()
+                .Where(m => string.Equals(m.Category, optionsCategory, StringComparison.Ordinal))
+                .Select(m => m.FormattedMessage)
+                .ToList();
+
+            // WebHost-level options implementing IOptionsFormatter should be logged.
+            TestHelpers.AssertOptionLogged(allOptionsLogs, nameof(HttpBodyControlOptions));
+            TestHelpers.AssertOptionLogged(allOptionsLogs, nameof(ResponseCompressionOptions));
+            TestHelpers.AssertOptionLogged(allOptionsLogs, nameof(HostHealthMonitorOptions));
+            TestHelpers.AssertOptionLogged(allOptionsLogs, nameof(WorkerConfigurationResolverOptions));
+            TestHelpers.AssertOptionLogged(allOptionsLogs, nameof(LanguageWorkerOptions));
+
+            // ScriptHost-level options should also be present.
+            TestHelpers.AssertOptionLogged(allOptionsLogs, nameof(ScriptJobHostOptions));
+            TestHelpers.AssertOptionLogged(allOptionsLogs, nameof(FunctionResultAggregatorOptions));
+            TestHelpers.AssertOptionLogged(allOptionsLogs, nameof(ConcurrencyOptions));
+            TestHelpers.AssertOptionLogged(allOptionsLogs, nameof(SingletonOptions));
+            TestHelpers.AssertOptionLogged(allOptionsLogs, nameof(ScaleOptions));
+            TestHelpers.AssertOptionLogged(allOptionsLogs, nameof(HttpOptions));
         }
 
         [Fact]
         public async Task Specialization_ResetsSharedLoadContext()
         {
-            var builder = CreateStandbyHostBuilder("FunctionExecutionContext");
+            var builder = CreateStandbyHostBuilder(_loggerProvider, "FunctionExecutionContext");
 
-            using (var testServer = new TestServer(builder))
-            {
-                var client = testServer.CreateClient();
+            await using var stoppable = new StoppableHost(builder.Build());
 
-                var response = await client.GetAsync("api/warmup");
-                response.EnsureSuccessStatusCode();
+            var host = stoppable.Inner;
 
-                var placeholderContext = FunctionAssemblyLoadContext.Shared;
+            await host.StartAsync();
 
-                _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady, "1");
-                _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
+            var client = host.GetTestClient();
 
-                //await _pauseBeforeHostBuild.WaitAsync(10000);
+            var response = await client.GetAsync("api/warmup");
+            response.EnsureSuccessStatusCode();
 
-                response = await client.GetAsync("api/functionexecutioncontext");
-                response.EnsureSuccessStatusCode();
+            var placeholderContext = FunctionAssemblyLoadContext.Shared;
 
-                var specializedContext = FunctionAssemblyLoadContext.Shared;
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady, "1");
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
 
-                Assert.NotSame(placeholderContext, specializedContext);
-            }
+            //await _pauseBeforeHostBuild.WaitAsync(10000);
+
+            response = await client.GetAsync("api/functionexecutioncontext");
+            response.EnsureSuccessStatusCode();
+
+            var specializedContext = FunctionAssemblyLoadContext.Shared;
+
+            Assert.NotSame(placeholderContext, specializedContext);
         }
 
         [Fact]
         public async Task ForNonReadOnlyFileSystem_RestartWorkerForSpecializationAndHotReload()
         {
-            _environment.SetEnvironmentVariable(RpcWorkerConstants.FunctionWorkerRuntimeSettingName, "node");
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.FunctionWorkerRuntime, "node");
             _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebJobsFeatureFlags, ScriptConstants.FeatureFlagEnableWorkerIndexing);
 
-            var builder = CreateStandbyHostBuilder("HttpTriggerNoAuth");
+            var builder = CreateStandbyHostBuilder(_loggerProvider, "HttpTriggerNoAuth");
 
             builder.ConfigureAppConfiguration(config =>
             {
@@ -269,14 +497,18 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 });
             });
 
-            using var testServer = new TestServer(builder);
+            await using var stoppable = new StoppableHost(builder.Build());
 
-            var client = testServer.CreateClient();
+            var host = stoppable.Inner;
+
+            await host.StartAsync();
+
+            var client = host.GetTestClient();
 
             var response = await client.GetAsync("api/warmup");
             response.EnsureSuccessStatusCode();
 
-            var webChannelManager = testServer.Services.GetService<IWebHostRpcWorkerChannelManager>();
+            var webChannelManager = host.Services.GetService<IWebHostRpcWorkerChannelManager>();
             var channel = await webChannelManager.GetChannels("node").Single().Value.Task;
             var processId = channel.WorkerProcess.Process.Id;
 
@@ -302,7 +534,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             string updatedContent = fileContent.Replace(content, newContent);
             File.WriteAllText(indexJS, updatedContent);
 
-            var manager = testServer.Host.Services.GetService<IScriptHostManager>();
+            var manager = host.Services.GetService<IScriptHostManager>();
             var hostService = manager as WebJobsScriptHostService;
 
             await TestHelpers.Await(() =>
@@ -329,10 +561,10 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         [Fact]
         public async Task Specialization_RestartsWorkerForNonReadOnlyFileSystem()
         {
-            _environment.SetEnvironmentVariable(RpcWorkerConstants.FunctionWorkerRuntimeSettingName, "node");
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.FunctionWorkerRuntime, "node");
             _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebJobsFeatureFlags, ScriptConstants.FeatureFlagEnableWorkerIndexing);
 
-            var builder = CreateStandbyHostBuilder("HttpTriggerNoAuth");
+            var builder = CreateStandbyHostBuilder(_loggerProvider, "HttpTriggerNoAuth");
 
             builder.ConfigureAppConfiguration(config =>
             {
@@ -343,16 +575,20 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 });
             });
 
-            using var testServer = new TestServer(builder);
+            await using var stoppable = new StoppableHost(builder.Build());
 
-            var client = testServer.CreateClient();
+            var host = stoppable.Inner;
+
+            await host.StartAsync();
+
+            var client = host.GetTestClient();
 
             var response = await client.GetAsync("api/warmup");
             response.EnsureSuccessStatusCode();
 
             var placeholderContext = FunctionAssemblyLoadContext.Shared;
 
-            var webChannelManager = testServer.Services.GetService<IWebHostRpcWorkerChannelManager>();
+            var webChannelManager = host.Services.GetService<IWebHostRpcWorkerChannelManager>();
             var channel = await webChannelManager.GetChannels("node").Single().Value.Task;
             var processId = channel.WorkerProcess.Process.Id;
 
@@ -372,10 +608,10 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         [Fact]
         public async Task Specialization_UsePlaceholderWorkerforReadOnlyFileSystem()
         {
-            _environment.SetEnvironmentVariable(RpcWorkerConstants.FunctionWorkerRuntimeSettingName, "node");
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.FunctionWorkerRuntime, "node");
             _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebJobsFeatureFlags, ScriptConstants.FeatureFlagEnableWorkerIndexing);
 
-            var builder = CreateStandbyHostBuilder("HttpTriggerNoAuth");
+            var builder = CreateStandbyHostBuilder(_loggerProvider, "HttpTriggerNoAuth");
             string isFileSystemReadOnly = ConfigurationPath.Combine(ConfigurationSectionNames.WebHost, nameof(ScriptApplicationHostOptions.IsFileSystemReadOnly));
 
             builder.ConfigureAppConfiguration(config =>
@@ -386,15 +622,18 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                     });
                 });
 
+            await using var stoppable = new StoppableHost(builder.Build());
 
-            using var testServer = new TestServer(builder);
+            var host = stoppable.Inner;
 
-            var client = testServer.CreateClient();
+            await host.StartAsync();
+
+            var client = host.GetTestClient();
 
             var response = await client.GetAsync("api/warmup");
             response.EnsureSuccessStatusCode();
 
-            var webChannelManager = testServer.Services.GetService<IWebHostRpcWorkerChannelManager>();
+            var webChannelManager = host.Services.GetService<IWebHostRpcWorkerChannelManager>();
             var channel = await webChannelManager.GetChannels("node").Single().Value.Task;
             var processId = channel.WorkerProcess.Process.Id;
 
@@ -413,10 +652,10 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         [Fact]
         public async Task Specialization_RestartWorkerWithWorkerArguments()
         {
-            _environment.SetEnvironmentVariable(RpcWorkerConstants.FunctionWorkerRuntimeSettingName, "node");
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.FunctionWorkerRuntime, "node");
             _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebJobsFeatureFlags, ScriptConstants.FeatureFlagEnableWorkerIndexing);
 
-            var builder = CreateStandbyHostBuilder("HttpTriggerNoAuth");
+            var builder = CreateStandbyHostBuilder(_loggerProvider, "HttpTriggerNoAuth");
             string isFileSystemReadOnly = ConfigurationPath.Combine(ConfigurationSectionNames.WebHost, nameof(ScriptApplicationHostOptions.IsFileSystemReadOnly));
 
             builder.ConfigureAppConfiguration(config =>
@@ -427,14 +666,18 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 });
             });
 
-            using var testServer = new TestServer(builder);
+            await using var stoppable = new StoppableHost(builder.Build());
 
-            var client = testServer.CreateClient();
+            var host = stoppable.Inner;
+
+            await host.StartAsync();
+
+            var client = host.GetTestClient();
 
             var response = await client.GetAsync("api/warmup");
             response.EnsureSuccessStatusCode();
 
-            var webChannelManager = testServer.Services.GetService<IWebHostRpcWorkerChannelManager>();
+            var webChannelManager = host.Services.GetService<IWebHostRpcWorkerChannelManager>();
             var channel = await webChannelManager.GetChannels("node").Single().Value.Task;
             var processId = channel.WorkerProcess.Process.Id;
             Assert.DoesNotContain("--max-old-space-size=1272", channel.WorkerProcess.Process.StartInfo.Arguments);
@@ -453,90 +696,144 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             var newProcessId = channel.WorkerProcess.Process.Id;
             Assert.Contains("--max-old-space-size=1272", channel.WorkerProcess.Process.StartInfo.Arguments);
             Assert.NotEqual(processId, newProcessId);
+
+            AssertWorkerProcessStartupCount(2);
+
+            AssertLanguageWorkerOptionsSetupCount(2);
+        }
+
+        [Fact]
+        // This test doesn't specialize, but is here to compare behavior with the other Arguments test above
+        public async Task NoSpecialization_StartWorkerWithWorkerArguments()
+        {
+            _environment.Clear();
+
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.FunctionWorkerRuntime, "node");
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebJobsFeatureFlags, ScriptConstants.FeatureFlagEnableWorkerIndexing);
+
+            var builder = CreateStandbyHostBuilder(_loggerProvider, "HttpTriggerNoAuth");
+
+            builder.ConfigureAppConfiguration(config =>
+            {
+                config.AddInMemoryCollection(new Dictionary<string, string>
+                {
+                    { _scriptRootConfigPath, Path.GetFullPath(@"TestScripts\NodeWithBundles") }
+                });
+            });
+
+            // Use an actual env var here as it will be refreshed in config after specialization
+            using var envVars = new TestScopedEnvironmentVariable("languageWorkers:node:arguments", "--max-old-space-size=1272");
+
+            await using var stoppable = new StoppableHost(builder.Build());
+
+            var host = stoppable.Inner;
+
+            await host.StartAsync();
+
+            var client = host.GetTestClient();
+
+            var response = await client.GetAsync("api/HttpTriggerNoAuth");
+            response.EnsureSuccessStatusCode();
+
+            var webChannelManager = host.Services.GetService<IWebHostRpcWorkerChannelManager>();
+            var channel = await webChannelManager.GetChannels("node").Single().Value.Task;
+            Assert.Contains("--max-old-space-size=1272", channel.WorkerProcess.Process.StartInfo.Arguments);
+
+            AssertWorkerProcessStartupCount(1);
+
+            AssertLanguageWorkerOptionsSetupCount(1);
         }
 
         [Fact]
         public async Task Specialization_GCMode()
         {
-            var builder = CreateStandbyHostBuilder("FunctionExecutionContext");
+            var builder = CreateStandbyHostBuilder(_loggerProvider, "FunctionExecutionContext");
 
-            using (var testServer = new TestServer(builder))
-            {
-                var client = testServer.CreateClient();
+            await using var stoppable = new StoppableHost(builder.Build());
 
-                // GC's LatencyMode should be Interactive as default, switch to NoGCRegion in placeholder mode and back to Interactive when specialization is complete.
-                Assert.True(GCSettings.LatencyMode != GCLatencyMode.NoGCRegion, "GCLatencyMode should *not* be NoGCRegion at the beginning");
+            var host = stoppable.Inner;
 
-                var response = await client.GetAsync("api/warmup");
-                response.EnsureSuccessStatusCode();
+            await host.StartAsync();
 
-                _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady, "1");
-                _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
+            var client = host.GetTestClient();
 
-                response = await client.GetAsync("api/functionexecutioncontext");
-                response.EnsureSuccessStatusCode();
+            // GC's LatencyMode should be Interactive as default, switch to NoGCRegion in placeholder mode and back to Interactive when specialization is complete.
+            Assert.True(GCSettings.LatencyMode != GCLatencyMode.NoGCRegion, "GCLatencyMode should *not* be NoGCRegion at the beginning");
 
-                Assert.True(GCSettings.LatencyMode != GCLatencyMode.NoGCRegion, "GCLatencyMode should *not* be NoGCRegion at the end of specialization");
-            }
+            var response = await client.GetAsync("api/warmup");
+            response.EnsureSuccessStatusCode();
+
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady, "1");
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
+
+            response = await client.GetAsync("api/functionexecutioncontext");
+            response.EnsureSuccessStatusCode();
+
+            Assert.True(GCSettings.LatencyMode != GCLatencyMode.NoGCRegion, "GCLatencyMode should *not* be NoGCRegion at the end of specialization");
         }
 
         [Fact]
         public async Task Specialization_ResetsSecretManagerRepository()
         {
-            var builder = CreateStandbyHostBuilder("FunctionExecutionContext")
+            var builder = CreateStandbyHostBuilder(_loggerProvider, "FunctionExecutionContext")
                 .ConfigureLogging(logging =>
                 {
                     logging.AddFilter<TestLoggerProvider>(null, LogLevel.Debug);
                 });
 
-            using (var testServer = new TestServer(builder))
-            {
-                var client = testServer.CreateClient();
+            await using var stoppable = new StoppableHost(builder.Build());
 
-                var response = await client.GetAsync("api/warmup");
-                response.EnsureSuccessStatusCode();
+            var host = stoppable.Inner;
 
-                var provider = testServer.Host.Services.GetService<ISecretManagerProvider>();
-                _ = provider.SecretsEnabled;
-                _ = provider.SecretsEnabled;
-                _ = provider.SecretsEnabled;
+            await host.StartAsync();
 
-                // Should only be evaluated once due to the Lazy
-                var messages = _loggerProvider.GetAllLogMessages().Select(p => p.EventId.Name);
-                Assert.Single(messages, "GetSecretsEnabled");
+            var client = host.GetTestClient();
 
-                _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady, "1");
-                _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
+            var response = await client.GetAsync("api/warmup");
+            response.EnsureSuccessStatusCode();
 
-                // Force specialization
-                response = await client.GetAsync("api/functionexecutioncontext");
-                response.EnsureSuccessStatusCode();
+            var provider = host.Services.GetService<ISecretManagerProvider>();
+            _ = provider.SecretsEnabled;
+            _ = provider.SecretsEnabled;
+            _ = provider.SecretsEnabled;
 
-                _ = provider.SecretsEnabled;
-                _ = provider.SecretsEnabled;
-                _ = provider.SecretsEnabled;
+            // Should only be evaluated once due to the Lazy
+            var messages = _loggerProvider.GetAllLogMessages().Select(p => p.EventId.Name);
+            Assert.Single(messages, "GetSecretsEnabled");
 
-                messages = _loggerProvider.GetAllLogMessages().Select(p => p.EventId.Name);
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady, "1");
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
 
-                // Should be re-evaluated one more time after reset
-                Assert.Equal(2, messages.Where(p => p == "GetSecretsEnabled").Count());
+            // Force specialization
+            response = await client.GetAsync("api/functionexecutioncontext");
+            response.EnsureSuccessStatusCode();
 
-                Assert.Single(messages, "ResetSecretManager");
-            }
+            _ = provider.SecretsEnabled;
+            _ = provider.SecretsEnabled;
+            _ = provider.SecretsEnabled;
+
+            messages = _loggerProvider.GetAllLogMessages().Select(p => p.EventId.Name);
+
+            // Should be re-evaluated one more time after reset
+            Assert.Equal(2, messages.Where(p => p == "GetSecretsEnabled").Count());
+
+            Assert.Single(messages, "ResetSecretManager");
         }
 
         [Fact]
         public async Task StartAsync_SetsCorrectActiveHost_RefreshesLanguageWorkerOptions()
         {
-            var builder = CreateStandbyHostBuilder();
+            var builder = CreateStandbyHostBuilder(_loggerProvider);
 
             await _pauseAfterStandbyHostBuild.WaitAsync();
 
             // We want it to start first, but finish last, so unstick it in a couple seconds.
             Task ignore = Task.Delay(3000).ContinueWith(_ => _pauseAfterStandbyHostBuild.Release());
 
-            var expectedPowerShellVersion = "7.2";
-            IWebHost host = builder.Build();
+            var expectedPowerShellVersion = "7.4";
+            await using var stoppable = new StoppableHost(builder.Build());
+            var host = stoppable.Inner;
+
             var scriptHostService = host.Services.GetService<WebJobsScriptHostService>();
             var channelFactory = host.Services.GetService<IRpcWorkerChannelFactory>();
             var workerOptionsPlaceholderMode = host.Services.GetService<IOptions<LanguageWorkerOptions>>();
@@ -557,7 +854,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady, "1");
             _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
-            _environment.SetEnvironmentVariable(RpcWorkerConstants.FunctionWorkerRuntimeSettingName, "powershell");
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.FunctionWorkerRuntime, "powershell");
             _environment.SetEnvironmentVariable(RpcWorkerConstants.FunctionWorkerRuntimeVersionSettingName, expectedPowerShellVersion);
 
             var specializeTask = Task.Run(async () => await standbyManager.SpecializeHostAsync());
@@ -586,7 +883,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             // Add environment variables expected throughout the specialization (similar to how DWAS updates the environment)
             using (new TestScopedEnvironmentVariable("AzureWebJobsStorage", ""))
             {
-                var builder = CreateStandbyHostBuilder("FunctionExecutionContext")
+                var builder = CreateStandbyHostBuilder(_loggerProvider, "FunctionExecutionContext")
                 .ConfigureScriptHostWebJobsBuilder(s =>
                 {
                     if (!_environment.IsPlaceholderModeEnabled())
@@ -600,24 +897,28 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 // This is required to force secrets to load.
                 _environment.SetEnvironmentVariable("WEBSITE_HOSTNAME", "test");
 
-                using (var testServer = new TestServer(builder))
+                await using var stoppable = new StoppableHost(builder.Build());
+
+                var host = stoppable.Inner;
+
+                await host.StartAsync();
+
+                var client = host.GetTestClient();
+
+                var response = await client.GetAsync("api/warmup");
+                response.EnsureSuccessStatusCode();
+
+                _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady, "1");
+                _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
+
+                // This value is available now
+                using (new TestScopedEnvironmentVariable("AzureWebJobsStorage", storageValue))
                 {
-                    var client = testServer.CreateClient();
-                    var response = await client.GetAsync("api/warmup");
+                    // Now that we're specialized, set up the expected env var, which will be loaded internally
+                    // when the config is refreshed during specialization.
+                    // This request will force specialization.
+                    response = await client.GetAsync("api/functionexecutioncontext");
                     response.EnsureSuccessStatusCode();
-
-                    _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady, "1");
-                    _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
-
-                    // This value is available now
-                    using (new TestScopedEnvironmentVariable("AzureWebJobsStorage", storageValue))
-                    {
-                        // Now that we're specialized, set up the expected env var, which will be loaded internally
-                        // when the config is refreshed during specialization.
-                        // This request will force specialization.
-                        response = await client.GetAsync("api/functionexecutioncontext");
-                        response.EnsureSuccessStatusCode();
-                    }
                 }
             }
         }
@@ -634,7 +935,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             // Add environment variables expected throughout the specialization (similar to how DWAS updates the environment)
             using (new TestScopedEnvironmentVariable("AzureWebJobsStorage", ""))
             {
-                var builder = CreateStandbyHostBuilder("FunctionExecutionContext")
+                var builder = CreateStandbyHostBuilder(_loggerProvider, "FunctionExecutionContext")
                 .ConfigureScriptHostWebJobsBuilder(s =>
                 {
                     if (!_environment.IsPlaceholderModeEnabled())
@@ -653,24 +954,28 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 // This is required to force secrets to load.
                 _environment.SetEnvironmentVariable("WEBSITE_HOSTNAME", "test");
 
-                using (var testServer = new TestServer(builder))
+                await using var stoppable = new StoppableHost(builder.Build());
+
+                var host = stoppable.Inner;
+
+                await host.StartAsync();
+
+                var client = host.GetTestClient();
+
+                var response = await client.GetAsync("api/warmup");
+                response.EnsureSuccessStatusCode();
+
+                _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady, "1");
+                _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
+
+                // This value is available now
+                using (new TestScopedEnvironmentVariable("AzureWebJobsStorage", storageValue))
                 {
-                    var client = testServer.CreateClient();
-                    var response = await client.GetAsync("api/warmup");
+                    // Now that we're specialized, set up the expected env var, which will be loaded internally
+                    // when the config is refreshed during specialization.
+                    // This request will force specialization.
+                    response = await client.GetAsync("api/functionexecutioncontext");
                     response.EnsureSuccessStatusCode();
-
-                    _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady, "1");
-                    _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
-
-                    // This value is available now
-                    using (new TestScopedEnvironmentVariable("AzureWebJobsStorage", storageValue))
-                    {
-                        // Now that we're specialized, set up the expected env var, which will be loaded internally
-                        // when the config is refreshed during specialization.
-                        // This request will force specialization.
-                        response = await client.GetAsync("api/functionexecutioncontext");
-                        response.EnsureSuccessStatusCode();
-                    }
                 }
             }
         }
@@ -683,7 +988,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             // No AzureWebJobsStorage set in environment variables (App Settings from portal)
             using (new TestScopedEnvironmentVariable("AzureWebJobsStorage", ""))
             {
-                var builder = CreateStandbyHostBuilder("FunctionExecutionContext")
+                var builder = CreateStandbyHostBuilder(_loggerProvider, "FunctionExecutionContext")
                 .ConfigureScriptHostWebJobsBuilder(s =>
                 {
                     if (!_environment.IsPlaceholderModeEnabled())
@@ -708,23 +1013,28 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 // This is required to force secrets to load.
                 _environment.SetEnvironmentVariable("WEBSITE_HOSTNAME", "test");
 
-                using (var testServer = new TestServer(builder))
-                {
-                    var client = testServer.CreateClient();
-                    var response = await client.GetAsync("api/warmup");
-                    response.EnsureSuccessStatusCode();
+                await using var stoppable = new StoppableHost(builder.Build());
 
-                    _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady, "1");
-                    _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
+                var host = stoppable.Inner;
 
-                    // Now that we're specialized, set up the expected env var, which will be loaded internally
-                    // when the config is refreshed during specialization.
-                    // This request will force specialization.
-                    response = await client.GetAsync("api/functionexecutioncontext");
-                    response.EnsureSuccessStatusCode();
-                }
+                await host.StartAsync();
+
+                var client = host.GetTestClient();
+
+                var response = await client.GetAsync("api/warmup");
+                response.EnsureSuccessStatusCode();
+
+                _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady, "1");
+                _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
+
+                // Now that we're specialized, set up the expected env var, which will be loaded internally
+                // when the config is refreshed during specialization.
+                // This request will force specialization.
+                response = await client.GetAsync("api/functionexecutioncontext");
+                response.EnsureSuccessStatusCode();
             }
         }
+
 
         /// <summary>
         /// This scenario tests that the configured JobHostInternalStorageOptions will have the right
@@ -744,10 +1054,10 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             // We can't assume the placeholder has any environment variables specified by the customer.
             // Add environment variables expected throughout the specialization (similar to how DWAS updates the environment)
-            using (new TestScopedEnvironmentVariable("AzureFunctionsJobHost__InternalSasBlobContainer", ""))
-            using (new TestScopedEnvironmentVariable("AzureWebJobsStorage", ""))
+            using (new TestScopedEnvironmentVariable("AzureFunctionsJobHost__InternalSasBlobContainer", null))
+            using (new TestScopedEnvironmentVariable("AzureWebJobsStorage", null))
             {
-                var builder = CreateStandbyHostBuilder("FunctionExecutionContext")
+                var builder = CreateStandbyHostBuilder(_loggerProvider, "FunctionExecutionContext")
                 .ConfigureScriptHostWebJobsBuilder(s =>
                 {
                     if (!_environment.IsPlaceholderModeEnabled())
@@ -761,54 +1071,117 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 // This is required to force secrets to load.
                 _environment.SetEnvironmentVariable("WEBSITE_HOSTNAME", "test");
 
-                using (var testServer = new TestServer(builder))
+                await using var stoppable = new StoppableHost(builder.Build());
+
+                var host = stoppable.Inner;
+
+                await host.StartAsync();
+
+                var client = host.GetTestClient();
+
+                var response = await client.GetAsync("api/warmup");
+                response.EnsureSuccessStatusCode();
+
+                // Should not be able to get the Hosting BlobContainerClient before specialization since
+                // customer provided storage-related configuration is not in the Environment
+                var blobStorageProvider = host.Services.GetService<IAzureBlobStorageProvider>();
+                Assert.False(blobStorageProvider.TryCreateHostingBlobContainerClient(out _));
+
+                _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady, "1");
+                _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
+
+                // This value is available now
+                using (new TestScopedEnvironmentVariable("AzureFunctionsJobHost__InternalSasBlobContainer", fakeSasUri.ToString()))
+                using (new TestScopedEnvironmentVariable("AzureWebJobsStorage", storageValue))
                 {
-                    var client = testServer.CreateClient();
-                    var response = await client.GetAsync("api/warmup");
+                    // Now that we're specialized, set up the expected env var, which will be loaded internally
+                    // when the config is refreshed during specialization.
+                    // This request will force specialization.
+                    response = await client.GetAsync("api/functionexecutioncontext");
                     response.EnsureSuccessStatusCode();
 
-                    // Should not be able to get the Hosting BlobContainerClient before specialization since
-                    // customer provided storage-related configuration is not in the Environment
-                    var blobStorageProvider = testServer.Services.GetService<IAzureBlobStorageProvider>();
-                    Assert.False(blobStorageProvider.TryCreateHostingBlobContainerClient(out _));
-
-                    _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady, "1");
-                    _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
-
-                    // This value is available now
-                    using (new TestScopedEnvironmentVariable("AzureFunctionsJobHost__InternalSasBlobContainer", fakeSasUri.ToString()))
-                    using (new TestScopedEnvironmentVariable("AzureWebJobsStorage", storageValue))
-                    {
-                        // Now that we're specialized, set up the expected env var, which will be loaded internally
-                        // when the config is refreshed during specialization.
-                        // This request will force specialization.
-                        response = await client.GetAsync("api/functionexecutioncontext");
-                        response.EnsureSuccessStatusCode();
-
-                        // The HostingBlobContainerClient should be the sas container specified.
-                        blobStorageProvider = testServer.Services.GetService<IAzureBlobStorageProvider>();
-                        Assert.True(blobStorageProvider.TryCreateHostingBlobContainerClient(out var blobContainerClient));
-                        Assert.Equal("test-sas-container", blobContainerClient.Name);
-                    }
+                    // The HostingBlobContainerClient should be the sas container specified.
+                    blobStorageProvider = host.Services.GetService<IAzureBlobStorageProvider>();
+                    Assert.True(blobStorageProvider.TryCreateHostingBlobContainerClient(out var blobContainerClient));
+                    Assert.Equal("test-sas-container", blobContainerClient.Name);
                 }
-
                 await containerClient.DeleteAsync();
+            }
+        }
+
+        [Theory]
+        [InlineData(ScriptConstants.FlexConsumptionSku, ScriptConstants.FeatureFlagEnableMcpCustomHandlerPreview, true)]
+        [InlineData(ScriptConstants.FlexConsumptionSku, $"Feature1,{ScriptConstants.FeatureFlagEnableMcpCustomHandlerPreview}", true)]
+        [InlineData(ScriptConstants.FlexConsumptionSku, "Feature1", false)]
+        [InlineData(ScriptConstants.FlexConsumptionSku, null, false)]
+        [InlineData(ScriptConstants.DynamicSku, null, false)]
+        [InlineData(ScriptConstants.DynamicSku, ScriptConstants.FeatureFlagEnableMcpCustomHandlerPreview, false)]
+        [InlineData(ScriptConstants.DynamicSku, $"Feature1,{ScriptConstants.FeatureFlagEnableMcpCustomHandlerPreview}", false)]
+        [InlineData(ScriptConstants.ElasticPremiumSku, null, false)]
+        [InlineData(ScriptConstants.ElasticPremiumSku, $"Feature1,{ScriptConstants.FeatureFlagEnableMcpCustomHandlerPreview}", false)]
+        [InlineData("", null, false)]
+        public async Task Specialization_FlexSku_McpPreview_SetsWorkerRuntimeToCustom(string websiteSku, string featureFlags, bool isExpectedToResetWorkerRuntime)
+        {
+            var environmentVariables = new Dictionary<string, string>
+            {
+                { EnvironmentSettingNames.AzureWebsiteSku, websiteSku }
+            };
+            var builder = InitializeDotNetIsolatedPlaceholderBuilder(_dotnetCustomHandlerPath, _loggerProvider, environmentVariables, "SimpleHttpTrigger");
+
+            await using var stoppable = new StoppableHost(builder.Build());
+
+            var host = stoppable.Inner;
+
+            await host.StartAsync();
+
+            var client = host.GetTestClient();
+            var response = await client.GetAsync("api/warmup");
+            response.EnsureSuccessStatusCode();
+
+            // Validate that the channel is set up with native worker
+            var webChannelManager = host.Services.GetService<IWebHostRpcWorkerChannelManager>();
+            var placeholderChannel = await webChannelManager.GetChannels("dotnet-isolated").Single().Value.Task;
+            Assert.Contains("FunctionsNetHost.exe", placeholderChannel.WorkerProcess.Process.StartInfo.FileName);
+            Assert.NotNull(placeholderChannel.WorkerProcess.Process.Id);
+
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebJobsFeatureFlags, featureFlags);
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady, "1");
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
+
+            response = await client.GetAsync("api/SimpleHttpTrigger");
+            response.EnsureSuccessStatusCode();
+
+            var log = _loggerProvider.GetLog();
+
+            if (isExpectedToResetWorkerRuntime)
+            {
+                // Verify expected logs when running the custom handler executable.
+                Assert.Contains("MCP custom handler preview is enabled. Setting FUNCTIONS_WORKER_RUNTIME to 'custom'", log);
+                Assert.Contains("Mapped function route 'api/SimpleHttpTrigger'", log);
+            }
+            else
+            {
+                Assert.DoesNotContain("MCP custom handler preview is enabled. Setting FUNCTIONS_WORKER_RUNTIME to 'custom'", log);
             }
         }
 
         [Fact]
         public async Task DotNetIsolated_PlaceholderHit()
         {
-            var builder = InitializeDotNetIsolatedPlaceholderBuilder("HttpRequestDataFunction");
+            var builder = InitializeDotNetIsolatedPlaceholderBuilder(_dotnetIsolated60Path, _loggerProvider, "HttpRequestDataFunction");
 
-            using var testServer = new TestServer(builder);
+            await using var stoppable = new StoppableHost(builder.Build());
 
-            var client = testServer.CreateClient();
+            var host = stoppable.Inner;
+
+            await host.StartAsync();
+
+            var client = host.GetTestClient();
             var response = await client.GetAsync("api/warmup");
             response.EnsureSuccessStatusCode();
 
             // Validate that the channel is set up with native worker
-            var webChannelManager = testServer.Services.GetService<IWebHostRpcWorkerChannelManager>();
+            var webChannelManager = host.Services.GetService<IWebHostRpcWorkerChannelManager>();
 
             var placeholderChannel = await webChannelManager.GetChannels("dotnet-isolated").Single().Value.Task;
             Assert.Contains("FunctionsNetHost.exe", placeholderChannel.WorkerProcess.Process.StartInfo.FileName);
@@ -832,6 +1205,366 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             Assert.Contains("UsePlaceholderDotNetIsolated: True", log);
             Assert.Contains("Placeholder runtime version: '6.0'. Site runtime version: '6.0'. Match: True", log);
             Assert.DoesNotContain("Shutting down placeholder worker.", log);
+
+            AssertWorkerProcessStartupCount(1);
+
+            // because placeholder app has bundles in host.json, it refreshes 2x before specializing.
+            AssertLanguageWorkerOptionsSetupCount(3);
+        }
+
+        [Fact]
+        public async Task DotNetIsolatedWithBundles_PlaceholderHit()
+        {
+            var builder = InitializeDotNetIsolatedPlaceholderBuilder(_dotnetIsolatedWithBundlesPath, _loggerProvider, "HttpRequestFunction");
+
+            await using var stoppable = new StoppableHost(builder.Build());
+
+            var host = stoppable.Inner;
+
+            await host.StartAsync();
+
+            var client = host.GetTestClient();
+            var response = await client.GetAsync("api/warmup");
+            response.EnsureSuccessStatusCode();
+
+            // Validate that the channel is set up with native worker
+            var webChannelManager = host.Services.GetService<IWebHostRpcWorkerChannelManager>();
+
+            var placeholderChannel = await webChannelManager.GetChannels("dotnet-isolated").Single().Value.Task;
+            Assert.Contains("FunctionsNetHost.exe", placeholderChannel.WorkerProcess.Process.StartInfo.FileName);
+            Assert.NotNull(placeholderChannel.WorkerProcess.Process.Id);
+            var runningProcess = Process.GetProcessById(placeholderChannel.WorkerProcess.Id);
+            Assert.Contains(runningProcess.ProcessName, "FunctionsNetHost");
+
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady, "1");
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
+
+            response = await client.GetAsync("api/HttpRequestFunction");
+            response.EnsureSuccessStatusCode();
+
+            // Placeholder hit; these should match
+            var specializedChannel = await webChannelManager.GetChannels("dotnet-isolated").Single().Value.Task;
+            Assert.Same(placeholderChannel, specializedChannel);
+            runningProcess = Process.GetProcessById(placeholderChannel.WorkerProcess.Id);
+            Assert.Contains(runningProcess.ProcessName, "FunctionsNetHost");
+
+            var log = _loggerProvider.GetLog();
+            Assert.Contains("UsePlaceholderDotNetIsolated: True", log);
+            Assert.Contains("Placeholder runtime version: '6.0'. Site runtime version: '6.0'. Match: True", log);
+            Assert.DoesNotContain("Shutting down placeholder worker.", log);
+
+            AssertWorkerProcessStartupCount(1);
+
+            // because placeholder app has bundles in host.json, it refreshes 2x before specializing.
+            // and then it refreshes for bundles and for dotnet-isolated when specializing.
+            // This is not really a valid scenario, but we need to ensure it keeps working. Customers should not use
+            // bundles with dotnet-isolated.
+            AssertLanguageWorkerOptionsSetupCount(4);
+        }
+
+        /// <summary>
+        /// Regression test for https://github.com/Azure/azure-functions-host/issues/11676.        
+        /// </summary>
+        [Fact]
+        public async Task Specialization_DotNetIsolatedToCustomHandler_BundleExtensionsLoadCorrectly()
+        {
+            // Forces download of bundles.            
+            string downloadPath = $"{ConfigurationSectionNames.JobHost}__{ConfigurationSectionNames.ExtensionBundle}__DownloadPath";
+            using var path = new TestScopedEnvironmentVariable(downloadPath, Path.Combine(Path.GetTempPath(), "BundlesTests"));
+            using var coreTools = new TestScopedEnvironmentVariable(EnvironmentSettingNames.CoreToolsEnvironment, "1");
+
+            // Start in placeholder mode as dotnet-isolated
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.FunctionWorkerRuntime, "dotnet-isolated");
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebJobsFeatureFlags, ScriptConstants.FeatureFlagEnableWorkerIndexing);
+
+            var builder = CreateStandbyHostBuilder(_loggerProvider, "HttpTrigger", "ServiceBusTriggerFunction", "EventHubTriggerFunction");
+
+            // Override the specialized script root to point to our custom handler app with bundles
+            builder.ConfigureAppConfiguration(config =>
+            {
+                config.AddInMemoryCollection(new Dictionary<string, string>
+                {
+                    { _scriptRootConfigPath, _customHandlerWithBundlesPath },
+                });
+            });
+
+            await using var stoppable = new StoppableHost(builder.Build());
+            var webHost = stoppable.Inner;
+            await webHost.StartAsync();
+            var client = webHost.GetTestClient();
+
+            // Warm up the placeholder
+            var response = await client.GetAsync("api/warmup");
+            Assert.True(response.IsSuccessStatusCode, _loggerProvider.GetLog());
+
+            // Specialize into a custom handler app
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.FunctionWorkerRuntime, "custom");
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady, "1");
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
+
+
+            // Issue a request to trigger specialization. The custom handler won't respond, but
+            // this forces the host through the full specialization + extension loading flow.
+            response = await client.GetAsync("api/warmup");
+
+            // Wait for the host to settle after specialization
+            await TestHelpers.Await(() =>
+                    {
+                        var log = _loggerProvider.GetLog();
+                        // Wait until we see evidence that the specialized host has started
+                        return log.Contains("Host started") || log.Contains("function is in error") || log.Contains("No job functions found");
+                    }, timeout: 30000);
+
+            var log = _loggerProvider.GetLog();
+
+            // Verify the specialized host found our custom handler functions.
+            Assert.Contains("3 functions found (Host)", log);
+
+            // The critical check: after IsScriptFileDetermined runs, functions must NOT be excluded.
+            // With the bug, we'd see "0 functions loaded" from the ScriptStartupTypeLocator call
+            // because IsScriptFileDetermined excludes custom handler functions (no scriptFile).
+            Assert.DoesNotContain("0 functions loaded", log);
+
+            // The binding types from function.json must NOT be missing from the extension bundle.
+            Assert.DoesNotContain("were not found in the configured extension bundle", log);
+        }
+
+        [Theory]
+        [InlineData("gzip", "gzip")]
+        [InlineData("br", "br")]
+        [InlineData("gzip, deflate, br", "br")]  // Compression defaults to Brotli compression when the client supports it.
+        [InlineData("", null)]
+        public async Task ResponseCompressionWorksAfterSpecialization(string acceptEncodingRequestHeaderValue, string expectedContentEncodingResponseHeaderValue)
+        {
+            var builder = InitializeDotNetIsolatedPlaceholderBuilder(_dotnetIsolated60Path, _loggerProvider, "HttpRequestDataFunction");
+
+            await using var stoppable = new StoppableHost(builder.Build());
+
+            var host = stoppable.Inner;
+
+            await host.StartAsync();
+
+            var client = host.GetTestClient();
+
+            client.DefaultRequestHeaders.Add("Accept-Encoding", acceptEncodingRequestHeaderValue);
+            var response = await client.GetAsync("api/warmup");
+            response.EnsureSuccessStatusCode();
+            response.Content.Headers.TryGetValues("Content-Encoding", out var value);
+            Assert.Null(value);
+
+            // Validate that the channel is set up with native worker
+            var webChannelManager = host.Services.GetService<IWebHostRpcWorkerChannelManager>();
+            var placeholderChannel = await webChannelManager.GetChannels("dotnet-isolated").Single().Value.Task;
+
+            // Ensure we are in placeholder mode
+            Assert.Contains("FunctionsNetHost.exe", placeholderChannel.WorkerProcess.Process.StartInfo.FileName);
+
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady, "1");
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebJobsFeatureFlags, ScriptConstants.FeatureFlagEnableResponseCompression);
+
+            response = await client.GetAsync("api/HttpRequestDataFunction");
+            response.EnsureSuccessStatusCode();
+            response.Content.Headers.TryGetValues("Content-Encoding", out value);
+            Assert.Equal(expectedContentEncodingResponseHeaderValue, value?.First());
+        }
+
+        [Fact]
+        public async Task Specialization_DotNetIsolatedApp_MissingAzureFunctionsDir_Logs()
+        {
+            Guid guid = Guid.NewGuid();
+            string path = "test-path" + guid.ToString();
+
+            if (!Directory.Exists(path))
+            {
+                Directory.CreateDirectory(path);
+            }
+
+            string json = "{\r\n  \"version\": \"2.0\",\r\n  \"isDefaultHostConfig\": false\r\n}";
+            File.WriteAllText(Path.Combine(path, "host.json"), json);
+
+            var builder = InitializeDotNetIsolatedPlaceholderBuilder(path, _loggerProvider);
+
+            await using var stoppable = new StoppableHost(builder.Build());
+
+            var host = stoppable.Inner;
+
+            await host.StartAsync();
+
+            var standbyManager = host.Services.GetService<IStandbyManager>();
+            Assert.NotNull(standbyManager);
+
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady, "1");
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.FunctionWorkerRuntime, "dotnet-isolated");
+            SystemEnvironment.Instance.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
+
+            await standbyManager.SpecializeHostAsync();
+
+            // Assert: Verify that the host has specialized
+            var scriptHostManager = host.Services.GetService<IScriptHostManager>();
+            Assert.NotNull(scriptHostManager);
+            Assert.Equal(ScriptHostState.Running, scriptHostManager.State);
+
+            await TestHelpers.Await(() =>
+            {
+                int completed = _loggerProvider.GetAllLogMessages().Count(p => p.FormattedMessage.Contains("Could not find the .azurefunctions folder in the deployed artifacts of a .NET isolated function app."));
+                return completed > 0;
+            });
+        }
+
+        [Fact]
+        public async Task Specialization_DynamicResolution_FallbackPath_Logs()
+        {
+            var loggerProvider = new TestLoggerProvider();
+            Guid guid = Guid.NewGuid();
+            string path = "test-path" + guid.ToString();
+
+            if (!Directory.Exists(path))
+            {
+                Directory.CreateDirectory(path);
+            }
+
+            string json = "{\r\n  \"version\": \"2.0\",\r\n  \"isDefaultHostConfig\": false\r\n}";
+            File.WriteAllText(Path.Combine(path, "host.json"), json);
+            string fallbackPath = Path.Combine(Directory.GetCurrentDirectory(), "workers");
+
+            var builder = InitializeDotNetIsolatedPlaceholderBuilder(path, loggerProvider);
+            builder.ConfigureServices(services =>
+            {
+                services.Configure<FunctionsHostingConfigOptions>(o => o.Features["WORKERS_AVAILABLE_FOR_DYNAMIC_RESOLUTION"] = "node");
+            });
+
+            await using var stoppable = new StoppableHost(builder.Build());
+
+            var host = stoppable.Inner;
+
+            await host.StartAsync();
+
+            var standbyManager = host.Services.GetService<IStandbyManager>();
+            Assert.NotNull(standbyManager);
+
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady, "1");
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.FunctionWorkerRuntime, "node");
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
+
+            var logs = loggerProvider.GetAllLogMessages().Select(p => p.FormattedMessage);
+
+            Assert.Contains("Placeholder mode is enabled: True", logs);
+
+            var nodeLog = logs.FirstOrDefault(p => p.Contains("Added WorkerConfig for language: node with worker path:") && p.Contains("workers\\node"));
+            Assert.True(nodeLog.Any());
+
+            var javaLog = logs.FirstOrDefault(p => p.Contains("Added WorkerConfig for language: java with worker path:") && p.Contains("workers\\java"));
+            Assert.True(javaLog.Any());
+
+            var probingLog = logs.FirstOrDefault(p => p.Contains("Worker probing paths set to:"));
+            Assert.True(probingLog.Any());
+
+            loggerProvider.ClearAllLogMessages();
+
+            await standbyManager.SpecializeHostAsync();
+
+            // Assert: Verify that the host has specialized
+            var scriptHostManager = host.Services.GetService<IScriptHostManager>();
+            Assert.NotNull(scriptHostManager);
+            Assert.Equal(ScriptHostState.Running, scriptHostManager.State);
+
+            var newLogs = loggerProvider.GetAllLogMessages().Select(p => p.FormattedMessage);
+
+            Assert.Contains("Completed language worker channel specialization", newLogs);
+
+            var newNodeLog = newLogs.FirstOrDefault(p => p.Contains("Added WorkerConfig for language: node with worker path:") && p.Contains("workers"));
+            Assert.True(newNodeLog.Any());
+
+            var newJavaLog = newLogs.FirstOrDefault(p => p.Contains("Added WorkerConfig for language: java with worker path:"));
+            Assert.Null(newJavaLog);
+
+            probingLog = logs.FirstOrDefault(p => p.Contains("Worker probing paths set to:"));
+            Assert.True(probingLog.Any());
+        }
+
+        [Fact]
+        public async Task Specialization_DynamicResolution_Logs()
+        {
+            var loggerProvider = new TestLoggerProvider();
+            Guid guid = Guid.NewGuid();
+            string path = "test-path" + guid.ToString();
+
+            if (!Directory.Exists(path))
+            {
+                Directory.CreateDirectory(path);
+            }
+
+            Guid guid2 = Guid.NewGuid();
+            string workerPath = "worker-path" + guid2.ToString();
+
+            if (!Directory.Exists(workerPath))
+            {
+                Directory.CreateDirectory(workerPath);
+            }
+
+            string subdir = Path.Combine(workerPath, "decoupledWorkers", "node", "1.0.0");
+
+            if (!Directory.Exists(subdir))
+            {
+                Directory.CreateDirectory(subdir);
+                string workerJson = @"{
+                            ""description"": {
+                                ""language"": ""node"",
+                                ""extensions"": ["".js"", "".mjs"", "".cjs""],
+                                ""defaultExecutablePath"": ""node"",
+                                ""defaultWorkerPath"": ""worker.config.json"",
+                                ""workerIndexing"": ""true""
+                            },
+                            ""hostRequirements"": []
+                        }";
+
+                File.WriteAllText(Path.Combine(subdir, "worker.config.json"), workerJson);
+            }
+
+            string json = "{\r\n  \"version\": \"2.0\",\r\n  \"isDefaultHostConfig\": false\r\n}";
+            File.WriteAllText(Path.Combine(path, "host.json"), json);
+
+            var builder = InitializeDotNetIsolatedPlaceholderBuilder(path, loggerProvider);
+            var inMemorySettings = new Dictionary<string, string>();
+            inMemorySettings["languageWorkers:probingPaths:0"] = Path.Combine(workerPath, "decoupledWorkers");
+
+            builder.ConfigureServices(services =>
+            {
+                services.Configure<FunctionsHostingConfigOptions>(o => o.Features["WORKERS_AVAILABLE_FOR_DYNAMIC_RESOLUTION"] = "node");
+            });
+
+            builder.ConfigureAppConfiguration(c =>
+            {
+                c.AddInMemoryCollection(inMemorySettings);
+            });
+
+            await using var stoppable = new StoppableHost(builder.Build());
+
+            var host = stoppable.Inner;
+
+            await host.StartAsync();
+
+            var standbyManager = host.Services.GetService<IStandbyManager>();
+            Assert.NotNull(standbyManager);
+
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady, "1");
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.FunctionWorkerRuntime, "node");
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
+
+            var logs = loggerProvider.GetAllLogMessages().Select(p => p.FormattedMessage);
+
+            Assert.Contains("Placeholder mode is enabled: True", logs);
+
+            var nodeLog = logs.FirstOrDefault(p => p.Contains("Added WorkerConfig for language: node with worker path:") && p.Contains("decoupledWorkers\\node"));
+            Assert.True(nodeLog.Length != 0);
+
+            var javaLog = logs.FirstOrDefault(p => p.Contains("Added WorkerConfig for language: java with worker path:") && p.Contains("workers\\java"));
+            Assert.True(javaLog.Length != 0);
+
+            var probingLog = logs.FirstOrDefault(p => p.Contains("Worker probing paths set to:"));
+            Assert.True(probingLog.Length != 0);
         }
 
         [Fact]
@@ -839,18 +1572,23 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         {
             // This test ensures that capabilities are correctly applied in EnvironmentReload during
             // specialization
-            var builder = InitializeDotNetIsolatedPlaceholderBuilder("HttpRequestFunction");
+            var builder = InitializeDotNetIsolatedPlaceholderBuilder(_dotnetIsolated60Path, _loggerProvider, "HttpRequestFunction");
 
-            using var testServer = new TestServer(builder);
+            await using var stoppable = new StoppableHost(builder.Build());
 
-            var client = testServer.CreateClient();
+            var host = stoppable.Inner;
+
+            await host.StartAsync();
+
+            var client = host.GetTestClient();
+
             client.Timeout = TimeSpan.FromSeconds(10);
 
             var response = await client.GetAsync("api/warmup");
             response.EnsureSuccessStatusCode();
 
             // Validate that the channel is set up with native worker
-            var webChannelManager = testServer.Services.GetService<IWebHostRpcWorkerChannelManager>();
+            var webChannelManager = host.Services.GetService<IWebHostRpcWorkerChannelManager>();
 
             var placeholderChannel = await webChannelManager.GetChannels("dotnet-isolated").Single().Value.Task;
             Assert.Contains("FunctionsNetHost.exe", placeholderChannel.WorkerProcess.Process.StartInfo.FileName);
@@ -888,10 +1626,28 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         public async Task DotNetIsolated_PlaceholderMiss_EnvVar()
         {
             // Placeholder miss if the WEBSITE_USE_PLACEHOLDER_DOTNETISOLATED env var is not set
-            await DotNetIsolatedPlaceholderMiss();
+            await DotNetIsolatedPlaceholderMiss(_dotnetIsolated60Path);
 
             var log = _loggerProvider.GetLog();
             Assert.Contains("UsePlaceholderDotNetIsolated: False", log);
+            Assert.Contains("Shutting down placeholder worker. Worker is not compatible for runtime: dotnet-isolated", log);
+        }
+
+        [Fact]
+        public async Task DotNetIsolated_PlaceholderMiss_Not64Bit()
+        {
+            _environment.SetProcessBitness(is64Bitness: false);
+
+            // We only specialize when host process is 64 bit process.
+            await DotNetIsolatedPlaceholderMiss(_dotnetIsolated60Path, () =>
+            {
+                _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteUsePlaceholderDotNetIsolated, "1");
+                _environment.SetEnvironmentVariable(RpcWorkerConstants.FunctionWorkerRuntimeVersionSettingName, "6.0");
+            });
+
+            var log = _loggerProvider.GetLog();
+            Assert.Contains("UsePlaceholderDotNetIsolated: True", log);
+            Assert.Contains("This app is configured as 32-bit and therefore does not leverage all performance optimizations. See https://aka.ms/azure-functions/dotnet/placeholders for more information.", log);
             Assert.Contains("Shutting down placeholder worker. Worker is not compatible for runtime: dotnet-isolated", log);
         }
 
@@ -900,7 +1656,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         {
             // Even with placeholders enabled via the WEBSITE_USE_PLACEHOLDER_DOTNETISOLATED env var,
             // if the dotnet version does not match, we should not use the placeholder
-            await DotNetIsolatedPlaceholderMiss(() =>
+            await DotNetIsolatedPlaceholderMiss(_dotnetIsolated60Path, () =>
             {
                 _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteUsePlaceholderDotNetIsolated, "1");
                 _environment.SetEnvironmentVariable(RpcWorkerConstants.FunctionWorkerRuntimeVersionSettingName, "7.0");
@@ -909,6 +1665,41 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             var log = _loggerProvider.GetLog();
             Assert.Contains("UsePlaceholderDotNetIsolated: True", log);
             Assert.Contains("Placeholder runtime version: '6.0'. Site runtime version: '7.0'. Match: False", log);
+            Assert.Contains("Shutting down placeholder worker. Worker is not compatible for runtime: dotnet-isolated", log);
+
+            AssertWorkerProcessStartupCount(2);
+
+            // because placeholder app has bundles in host.json, it refreshes twice in placeholder mode for dotnet-isolated
+            AssertLanguageWorkerOptionsSetupCount(3);
+        }
+
+        [Fact]
+        public async Task DotNetIsolated_PlaceholderMiss_UnsupportedWorkerPackage()
+        {
+            await DotNetIsolatedPlaceholderMiss(_dotnetIsolatedUnsuppportedPath, () =>
+            {
+                _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteUsePlaceholderDotNetIsolated, "1");
+                _environment.SetEnvironmentVariable(RpcWorkerConstants.FunctionWorkerRuntimeVersionSettingName, "6.0");
+            });
+
+            var log = _loggerProvider.GetLog();
+            Assert.Contains("UsePlaceholderDotNetIsolated: True", log);
+            Assert.Contains("Placeholder runtime version: '6.0'. Site runtime version: '6.0'. Match: True", log);
+            Assert.Contains("Shutting down placeholder worker. Worker is not compatible for runtime: dotnet-isolated", log);
+        }
+
+        [Fact]
+        public async Task DotNetIsolated_PlaceholderMiss_EmptyScriptRoot()
+        {
+            await DotNetIsolatedPlaceholderMiss(_dotnetIsolatedEmptyScriptRoot, () =>
+            {
+                _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteUsePlaceholderDotNetIsolated, "1");
+                _environment.SetEnvironmentVariable(RpcWorkerConstants.FunctionWorkerRuntimeVersionSettingName, "6.0");
+            });
+
+            var log = _loggerProvider.GetLog();
+            Assert.Contains("UsePlaceholderDotNetIsolated: True", log);
+            Assert.Contains("Placeholder runtime version: '6.0'. Site runtime version: '6.0'. Match: True", log);
             Assert.Contains("Shutting down placeholder worker. Worker is not compatible for runtime: dotnet-isolated", log);
         }
 
@@ -919,17 +1710,23 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             // this app has a QueueTrigger reading from "myqueue-items"
             // add a few messages there before stopping the host
             var storageValue = TestHelpers.GetTestConfiguration().GetWebJobsConnectionString("AzureWebJobsStorage");
-            CloudStorageAccount storageAccount = CloudStorageAccount.Parse(storageValue);
-            CloudQueueClient queueClient = storageAccount.CreateCloudQueueClient();
-            CloudQueue queue = queueClient.GetQueueReference("myqueue-items");
+            var queueServiceClient = new QueueServiceClient(storageValue, new QueueClientOptions
+            {
+                MessageEncoding = QueueMessageEncoding.Base64
+            });
+            var queue = queueServiceClient.GetQueueClient("myqueue-items");
             await queue.CreateIfNotExistsAsync();
-            await queue.ClearAsync();
+            await queue.ClearMessagesAsync();
 
-            var builder = InitializeDotNetIsolatedPlaceholderBuilder("HttpRequestDataFunction", "QueueFunction");
+            var builder = InitializeDotNetIsolatedPlaceholderBuilder(_dotnetIsolated60Path, _loggerProvider, "HttpRequestDataFunction", "QueueFunction");
 
-            using var testServer = new TestServer(builder);
+            await using var stoppable = new StoppableHost(builder.Build());
 
-            var client = testServer.CreateClient();
+            var host = stoppable.Inner;
+
+            await host.StartAsync();
+
+            var client = host.GetTestClient();
             var response = await client.GetAsync("api/warmup");
             response.EnsureSuccessStatusCode();
 
@@ -940,7 +1737,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             response = await client.GetAsync("api/HttpRequestDataFunction");
             response.EnsureSuccessStatusCode();
 
-            var scriptHostManager = testServer.Services.GetService<IScriptHostManager>();
+            var scriptHostManager = host.Services.GetService<IScriptHostManager>();
 
             scriptHostManager.ActiveHostChanged += (object sender, ActiveHostChangedEventArgs e) =>
             {
@@ -962,7 +1759,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             {
                 while (keepRunning)
                 {
-                    await queue.AddMessageAsync(new CloudQueueMessage("test"));
+                    await queue.SendMessageAsync("test");
                 }
             });
 
@@ -973,11 +1770,10 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 return completed > 10;
             });
 
-            await testServer.Host.StopAsync();
 
             keepRunning = false;
             await messageTask;
-            await queue.ClearAsync();
+            await queue.ClearMessagesAsync();
 
             var completedLogs = _loggerProvider.GetAllLogMessages()
                 .Where(p => p.Category == "Function.QueueFunction")
@@ -987,21 +1783,149 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             Assert.Empty(completedLogs.Where(p => p.Level == LogLevel.Error));
         }
 
-        private async Task DotNetIsolatedPlaceholderMiss(Action additionalSpecializedSetup = null)
+        [Fact]
+        public async Task Specialization_PowerShellPlaceholder_SpecializesToDotNetIsolated()
         {
-            var builder = InitializeDotNetIsolatedPlaceholderBuilder("HttpRequestDataFunction");
+            // Start with PowerShell as the placeholder runtime
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.FunctionWorkerRuntime, RpcWorkerConstants.PowerShellLanguageWorkerName);
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebJobsFeatureFlags, ScriptConstants.FeatureFlagEnableWorkerIndexing);
+
+            var builder = CreateStandbyHostBuilder(_loggerProvider, "HttpRequestDataFunction");
+
+            builder.ConfigureAppConfiguration(c =>
+            {
+                c.AddInMemoryCollection(new Dictionary<string, string>
+                {
+                    { _scriptRootConfigPath, _dotnetIsolated60Path }
+                });
+            });
+
+            await using var stoppable = new StoppableHost(builder.Build());
+
+            var host = stoppable.Inner;
+
+            await host.StartAsync();
+
+            var client = host.GetTestClient();
+            var response = await client.GetAsync("api/warmup");
+            response.EnsureSuccessStatusCode();
+
+            // Verify PowerShell placeholder channel was created
+            var webChannelManager = host.Services.GetService<IWebHostRpcWorkerChannelManager>();
+            var powershellChannels = webChannelManager.GetChannels(RpcWorkerConstants.PowerShellLanguageWorkerName);
+            Assert.NotNull(powershellChannels);
+            Assert.Single(powershellChannels);
+
+            // Specialize: switch runtime from powershell to dotnet-isolated
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.FunctionWorkerRuntime, RpcWorkerConstants.DotNetIsolatedLanguageWorkerName);
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteUsePlaceholderDotNetIsolated, "1");
+            _environment.SetEnvironmentVariable(RpcWorkerConstants.FunctionWorkerRuntimeVersionSettingName, "6.0");
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady, "1");
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
+
+            response = await client.GetAsync("api/HttpRequestDataFunction");
+            response.EnsureSuccessStatusCode();
+
+            // Wait for the PowerShell standby channel to be disposed (cleanup is debounced ~5s)
+            await TestHelpers.Await(() =>
+            {
+                var channels = webChannelManager.GetChannels(RpcWorkerConstants.PowerShellLanguageWorkerName);
+                return channels is null || channels.Count == 0;
+            }, timeout: 15000);
+
+            // Verify dotnet-isolated channel was created and survives the standby cleanup.
+            // ScheduleShutdownStandbyChannels disposes channels that don't match _workerRuntime.
+            var dotnetChannels = webChannelManager.GetChannels(RpcWorkerConstants.DotNetIsolatedLanguageWorkerName);
+            Assert.NotNull(dotnetChannels);
+            Assert.Single(dotnetChannels);
+            var specializedChannel = await dotnetChannels.Single().Value.Task;
+            Assert.NotNull(specializedChannel);
+
+            // Wait for the host to finish disposing standby channels for non-matching runtimes
+            await Task.Delay(TimeSpan.FromSeconds(6));
+            dotnetChannels = webChannelManager.GetChannels(RpcWorkerConstants.DotNetIsolatedLanguageWorkerName);
+            Assert.NotNull(dotnetChannels);
+            Assert.Single(dotnetChannels);
+
+            var log = _loggerProvider.GetLog();
+            Assert.Contains("Disposing standby channel for runtime:powershell", log);
+            Assert.DoesNotContain("Disposing standby channel for runtime:dotnet-isolated", log);
+        }
+
+        [Fact]
+        public async Task Specialization_Writes_WorkerStartupLogs()
+        {
+            // Create a test logger per-host so we can ensure logs go to the correct one when specializing
+            var perScriptHostLoggers = new List<(bool IsPlaceholderMode, TestLoggerProvider Logger)>();
+            _customizeScriptHostServices = s =>
+            {
+                var isPlaceholderMode = _environment.GetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode);
+                var testLoggerProvider = new TestLoggerProvider();
+                perScriptHostLoggers.Add(new(isPlaceholderMode == "1", testLoggerProvider));
+
+                s.AddSingleton<ILoggerProvider>(testLoggerProvider);
+            };
+
+            var builder = InitializeDotNetIsolatedPlaceholderBuilder(_dotnetIsolated60Path, _loggerProvider, "HttpRequestDataFunction", "QueueFunction");
+            var storageValue = TestHelpers.GetTestConfiguration().GetWebJobsConnectionString("AzureWebJobsStorage");
+
+            await using var stoppable = new StoppableHost(builder.Build());
+
+            var host = stoppable.Inner;
+
+            await host.StartAsync();
+
+            var client = host.GetTestClient();
+            var response = await client.GetAsync("api/warmup");
+            response.EnsureSuccessStatusCode();
+
+            var webChannelManager = host.Services.GetService<IWebHostRpcWorkerChannelManager>();
+            var placeholderChannel = await webChannelManager.GetChannels("dotnet-isolated").Single().Value.Task;
+            var process = placeholderChannel.WorkerProcess as WorkerProcess;
+            process.BuildAndLogConsoleLog("Fake console out from placeholder", LogLevel.Information);
+
+            _environment.SetEnvironmentVariable("AzureWebJobsStorage", storageValue);
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady, "1");
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
+
+            response = await client.GetAsync("api/HttpRequestDataFunction");
+            response.EnsureSuccessStatusCode();
+
+            var placeholderLogger = perScriptHostLoggers.Single(p => p.IsPlaceholderMode).Logger;
+            var userLogger = perScriptHostLoggers.Single(p => !p.IsPlaceholderMode).Logger;
+
+            string logs = placeholderLogger.GetLog();
+
+            Assert.Null(placeholderLogger.GetAllLogMessages().SingleOrDefault(p => p.Category == "Host.Function.Console"));
+            var placeholderMessages = placeholderLogger.GetAllLogMessages().Select(p => p.FormattedMessage);
+            Assert.DoesNotContain("Console Out from worker on startup.", placeholderMessages);
+            Assert.DoesNotContain("Fake console out from placeholder", placeholderMessages); // placeholder 'user' console logs should never be logged
+
+            Assert.Single(userLogger.GetAllLogMessages().Select(p => p.Category), "Host.Function.Console");
+            var userMessages = userLogger.GetAllLogMessages().Select(p => p.FormattedMessage);
+            Assert.Contains("Console Out from worker on startup.", userMessages);
+            Assert.DoesNotContain("Fake console out from placeholder", userMessages); // this log should be 'lost' and never written
+        }
+
+        private async Task DotNetIsolatedPlaceholderMiss(string scriptRootPath, Action additionalSpecializedSetup = null)
+        {
+            var builder = InitializeDotNetIsolatedPlaceholderBuilder(scriptRootPath, _loggerProvider, "HttpRequestDataFunction");
 
             // remove WEBSITE_USE_PLACEHOLDER_DOTNETISOLATED
             _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteUsePlaceholderDotNetIsolated, null);
 
-            using var testServer = new TestServer(builder);
+            await using var stoppable = new StoppableHost(builder.Build());
 
-            var client = testServer.CreateClient();
+            var host = stoppable.Inner;
+
+            await host.StartAsync();
+
+            var client = host.GetTestClient();
             var response = await client.GetAsync("api/warmup");
             response.EnsureSuccessStatusCode();
 
             // Validate that the channel is set up with native worker
-            var webChannelManager = testServer.Services.GetService<IWebHostRpcWorkerChannelManager>();
+            var webChannelManager = host.Services.GetService<IWebHostRpcWorkerChannelManager>();
 
             var placeholderChannel = await webChannelManager.GetChannels("dotnet-isolated").Single().Value.Task;
             Assert.Contains("FunctionsNetHost.exe", placeholderChannel.WorkerProcess.Process.StartInfo.FileName);
@@ -1015,69 +1939,102 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             additionalSpecializedSetup?.Invoke();
 
             response = await client.GetAsync("api/HttpRequestDataFunction");
-            response.EnsureSuccessStatusCode();
+            if (scriptRootPath == _dotnetIsolatedEmptyScriptRoot)
+            {
+                Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+            }
+            else
+            {
+                response.EnsureSuccessStatusCode();
 
-            // Placeholder miss; new channel should be started using the deployed worker directly
-            var specializedChannel = await webChannelManager.GetChannels("dotnet-isolated").Single().Value.Task;
-            Assert.Contains("dotnet.exe", specializedChannel.WorkerProcess.Process.StartInfo.FileName);
-            Assert.Contains("DotNetIsolated60", specializedChannel.WorkerProcess.Process.StartInfo.Arguments);
-            runningProcess = Process.GetProcessById(specializedChannel.WorkerProcess.Id);
-            Assert.Contains(runningProcess.ProcessName, "dotnet");
+                var expectedProcessName = scriptRootPath == _dotnetIsolated60Path ? "DotNetIsolated60" : "DotNetIsolatedUnsupported";
+                // Placeholder miss; new channel should be started using the deployed worker directly
+                var specializedChannel = await webChannelManager.GetChannels("dotnet-isolated").Single().Value.Task;
+                Assert.Contains("dotnet.exe", specializedChannel.WorkerProcess.Process.StartInfo.FileName);
+                Assert.Contains(expectedProcessName, specializedChannel.WorkerProcess.Process.StartInfo.Arguments);
+                runningProcess = Process.GetProcessById(specializedChannel.WorkerProcess.Id);
+                Assert.Contains(runningProcess.ProcessName, "dotnet");
 
-            // Ensure other process is gone.
-            Assert.DoesNotContain(Process.GetProcesses(), p => p.ProcessName.Contains("FunctionsNetHost"));
-            Assert.Throws<InvalidOperationException>(() => placeholderChannel.WorkerProcess.Process.Id);
+                // Ensure other process is gone.
+                Assert.DoesNotContain(Process.GetProcesses(), p => p.ProcessName.Contains("FunctionsNetHost"));
+                Assert.Throws<InvalidOperationException>(() => placeholderChannel.WorkerProcess.Process.Id);
+            }
         }
 
-        private static void BuildDotnetIsolated60()
+        private IHostBuilder InitializeDotNetIsolatedPlaceholderBuilder(string scriptRootPath, TestLoggerProvider testLoggerProvider, params string[] functions)
         {
-            var p = Process.Start("dotnet", $"build {_dotnetIsolated60Path}/../../..");
-            p.WaitForExit();
+            return InitializeDotNetIsolatedPlaceholderBuilder(scriptRootPath, testLoggerProvider, null, functions);
         }
 
-        private IWebHostBuilder InitializeDotNetIsolatedPlaceholderBuilder(params string[] functions)
+        private IHostBuilder InitializeDotNetIsolatedPlaceholderBuilder(string scriptRootPath, TestLoggerProvider testLoggerProvider, Dictionary<string, string> environmentVariables, params string[] functions)
         {
-            BuildDotnetIsolated60();
-
-            _environment.SetEnvironmentVariable(RpcWorkerConstants.FunctionWorkerRuntimeSettingName, "dotnet-isolated");
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.FunctionWorkerRuntime, "dotnet-isolated");
             _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteUsePlaceholderDotNetIsolated, "1");
             _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebJobsFeatureFlags, ScriptConstants.FeatureFlagEnableWorkerIndexing);
             _environment.SetEnvironmentVariable(RpcWorkerConstants.FunctionWorkerRuntimeVersionSettingName, "6.0");
 
-            var builder = CreateStandbyHostBuilder(functions);
+            if (environmentVariables is not null)
+            {
+                foreach (var (key, value) in environmentVariables)
+                {
+                    _environment.SetEnvironmentVariable(key, value);
+                }
+            }
+
+            var builder = CreateStandbyHostBuilder(testLoggerProvider, functions);
 
             builder.ConfigureAppConfiguration(config =>
             {
                 config.AddInMemoryCollection(new Dictionary<string, string>
                 {
-                    { _scriptRootConfigPath, _dotnetIsolated60Path },
+                    { _scriptRootConfigPath, scriptRootPath },
                 });
             });
 
             return builder;
         }
 
-        private IWebHostBuilder CreateStandbyHostBuilder(params string[] functions)
+        private IHostBuilder CreateStandbyHostBuilder(TestLoggerProvider loggerProvider, params string[] functions)
         {
-            var builder = Program.CreateWebHostBuilder()
-                .ConfigureLogging(b =>
+            loggerProvider ??= _loggerProvider;
+            var builder = Program.CreateHostBuilder()
+                .ConfigureWebHost(webHostBuilder =>
                 {
-                    b.AddProvider(_loggerProvider);
-                    b.AddFilter<TestLoggerProvider>("Microsoft.Azure.WebJobs", LogLevel.Debug);
-                    b.AddFilter<TestLoggerProvider>("Worker", LogLevel.Debug);
+                    webHostBuilder.UseTestServer();
                 })
                 .ConfigureAppConfiguration(c =>
                 {
-                    c.AddInMemoryCollection(new Dictionary<string, string>
+                    var inMemorySettings = new Dictionary<string, string>
                     {
-                        { _scriptRootConfigPath, _specializedScriptRoot }
-                    });
+                        { _scriptRootConfigPath, _specializedScriptRoot },
+                        { _logPathConfigPath, _testLogPath }
+                    };
+
+                    string workerRuntime = _environment.GetEnvironmentVariable(EnvironmentSettingNames.FunctionWorkerRuntime);
+                    if (workerRuntime is not null)
+                    {
+                        inMemorySettings[EnvironmentSettingNames.FunctionWorkerRuntime] = workerRuntime;
+                    }
+
+                    c.AddInMemoryCollection(inMemorySettings);
+
+                    // Bridge TestEnvironment into IConfiguration so that _configuration.Reload()
+                    // picks up env var changes made during specialization — matching production
+                    // where ScriptEnvironmentVariablesConfigurationSource reads real process env vars.
+                    c.Add(new TestEnvironmentConfigurationSource(_environment));
+                })
+                .ConfigureLogging(b =>
+                {
+                    b.AddProvider(loggerProvider);
+                    b.AddFilter<TestLoggerProvider>("Microsoft.Azure.WebJobs", LogLevel.Debug);
+                    b.AddFilter<TestLoggerProvider>("Worker", LogLevel.Debug);
+                    b.AddFilter<TestLoggerProvider>("Host.LanguageWorkerConfig", LogLevel.Trace);
                 })
                 .ConfigureServices((bc, s) =>
                 {
                     s.AddSingleton<IEnvironment>(_environment);
 
-                    // Ensure that we don't have a race between the timer and the 
+                    // Ensure that we don't have a race between the timer and the
                     // request for triggering specialization.
                     s.AddSingleton<IStandbyManager, InfiniteTimerStandbyManager>();
 
@@ -1087,7 +2044,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 {
                     s.AddLogging(logging =>
                     {
-                        logging.AddProvider(_loggerProvider);
+                        logging.AddProvider(_scriptHostLoggerProvider ?? loggerProvider);
                     });
 
                     s.PostConfigure<ScriptJobHostOptions>(o =>
@@ -1098,18 +2055,58 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                             o.Functions = functions;
                         }
                     });
+
+                    _customizeScriptHostServices?.Invoke(s);
                 });
 
             return builder;
         }
 
+        private void AssertLanguageWorkerOptionsSetupCount(int expected)
+        {
+            // Verify LanguageWorkerOptions setup count
+            var workerConfigLogs = _loggerProvider.GetAllLogMessages()
+                .Where(p => p.FormattedMessage is not null && p.FormattedMessage.Contains("Workers Directory set to:"))
+                .ToArray();
+            Assert.Equal(expected, workerConfigLogs.Length);
+        }
+
+        private void AssertWorkerProcessStartupCount(int expected)
+        {
+            var workerStartLogs = _loggerProvider.GetAllLogMessages()
+                .Where(p => p.FormattedMessage is not null && p.FormattedMessage.Contains("Starting worker process with FileName:"))
+                .ToArray();
+            Assert.Equal(expected, workerStartLogs.Length);
+        }
+
+        private class CapturingHttpMessageHandler : HttpMessageHandler
+        {
+            private readonly System.Collections.Concurrent.ConcurrentBag<string> _bodies;
+
+            public CapturingHttpMessageHandler(System.Collections.Concurrent.ConcurrentBag<string> bodies)
+            {
+                _bodies = bodies;
+            }
+
+            protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+            {
+                if (request.Content != null)
+                {
+                    _bodies.Add(await request.Content.ReadAsStringAsync());
+                }
+
+                return new HttpResponseMessage(HttpStatusCode.OK);
+            }
+        }
+
         private class InfiniteTimerStandbyManager : StandbyManager
         {
-            public InfiniteTimerStandbyManager(IScriptHostManager scriptHostManager, IWebHostRpcWorkerChannelManager rpcWorkerChannelManager,
+            public InfiniteTimerStandbyManager(IScriptHostManager scriptHostManager, IWebHostWorkerManager rpcWorkerChannelManager,
                 IConfiguration configuration, IScriptWebHostEnvironment webHostEnvironment, IEnvironment environment,
-                IOptionsMonitor<ScriptApplicationHostOptions> options, ILogger<StandbyManager> logger, HostNameProvider hostNameProvider, IApplicationLifetime applicationLifetime)
+                IOptionsMonitor<ScriptApplicationHostOptions> options, IOptionsMonitor<StandbyOptions> standbyOptions,
+                ILogger<StandbyManager> logger, HostNameProvider hostNameProvider, IHostApplicationLifetime applicationLifetime)
                 : base(scriptHostManager, rpcWorkerChannelManager, configuration, webHostEnvironment, environment, options,
-                      logger, hostNameProvider, applicationLifetime, TimeSpan.FromMilliseconds(-1), new TestMetricsLogger())
+                      standbyOptions, logger, hostNameProvider, applicationLifetime, TimeSpan.FromMilliseconds(-1), new TestMetricsLogger())
             {
             }
         }
@@ -1119,9 +2116,9 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             private readonly DefaultScriptHostBuilder _inner;
             private readonly IOptionsMonitor<ScriptApplicationHostOptions> _options;
 
-            public PausingScriptHostBuilder(IOptionsMonitor<ScriptApplicationHostOptions> options, IServiceProvider root, IServiceScopeFactory scope)
+            public PausingScriptHostBuilder(IOptionsMonitor<ScriptApplicationHostOptions> options, IServiceProvider rootServiceProvider, IServiceCollection rootServices)
             {
-                _inner = new DefaultScriptHostBuilder(options, root, scope);
+                _inner = new DefaultScriptHostBuilder(options, rootServices, rootServiceProvider);
                 _options = options;
             }
 
@@ -1162,6 +2159,77 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             public Task<HttpResponseMessage> ConvertAsync(HttpRequestMessage input, CancellationToken cancellationToken)
             {
                 throw new NotImplementedException();
+            }
+        }
+
+        /// <summary>
+        /// Wraps an <see cref="IHost"/> to ensure <see cref="IHost.StopAsync"/> is called
+        /// before disposal, guaranteeing <see cref="FileMonitoringService.StopAsync"/> runs
+        /// and file watchers are unsubscribed even if a test assertion fails.
+        /// </summary>
+        private sealed class StoppableHost : IAsyncDisposable
+        {
+            public IHost Inner { get; }
+
+            public StoppableHost(IHost host) => Inner = host;
+
+            public IServiceProvider Services => Inner.Services;
+
+            public async ValueTask DisposeAsync()
+            {
+                try
+                {
+                    await Inner.StopAsync();
+                }
+                catch
+                {
+                }
+
+                Inner.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// An <see cref="IConfigurationSource"/> that reads from a <see cref="IEnvironment"/> instance.
+        /// When <see cref="IConfigurationRoot.Reload"/> is called, the provider re-reads the current
+        /// values from the environment, allowing tests to simulate environment variable changes
+        /// that flow through to <see cref="IConfiguration"/>.
+        /// </summary>
+        private sealed class TestEnvironmentConfigurationSource : IConfigurationSource
+        {
+            private readonly IEnvironment _environment;
+
+            public TestEnvironmentConfigurationSource(IEnvironment environment)
+            {
+                _environment = environment;
+            }
+
+            public IConfigurationProvider Build(IConfigurationBuilder builder)
+            {
+                return new Provider(_environment);
+            }
+
+            private sealed class Provider : ConfigurationProvider
+            {
+                private readonly IEnvironment _environment;
+
+                public Provider(IEnvironment environment)
+                {
+                    _environment = environment;
+                }
+
+                public override void Load()
+                {
+                    var runtime = _environment.GetEnvironmentVariable(EnvironmentSettingNames.FunctionWorkerRuntime);
+                    if (runtime is not null)
+                    {
+                        Data[EnvironmentSettingNames.FunctionWorkerRuntime] = runtime;
+                    }
+                    else
+                    {
+                        Data.Remove(EnvironmentSettingNames.FunctionWorkerRuntime);
+                    }
+                }
             }
         }
     }

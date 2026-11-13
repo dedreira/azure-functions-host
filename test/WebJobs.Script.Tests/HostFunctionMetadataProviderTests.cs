@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
@@ -9,8 +9,11 @@ using System.IO.Abstractions.TestingHelpers;
 using System.Linq;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
+using Microsoft.Azure.WebJobs.Script.Workers;
 using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.WebJobs.Script.Tests;
 using Moq;
 using Newtonsoft.Json.Linq;
 using Xunit;
@@ -31,36 +34,49 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         [Fact]
         public void ReadFunctionMetadata_Succeeds()
         {
-            string functionsPath = Path.Combine(Environment.CurrentDirectory, @"..", "..", "..", "..", "..", "sample", "node");
+            var workerRuntimeMock = new Mock<IWorkerRuntimeResolver>();
+            var testLoggerProvider = new TestLoggerProvider();
+            var loggerFactory = new LoggerFactory();
+            loggerFactory.AddProvider(testLoggerProvider);
+            var logger = loggerFactory.CreateLogger<HostFunctionMetadataProvider>();
+            string functionsPath = Path.Combine(Environment.CurrentDirectory, @"..", "..", "..", "..", "sample", "node");
             _scriptApplicationHostOptions.ScriptPath = functionsPath;
             var optionsMonitor = TestHelpers.CreateOptionsMonitor(_scriptApplicationHostOptions);
-            var metadataProvider = new HostFunctionMetadataProvider(optionsMonitor, NullLogger<HostFunctionMetadataProvider>.Instance, _testMetricsLogger, SystemEnvironment.Instance);
+            var metadataProvider = new HostFunctionMetadataProvider(optionsMonitor, logger, _testMetricsLogger, workerRuntimeMock.Object);
             var workerConfigs = TestHelpers.GetTestWorkerConfigs();
 
-            Assert.Equal(18, metadataProvider.GetFunctionMetadataAsync(workerConfigs, SystemEnvironment.Instance, false).Result.Length);
+            Assert.Equal(18, metadataProvider.GetFunctionMetadataAsync(workerConfigs, false).Result.Length);
+            var traces = testLoggerProvider.GetAllLogMessages();
             Assert.True(AreRequiredMetricsEmitted(_testMetricsLogger));
+
+            // Assert that the logs contain the expected messages
+            Assert.Equal(2, traces.Count);
+            Assert.Equal("Reading functions metadata (Host)", traces[0].FormattedMessage);
+            Assert.Equal("18 functions found (Host)", traces[1].FormattedMessage);
         }
 
         [Fact]
         public void ReadFunctionMetadata_For_WorkerIndexingFormatApp_Fails()
         {
-            string functionsPath = Path.Combine(Environment.CurrentDirectory, @"..", "..", "..", "..", "..", "sample", "PythonWorkerIndexing");
+            var workerRuntimeMock = new Mock<IWorkerRuntimeResolver>();
+            string functionsPath = Path.Combine(Environment.CurrentDirectory, @"..", "..", "..", "..", "sample", "PythonWorkerIndexing");
             _scriptApplicationHostOptions.ScriptPath = functionsPath;
             var optionsMonitor = TestHelpers.CreateOptionsMonitor(_scriptApplicationHostOptions);
-            var metadataProvider = new HostFunctionMetadataProvider(optionsMonitor, NullLogger<HostFunctionMetadataProvider>.Instance, _testMetricsLogger, SystemEnvironment.Instance);
+            var metadataProvider = new HostFunctionMetadataProvider(optionsMonitor, NullLogger<HostFunctionMetadataProvider>.Instance, _testMetricsLogger, workerRuntimeMock.Object);
             var workerConfigs = TestHelpers.GetTestWorkerConfigs();
-            Assert.Equal(0, metadataProvider.GetFunctionMetadataAsync(workerConfigs, SystemEnvironment.Instance, false).Result.Length);
+            Assert.Equal(0, metadataProvider.GetFunctionMetadataAsync(workerConfigs, false).Result.Length);
         }
 
         [Fact]
         public void ReadFunctionMetadata_With_Retry_Succeeds()
         {
-            string functionsPath = Path.Combine(Environment.CurrentDirectory, @"..", "..", "..", "..", "..", "sample", "noderetry");
+            var workerRuntimeMock = new Mock<IWorkerRuntimeResolver>();
+            string functionsPath = Path.Combine(Environment.CurrentDirectory, @"..", "..", "..", "..", "sample", "noderetry");
             _scriptApplicationHostOptions.ScriptPath = functionsPath;
             var optionsMonitor = TestHelpers.CreateOptionsMonitor(_scriptApplicationHostOptions);
-            var metadataProvider = new HostFunctionMetadataProvider(optionsMonitor, NullLogger<HostFunctionMetadataProvider>.Instance, _testMetricsLogger, SystemEnvironment.Instance);
+            var metadataProvider = new HostFunctionMetadataProvider(optionsMonitor, NullLogger<HostFunctionMetadataProvider>.Instance, _testMetricsLogger, workerRuntimeMock.Object);
             var workerConfigs = TestHelpers.GetTestWorkerConfigs();
-            var functionMetadatas = metadataProvider.GetFunctionMetadataAsync(workerConfigs, SystemEnvironment.Instance, false).Result;
+            var functionMetadatas = metadataProvider.GetFunctionMetadataAsync(workerConfigs, false).Result;
 
             Assert.Equal(2, functionMetadatas.Length);
 
@@ -337,6 +353,60 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             var metadata = HostFunctionMetadataProvider.ParseFunctionMetadata("Function1", json, scriptRoot, fileSystemMock.Object, workerConfigs, functionsWorkerRuntime);
             Assert.Equal(expectedLanguage, metadata.Language);
+        }
+
+        [Fact]
+        public void ParseFunctionMetadata_MasksSensitiveDataInBindings()
+        {
+            const string functionJson = @"{
+                                  ""scriptFile"": ""app.dll"",
+                                  ""bindings"": [
+                                    {
+                                      ""name"": ""myQueueItem"",
+                                      ""type"": ""queueTrigger"",
+                                      ""direction"": ""in"",
+                                      ""queueName"": ""test-input-node"",
+                                      ""connection"": ""DefaultEndpointsProtocol=https;AccountName=a;AccountKey=b/c==;EndpointSuffix=core.windows.net""
+                                    },
+                                    {
+                                      ""name"": ""$return"",
+                                      ""type"": ""queue"",
+                                      ""direction"": ""out"",
+                                      ""queueName"": ""test-output-node"",
+                                      ""connection"": ""MyConnection""
+                                    }
+                                  ]
+                                }";
+
+            var json = JObject.Parse(functionJson);
+            var scriptRoot = Path.Combine(Path.GetTempPath(), Path.GetTempFileName());
+
+            var fullFileSystem = new FileSystem();
+            var fileSystemMock = new Mock<IFileSystem>();
+            var fileBaseMock = new Mock<FileBase>();
+            fileSystemMock.Setup(f => f.Path).Returns(fullFileSystem.Path);
+            fileSystemMock.Setup(f => f.File).Returns(fileBaseMock.Object);
+            fileBaseMock.Setup(f => f.Exists(It.IsAny<string>())).Returns(true);
+
+            IList<RpcWorkerConfig> workerConfigs = [];
+
+            var metadata = HostFunctionMetadataProvider.ParseFunctionMetadata("Function1", json, scriptRoot, fileSystemMock.Object, workerConfigs, "custom");
+
+            Assert.NotNull(metadata);
+            Assert.NotNull(metadata.Bindings);
+            Assert.Equal(2, metadata.Bindings.Count);
+
+            // The first binding should have its connection string replaced with "[Hidden Credential]"
+            var bindingMetadata1 = metadata.Bindings[0];
+            Assert.Equal("[Hidden Credential]", bindingMetadata1.Connection);
+            Assert.Equal("[Hidden Credential]", bindingMetadata1.Raw["connection"]!.ToString());
+            Assert.DoesNotContain("AccountKey", bindingMetadata1.Raw.ToString());
+
+            // The second binding should remain unchanged (named connection)
+            var outputBinding = metadata.Bindings[1];
+            Assert.Equal("MyConnection", outputBinding.Connection);
+            Assert.Contains("MyConnection", outputBinding.Raw.ToString());
+            Assert.DoesNotContain("[Hidden Credential]", outputBinding.Raw["connection"]!.ToString());
         }
     }
 }

@@ -62,7 +62,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             fileBase.Setup(f => f.ReadAllText(Path.Combine(rootScriptPath, "DNE", ScriptConstants.FunctionMetadataFileName))).Throws(new DirectoryNotFoundException());
 
             _functionsSyncManagerMock = new Mock<IFunctionsSyncManager>(MockBehavior.Strict);
-            _functionsSyncManagerMock.Setup(p => p.TrySyncTriggersAsync(false)).ReturnsAsync(new SyncTriggersResult { Success = true });
+            _functionsSyncManagerMock.Setup(p => p.TrySyncTriggersAsync(false)).ReturnsAsync(new TriggersOperationResult { Success = true });
 
             var hostManagerMock = new Mock<IScriptHostManager>(MockBehavior.Strict);
             hostManagerMock.SetupGet(p => p.State).Returns(ScriptHostState.Running);
@@ -81,21 +81,21 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             {
                 { "key1", "secret1" }
             };
-            _secretsManagerMock.Setup(p => p.GetFunctionSecretsAsync("TestFunction1", false)).ReturnsAsync(keys);
+            _secretsManagerMock.Setup(p => p.GetFunctionSecretsAsync("TestFunction1")).ReturnsAsync(keys);
 
             keys = new Dictionary<string, string>
             {
                 { "key1", "secret1" }
             };
-            _secretsManagerMock.Setup(p => p.GetFunctionSecretsAsync("TestFunction2", false)).ReturnsAsync(keys);
+            _secretsManagerMock.Setup(p => p.GetFunctionSecretsAsync("TestFunction2")).ReturnsAsync(keys);
 
             keys = new Dictionary<string, string>
             {
                 { "key1", "secret1" }
             };
-            _secretsManagerMock.Setup(p => p.GetFunctionSecretsAsync("FunctionWithoutFile", false)).ReturnsAsync(keys);
+            _secretsManagerMock.Setup(p => p.GetFunctionSecretsAsync("FunctionWithoutFile")).ReturnsAsync(keys);
 
-            _secretsManagerMock.Setup(p => p.GetFunctionSecretsAsync("DNE", false)).ReturnsAsync((IDictionary<string, string>)null);
+            _secretsManagerMock.Setup(p => p.GetFunctionSecretsAsync("DNE")).ReturnsAsync((IDictionary<string, string>)null);
 
             SetHttpContext();
         }
@@ -204,6 +204,61 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             _secretsManagerMock.Setup(p => p.DeleteSecretAsync("dne", "TestFunction1", ScriptSecretsType.Function)).ReturnsAsync(false);
 
             var result = (StatusCodeResult)(await _testController.Delete("TestFunction1", "dne"));
+            Assert.Equal(StatusCodes.Status404NotFound, result.StatusCode);
+
+            _functionsSyncManagerMock.Verify(p => p.TrySyncTriggersAsync(false), Times.Never);
+        }
+
+        [Theory]
+        [InlineData("../etc/passwd")]
+        [InlineData("..\\windows\\system32")]
+        [InlineData("func/../../secret")]
+        [InlineData("host")]
+        [InlineData("")]
+        [InlineData("123startsWithDigit")]
+        [InlineData("-startsWithDash")]
+        [InlineData("has spaces")]
+        [InlineData("has!special@chars")]
+        public async Task GetKeys_InvalidFunctionName_ReturnsNotFound(string functionName)
+        {
+            var result = (StatusCodeResult)await _testController.Get(functionName);
+
+            Assert.Equal(StatusCodes.Status404NotFound, result.StatusCode);
+        }
+
+        [Theory]
+        [InlineData("../etc/passwd")]
+        [InlineData("..\\windows\\system32")]
+        [InlineData("func/../../secret")]
+        [InlineData("host")]
+        [InlineData("")]
+        [InlineData("123startsWithDigit")]
+        [InlineData("-startsWithDash")]
+        [InlineData("has spaces")]
+        [InlineData("has!special@chars")]
+        public async Task PutKey_InvalidFunctionName_ReturnsNotFound(string functionName)
+        {
+            var key = new Key("key1", "secret1");
+
+            var result = (StatusCodeResult)(await _testController.Put(functionName, key.Name, key));
+            Assert.Equal(StatusCodes.Status404NotFound, result.StatusCode);
+
+            _functionsSyncManagerMock.Verify(p => p.TrySyncTriggersAsync(false), Times.Never);
+        }
+
+        [Theory]
+        [InlineData("../etc/passwd")]
+        [InlineData("..\\windows\\system32")]
+        [InlineData("func/../../secret")]
+        [InlineData("host")]
+        [InlineData("")]
+        [InlineData("123startsWithDigit")]
+        [InlineData("-startsWithDash")]
+        [InlineData("has spaces")]
+        [InlineData("has!special@chars")]
+        public async Task DeleteKey_InvalidFunctionName_ReturnsNotFound(string functionName)
+        {
+            var result = (StatusCodeResult)(await _testController.Delete(functionName, "key1"));
             Assert.Equal(StatusCodes.Status404NotFound, result.StatusCode);
 
             _functionsSyncManagerMock.Verify(p => p.TrySyncTriggersAsync(false), Times.Never);

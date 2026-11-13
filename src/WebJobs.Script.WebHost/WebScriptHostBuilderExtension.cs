@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
@@ -6,22 +6,26 @@ using System.Net.Http;
 using Microsoft.AspNetCore.Mvc.ApplicationParts;
 using Microsoft.Azure.WebJobs.Host.Config;
 using Microsoft.Azure.WebJobs.Host.Executors;
+using Microsoft.Azure.WebJobs.Host.Listeners;
 using Microsoft.Azure.WebJobs.Host.Loggers;
 using Microsoft.Azure.WebJobs.Host.Scale;
 using Microsoft.Azure.WebJobs.Host.Storage;
 using Microsoft.Azure.WebJobs.Host.Timers;
 using Microsoft.Azure.WebJobs.Logging;
+using Microsoft.Azure.WebJobs.Script.Composition;
 using Microsoft.Azure.WebJobs.Script.Config;
 using Microsoft.Azure.WebJobs.Script.Configuration;
+using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.Middleware;
-using Microsoft.Azure.WebJobs.Script.Scale;
+using Microsoft.Azure.WebJobs.Script.WebHost.Composition;
 using Microsoft.Azure.WebJobs.Script.WebHost.Configuration;
 using Microsoft.Azure.WebJobs.Script.WebHost.DependencyInjection;
 using Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.WebHost.Management;
 using Microsoft.Azure.WebJobs.Script.WebHost.Middleware;
 using Microsoft.Azure.WebJobs.Script.WebHost.Storage;
+using Microsoft.Azure.WebJobs.Script.Workers;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
@@ -32,15 +36,49 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
 {
     public static class WebScriptHostBuilderExtension
     {
-        public static IHostBuilder AddWebScriptHost(this IHostBuilder builder, IServiceProvider rootServiceProvider,
-           IServiceScopeFactory rootScopeFactory, ScriptApplicationHostOptions webHostOptions, Action<IWebJobsBuilder> configureWebJobs = null)
+        public static IHostBuilder AddWebScriptHost(this IHostBuilder builder, IServiceProvider rootServiceProvider, IServiceCollection rootServices,
+           ScriptApplicationHostOptions webHostOptions, Action<IWebJobsBuilder> configureWebJobs = null)
         {
+            ArgumentNullException.ThrowIfNull(rootServiceProvider);
+
+            IWorkerComposition composition = rootServiceProvider.GetService<SelectedWorkerComposition>()?.Value
+                ?? ServerWorkerComposition.Instance;
+
+            return builder.AddWebScriptHost(
+                rootServiceProvider,
+                rootServices,
+                webHostOptions,
+                configureWebJobs,
+                composition);
+        }
+
+        /// <summary>
+        /// Adds a ScriptHost using the specified host composition.
+        /// </summary>
+        /// <param name="builder">The host builder to update.</param>
+        /// <param name="rootServiceProvider">The root WebHost service provider.</param>
+        /// <param name="rootServices">The root WebHost service collection.</param>
+        /// <param name="webHostOptions">The application host options.</param>
+        /// <param name="configureWebJobs">An optional action that configures WebJobs services.</param>
+        /// <param name="composition">The statically selected host composition.</param>
+        /// <returns>The updated host builder.</returns>
+        public static IHostBuilder AddWebScriptHost(
+            this IHostBuilder builder,
+            IServiceProvider rootServiceProvider,
+            IServiceCollection rootServices,
+            ScriptApplicationHostOptions webHostOptions,
+            Action<IWebJobsBuilder> configureWebJobs,
+            IWorkerComposition composition)
+        {
+            ArgumentNullException.ThrowIfNull(rootServiceProvider);
+            ArgumentNullException.ThrowIfNull(composition);
+
             ILoggerFactory configLoggerFactory = rootServiceProvider.GetService<ILoggerFactory>();
             IDependencyValidator validator = rootServiceProvider.GetService<IDependencyValidator>();
             IMetricsLogger metricsLogger = rootServiceProvider.GetService<IMetricsLogger>();
             IEnvironment environment = rootServiceProvider.GetService<IEnvironment>();
 
-            builder.UseServiceProviderFactory(new JobHostScopedServiceProviderFactory(rootServiceProvider, rootScopeFactory, validator))
+            builder.UseServiceProviderFactory(new JobHostScopedServiceProviderFactory(rootServiceProvider, rootServices, validator))
                 .ConfigureServices(services =>
                 {
                     // register default configuration
@@ -53,9 +91,12 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
                     services.ConfigureOptions<AppServiceOptionsSetup>();
                     services.ConfigureOptions<HostEasyAuthOptionsSetup>();
                     services.ConfigureOptions<PrimaryHostCoordinatorOptionsSetup>();
+                    services.ConfigureOptions<ExtensionSystemOptionsSetup>();
                 })
                 .AddScriptHost(webHostOptions, configLoggerFactory, metricsLogger, webJobsBuilder =>
                 {
+                    composition.ConfigureScriptHostServices(webJobsBuilder.Services, rootServiceProvider);
+
                     // Adds necessary Azure-based services to the ScriptHost, which will use the host-provided IAzureBlobStorageProvider registered below.
                     webJobsBuilder.AddAzureStorageCoreServices();
 
@@ -84,8 +125,8 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
                 .ConfigureLogging(loggingBuilder =>
                 {
                     loggingBuilder.Services.AddSingleton<ILoggerFactory, ScriptLoggerFactory>();
-
                     loggingBuilder.AddWebJobsSystem<SystemLoggerProvider>();
+
                     if (environment.IsAzureMonitorEnabled())
                     {
                         loggingBuilder.Services.AddSingleton<ILoggerProvider, AzureMonitorDiagnosticLoggerProvider>();
@@ -123,17 +164,27 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
                     services.TryAddSingleton<IJobHostMiddlewarePipeline, DefaultMiddlewarePipeline>();
                     services.TryAddEnumerable(ServiceDescriptor.Singleton<IJobHostHttpMiddleware, CustomHttpHeadersMiddleware>());
                     services.TryAddEnumerable(ServiceDescriptor.Singleton<IJobHostHttpMiddleware, HstsConfigurationMiddleware>());
-                    if (environment.IsAnyLinuxConsumption())
+
+                    bool isAnyLinuxConsumption = environment.IsAnyLinuxConsumption();
+
+                    if (isAnyLinuxConsumption || environment.IsCorsConfigurationEnabled())
                     {
                         services.AddSingleton<ICorsMiddlewareFactory, CorsMiddlewareFactory>();
                         services.TryAddEnumerable(ServiceDescriptor.Singleton<IJobHostHttpMiddleware, JobHostCorsMiddleware>());
+                    }
 
+                    if (isAnyLinuxConsumption)
+                    {
                         // EasyAuth must go after CORS, as CORS preflight requests can happen before authentication
                         services.TryAddEnumerable(ServiceDescriptor.Singleton<IJobHostHttpMiddleware, JobHostEasyAuthMiddleware>());
                     }
 
+                    if (environment.IsFlexConsumptionSku())
+                    {
+                        services.TryAddEnumerable(ServiceDescriptor.Singleton<IListenerDecorator, FunctionGroupListenerDecorator>());
+                    }
+
                     services.AddSingleton<IScaleMetricsRepository, TableStorageScaleMetricsRepository>();
-                    services.TryAddEnumerable(ServiceDescriptor.Singleton<IConcurrencyThrottleProvider, WorkerChannelThrottleProvider>());
 
                     // Make sure the registered IHostIdProvider is used
                     IHostIdProvider provider = rootServiceProvider.GetService<IHostIdProvider>();
@@ -152,10 +203,20 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
                     services.AddSingleton<IFileMonitoringService, FileMonitoringService>();
                     services.TryAddEnumerable(ServiceDescriptor.Singleton<IHostedService, IFileMonitoringService>(p => p.GetService<IFileMonitoringService>()));
 
+                    // Forwards buffered WebHost logs to this ScriptHost's telemetry providers. Scoped to the
+                    // ScriptHost so it stops reading automatically when the host is orphaned (restart/specialization).
+                    // The DependencyValidator requires this hosted service to always be registered, so forward the
+                    // WebHost's shared DeferredLogSource (falling back to a local, empty buffer for host builds that
+                    // don't register one, e.g. tests) so the service can always be constructed.
+                    services.AddSingleton(rootServiceProvider.GetService<DeferredLogSource>() ?? new DeferredLogSource());
+                    services.AddSingleton<IHostedService, DeferredLogForwardingService>();
+
                     IOptions<FunctionsHostingConfigOptions> hostingConfigOptions = rootServiceProvider.GetService<IOptions<FunctionsHostingConfigOptions>>();
                     IOptionsMonitor<FunctionsHostingConfigOptions> hostingConfigOptionsMonitor = rootServiceProvider.GetService<IOptionsMonitor<FunctionsHostingConfigOptions>>();
                     services.AddSingleton(hostingConfigOptions);
                     services.AddSingleton(hostingConfigOptionsMonitor);
+                    IOptions<ExtensionRequirementOptions> extensionRequirementOptions = rootServiceProvider.GetService<IOptions<ExtensionRequirementOptions>>();
+                    services.AddSingleton(extensionRequirementOptions);
 
                     ConfigureRegisteredBuilders(services, rootServiceProvider);
                 });

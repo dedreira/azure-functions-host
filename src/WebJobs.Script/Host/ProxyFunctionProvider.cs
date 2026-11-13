@@ -14,6 +14,7 @@ using System.Threading.Tasks;
 using Microsoft.Azure.AppService.Proxy.Client;
 using Microsoft.Azure.WebJobs.Logging;
 using Microsoft.Azure.WebJobs.Script.Description;
+using Microsoft.Azure.WebJobs.Script.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.Eventing;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -41,6 +42,12 @@ namespace Microsoft.Azure.WebJobs.Script
             _logger = loggerFactory.CreateLogger(LogCategories.Startup);
             if (_environment.IsProxiesEnabled())
             {
+                if (_environment.IsFlexConsumptionSku())
+                {
+                    _logger.LogWarning("Proxies are not supported in Flex Consumption. Proxy definitions will be ignored.");
+                    return;
+                }
+
                 // note these are both null-checked; if they're left null (disabled) - that's fine
                 _metadata = new Lazy<ImmutableArray<FunctionMetadata>>(LoadFunctionMetadata);
 
@@ -94,7 +101,7 @@ namespace Microsoft.Azure.WebJobs.Script
             var functionErrors = new Dictionary<string, ICollection<string>>();
             Collection<ProxyFunctionMetadata> proxies = ReadProxyMetadata(_scriptOptions.Value.RootScriptPath, _logger, functionErrors);
 
-            ImmutableArray<FunctionMetadata> metadata;
+            ImmutableArray<FunctionMetadata> metadata = ImmutableArray<FunctionMetadata>.Empty;
             if (proxies != null && proxies.Any())
             {
                 metadata = proxies.ToImmutableArray<FunctionMetadata>();
@@ -121,6 +128,12 @@ namespace Microsoft.Azure.WebJobs.Script
                 logger.LogInformation("Loading proxies metadata");
                 var metadataCollection = LoadProxyMetadata(proxiesJson, functionErrors, logger);
                 logger.LogInformation($"{metadataCollection.Count} proxies loaded");
+
+                if (metadataCollection.Count > 0)
+                {
+                    logger.LogDiagnosticEventWarning(DiagnosticEventConstants.DeprecatedProxiesErrorCode, "Azure Functions Proxies are deprecated and community support will end on September 30, 2025. Please migrate to Azure API Management or Azure Container Apps. See https://aka.ms/functions-deprecated-proxies for more information.", DiagnosticEventConstants.DeprecatedProxiesHelpLink, null);
+                }
+
                 return metadataCollection;
             }
 

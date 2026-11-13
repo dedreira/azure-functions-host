@@ -14,7 +14,6 @@ using Microsoft.Azure.WebJobs.Logging;
 using Microsoft.Azure.WebJobs.Script.Config;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
-using Microsoft.Azure.WebJobs.Script.ExtensionBundle;
 using Microsoft.Azure.WebJobs.Script.Models;
 using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
 using Microsoft.Extensions.Logging;
@@ -22,7 +21,6 @@ using Microsoft.Extensions.Options;
 using Microsoft.WebJobs.Script.Tests;
 using Moq;
 using Newtonsoft.Json.Linq;
-using NuGet.Versioning;
 using Xunit;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests
@@ -423,7 +421,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         [Theory]
         [InlineData("", null, false)]
         [InlineData(null, null, false)]
-        [InlineData("http://storage.blob.core.windows.net/functions/func.zip?sr=c&si=policy&sig=f%2BGLvBih%2BoFuQvckBSHWKMXwqGJHlPkESmZh9pjnHuc%3D",
+        [InlineData("http://storage.blob.core.windows.net/functions/func.zip?sr=c&si=policy&sig=PLACEHOLDER",
             "http://storage.blob.core.windows.net/functions/func.zip...", true)]
         [InlineData("http://storage.blob.core.windows.net/functions/func.zip",
             "http://storage.blob.core.windows.net/functions/func.zip", true)]
@@ -441,7 +439,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         [Theory]
         [InlineData("", null, false)]
         [InlineData(null, null, false)]
-        [InlineData("http://storage.blob.core.windows.net/functions/func.zip?sr=c&si=policy&sig=f%2BGLvBih%2BoFuQvckBSHWKMXwqGJHlPkESmZh9pjnHuc%3D",
+        [InlineData("http://storage.blob.core.windows.net/functions/func.zip?sr=c&si=policy&sig=PLACEHOLDER",
             "http://storage.blob.core.windows.net", true)]
         [InlineData("http://storage.blob.core.windows.net/functions/func.zip",
             "http://storage.blob.core.windows.net", true)]
@@ -457,12 +455,25 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         }
 
         [Theory]
-        [InlineData("http://storage.blob.core.windows.net/functions/func.zip?sr=c&si=policy&sig=f%2BGLvBih%2BoFuQvckBSHWKMXwqGJHlPkESmZh9pjnHuc%3D", true)]
-        [InlineData("http://storage.blob.core.windows.net/functions/func.zip?sr=c&si=policy&sv=abcd&sig=f%2BGLvBih%2BoFuQvckBSHWKMXwqGJHlPkESmZh9pjnHuc%3D", false)]
+        [InlineData("http://storage.blob.core.windows.net/functions/func.zip?sr=c&si=policy&sig=PLACEHOLDER", true)]
+        [InlineData("http://storage.blob.core.windows.net/functions/func.zip?sr=c&si=policy&sv=abcd&sig=PLACEHOLDER", false)]
         [InlineData("http://storage.blob.core.windows.net/functions/func.zip", true)]
         public void GetAccountNameFromDomain(string url, bool isUrlWithNoSas)
         {
             Assert.Equal(isUrlWithNoSas, Utility.IsResourceAzureBlobWithoutSas(new Uri(url)));
+        }
+
+        [Theory]
+        [InlineData("BlobEndpoint=https://storage.blob.core.windows.net;SharedAccessSignature=sv=2015-07-08&sig=PLACEHOLDER&spr=https&st=2016-04-12T03%3A24%3A31Z&se=2023-07-20T05:27:05Z&srt=s&ss=bf&sp=rwl", "2023-07-20T05:27:05Z", true)]
+        [InlineData("BlobEndpoint=https://storage.blob.core.windows.net;SharedAccessSignature=sv=2015-07-08&sig=PLACEHOLDER&spr=https&st=2016-04-12T03%3A24%3A31Z&srt=s&ss=bf&sp=rwl", null, true)]
+        [InlineData("BlobEndpoint=https://storage.blob.core.windows.net;TableEndpoint=https://table.core.windows.net;SharedAccessSignature=sv=2015-07-08&sig=PLACEHOLDER&spr=https&st=2016-04-12T03%3A24%3A31Z&srt=s&ss=bf&sp=rwl", null, true)]
+        [InlineData("BlobEndpoint=https://storage.blob.core.windows.net;TableEndpoint=https://table.core.windows.net;SharedAccessSignature=sv=2015-07-08&sig=PLACEHOLDER&spr=https&st=2016-04-12T03%3A24%3A31Z&se=2023-07-20T05:27:05Z&srt=s&ss=bf&sp=rwl", "2023-07-20T05:27:05Z", true)]
+        [InlineData("UseDevelopmentStorage=true", null, true)]
+        [InlineData("https://storage.blob.core.windows.net/func/func.zip?sp=r&st=2023-07-12T21:27:05Z&se=2023-07-20T05:27:05Z&spr=https&sv=2022-11-02&sr=b&sig=PLACEHOLDER", "2023-07-20T05:27:05Z", false)]
+        [InlineData("https://storage.blob.core.windows.net/functions/func.zip", null, false)]
+        public void GetSasTokenExpirationDateFromSasSignature(string input, string expirationDate, bool isAzureWebJobsStorage)
+        {
+            Assert.Equal(expirationDate, Utility.GetSasTokenExpirationDate(input, isAzureWebJobsStorage));
         }
 
         [Theory]
@@ -518,7 +529,6 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         [Theory]
         [InlineData(null)]
         [InlineData("")]
-        [InlineData("_binding")]
         [InlineData("binding-test")]
         [InlineData("binding name")]
         public void ValidateBinding_InvalidName_Throws(string bindingName)
@@ -533,10 +543,22 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 Utility.ValidateBinding(bindingMetadata);
             });
 
-            Assert.Equal($"The binding name {bindingName} is invalid. Please assign a valid name to the binding.", ex.Message);
+            Assert.Equal($"The binding name {bindingName} is invalid. Please assign a valid name to the binding. See https://aka.ms/azure-functions-binding-name-rules for more details.", ex.Message);
         }
 
         [Theory]
+        [InlineData("__")]
+        [InlineData("__binding")]
+        [InlineData("binding__")]
+        [InlineData("bind__ing")]
+        [InlineData("__binding__")]
+        [InlineData("_binding")]
+        [InlineData("binding_")]
+        [InlineData("_binding_")]
+        [InlineData("_another_binding_test_")]
+        [InlineData("long_binding_name_that_is_valid")]
+        [InlineData("binding_name")]
+        [InlineData("_")]
         [InlineData("bindingName")]
         [InlineData("binding1")]
         [InlineData(ScriptConstants.SystemReturnParameterBindingName)]
@@ -615,6 +637,24 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             var testEnv = new TestEnvironment();
             testEnv.SetEnvironmentVariable(EnvironmentSettingNames.FunctionWorkerRuntime, workerRuntime);
             Assert.True(Utility.GetWorkerRuntime(functionMetadatas, testEnv) == workerRuntime);
+        }
+
+        [Theory]
+        [InlineData("Python", "python", "Python")]
+        [InlineData("python", "Python", "python")]
+        [InlineData("python", "python", "python")]
+        [InlineData("python", "node", null)]
+        public void GetWorkerRuntime_MetadataLanguagesUseCaseInsensitiveComparison(
+            string firstLanguage, string secondLanguage, string expectedRuntime)
+        {
+            FunctionMetadata[] functions =
+            [
+                new FunctionMetadata { Name = "func1", Language = firstLanguage },
+                new FunctionMetadata { Name = "func2", Language = secondLanguage }
+            ];
+
+            Assert.Equal(expectedRuntime is not null, Utility.IsSingleLanguage(functions, null));
+            Assert.Equal(expectedRuntime, Utility.GetWorkerRuntime(functions));
         }
 
         [Theory]
@@ -855,7 +895,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         }
 
         [Theory]
-        [InlineData(false, true, false)]
+        [InlineData(false, true, true)]
         [InlineData(false, false, false)]
         [InlineData(true, false, false)]
         [InlineData(true, true, true)]
@@ -873,57 +913,51 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         }
 
         [Theory]
-        [InlineData(true, true, false, "", true)]
-        [InlineData(true, true, true, "NonApp", true)]
-        [InlineData(true, true, true, "AppName", true)]
-        [InlineData(true, true, false, "NonApp", true)]
-        [InlineData(true, true, false, "AppName", true)]
-        public void VerifyWorkerIndexingFeatureFlagTakesPrecedence(bool workerIndexingFeatureFlag, bool workerIndexingConfigProperty, bool enabledHostingConfig, string disabledHostingConfig, bool expected)
+        [InlineData(true, true, "", true)]
+        [InlineData(true, true, "NonApp", true)]
+        [InlineData(true, true, "AppName", true)]
+        public void VerifyWorkerIndexingFeatureFlagTakesPrecedence(bool workerIndexingFeatureFlag, bool workerIndexingConfigProperty, string disabledHostingConfig, bool expected)
         {
-            VerifyCanWorkerIndexUtility(workerIndexingFeatureFlag, workerIndexingConfigProperty, enabledHostingConfig, disabledHostingConfig, expected);
+            VerifyCanWorkerIndexUtility(workerIndexingFeatureFlag, workerIndexingConfigProperty, disabledHostingConfig, expected);
         }
 
         [Theory]
-        [InlineData(true, false, false, "", false)]
-        [InlineData(true, false, true, "NonApp", false)]
-        [InlineData(true, false, true, "AppName", false)]
-        [InlineData(true, false, false, "NonApp", false)]
-        [InlineData(true, false, false, "AppName", false)]
-        [InlineData(true, true, false, "AppName", true)]
-        public void VerifyWorkerConfigTakesPrecedence(bool workerIndexingFeatureFlag, bool workerIndexingConfigProperty, bool enabledHostingConfig, string disabledHostingConfig, bool expected)
+        [InlineData(true, false, "", false)]
+        [InlineData(true, false, "NonApp", false)]
+        [InlineData(true, false, "AppName", false)]
+        [InlineData(true, true, "AppName", true)]
+        public void VerifyWorkerConfigTakesPrecedence(bool workerIndexingFeatureFlag, bool workerIndexingConfigProperty, string disabledHostingConfig, bool expected)
         {
-            VerifyCanWorkerIndexUtility(workerIndexingFeatureFlag, workerIndexingConfigProperty, enabledHostingConfig, disabledHostingConfig, expected);
+            VerifyCanWorkerIndexUtility(workerIndexingFeatureFlag, workerIndexingConfigProperty, disabledHostingConfig, expected);
         }
 
         [Theory]
-        [InlineData(false, true, true, "", true)]
-        [InlineData(false, true, true, "NonApp", true)]
-        [InlineData(false, true, false, "NonApp", false)]
-        [InlineData(false, false, false, "NonApp", false)]
-        public void VerifyStampLevelHostingConfigHonored(bool workerIndexingFeatureFlag, bool workerIndexingConfigProperty, bool enabledHostingConfig, string disabledHostingConfig, bool expected)
+        [InlineData(false, true, "", true)]
+        [InlineData(false, true, "NonApp", true)]
+        [InlineData(false, false, "NonApp", false)]
+        public void VerifyStampLevelHostingConfigHonored(bool workerIndexingFeatureFlag, bool workerIndexingConfigProperty, string disabledHostingConfig, bool expected)
         {
-            VerifyCanWorkerIndexUtility(workerIndexingFeatureFlag, workerIndexingConfigProperty, enabledHostingConfig, disabledHostingConfig, expected);
+            VerifyCanWorkerIndexUtility(workerIndexingFeatureFlag, workerIndexingConfigProperty, disabledHostingConfig, expected);
         }
 
         [Theory]
-        [InlineData(false, true, true, "", true)]
-        [InlineData(false, true, true, "NonApp|AppName", false)]
-        [InlineData(false, true, true, "NonApp|AnotherAppName", true)]
-        [InlineData(false, true, true, "nonapp|AppName", false)]
-        [InlineData(false, true, true, "appname", false)]
-        [InlineData(false, true, true, "nonapp|appname", false)]
-        [InlineData(false, true, true, "NonApp|anotherAppname", true)]
-        [InlineData(false, false, true, "NonApp", false)]
-        [InlineData(false, false, true, "AppName", false)]
-        [InlineData(false, false, false, "Appname", false)]
-        [InlineData(false, true, false, "AppName", false)]
-        [InlineData(false, true, true, "AppName", false)]
-        public void VerifyDisabledAppConfigHonored(bool workerIndexingFeatureFlag, bool workerIndexingConfigProperty, bool enabledHostingConfig, string disabledHostingConfig, bool expected)
+        [InlineData(false, true, "", true)]
+        [InlineData(false, true, "NonApp|AppName", false)]
+        [InlineData(false, true, "NonApp|AnotherAppName", true)]
+        [InlineData(false, true, "nonapp|AppName", false)]
+        [InlineData(false, true, "appname", false)]
+        [InlineData(false, true, "nonapp|appname", false)]
+        [InlineData(false, true, "NonApp|anotherAppname", true)]
+        [InlineData(false, false, "NonApp", false)]
+        [InlineData(false, false, "AppName", false)]
+        [InlineData(false, false, "Appname", false)]
+        [InlineData(false, true, "AppName", false)]
+        public void VerifyDisabledAppConfigHonored(bool workerIndexingFeatureFlag, bool workerIndexingConfigProperty, string disabledHostingConfig, bool expected)
         {
-            VerifyCanWorkerIndexUtility(workerIndexingFeatureFlag, workerIndexingConfigProperty, enabledHostingConfig, disabledHostingConfig, expected);
+            VerifyCanWorkerIndexUtility(workerIndexingFeatureFlag, workerIndexingConfigProperty, disabledHostingConfig, expected);
         }
 
-        private void VerifyCanWorkerIndexUtility(bool workerIndexingFeatureFlag, bool workerIndexingConfigProperty, bool enabledHostingConfig, string disabledHostingConfig, bool expected)
+        private void VerifyCanWorkerIndexUtility(bool workerIndexingFeatureFlag, bool workerIndexingConfigProperty, string disabledHostingConfig, bool expected)
         {
             var testEnv = new TestEnvironment();
             testEnv.SetEnvironmentVariable(EnvironmentSettingNames.FunctionWorkerRuntime, RpcWorkerConstants.PythonLanguageWorkerName);
@@ -937,15 +971,37 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             RpcWorkerConfig workerConfig = new RpcWorkerConfig() { Description = TestHelpers.GetTestWorkerDescription("python", "none", workerIndexingConfigProperty) };
             var hostingOptions = new FunctionsHostingConfigOptions();
-            if (enabledHostingConfig)
-            {
-                hostingOptions.Features.Add(RpcWorkerConstants.WorkerIndexingEnabled, "1");
-            }
 
             hostingOptions.Features.Add(RpcWorkerConstants.WorkerIndexingDisabledApps, disabledHostingConfig);
 
             bool workerShouldIndex = Utility.CanWorkerIndex(new List<RpcWorkerConfig>() { workerConfig }, testEnv, hostingOptions);
             Assert.Equal(expected, workerShouldIndex);
+        }
+
+        [Theory]
+        [InlineData(true, true)]
+        [InlineData(false, false)]
+        public void WorkerIndexingDecisionLogic_LogicApps(bool enableIndexingForCodeful, bool expected)
+        {
+            var environmentVariables = new Dictionary<string, string>
+                {
+                    { EnvironmentSettingNames.FunctionWorkerRuntime, RpcWorkerConstants.DotNetExecutableName },
+                    { EnvironmentSettingNames.AppKind, ScriptConstants.WorkFlowAppKind },
+                    { EnvironmentSettingNames.AzureWebJobsFeatureFlags, ScriptConstants.FeatureFlagEnableWorkerIndexing },
+                };
+            if (enableIndexingForCodeful)
+            {
+                environmentVariables.Add(EnvironmentSettingNames.LogicAppCodefulModeEnabled, "true");
+            }
+
+            var testEnv = new TestEnvironment(environmentVariables);
+
+            RpcWorkerConfig workerConfig = new RpcWorkerConfig() { Description = TestHelpers.GetTestWorkerDescription("dotnet", "none", true) };
+
+            bool workerShouldIndex = Utility.CanWorkerIndex(new List<RpcWorkerConfig>() { workerConfig }, testEnv, new FunctionsHostingConfigOptions());
+            Assert.Equal(expected, workerShouldIndex);
+
+            testEnv.Clear();
         }
 
         [Theory]
@@ -1096,6 +1152,27 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             };
 
             Utility.ValidateRetryOptions(retryOptions);
+        }
+
+        [Theory]
+        // Null input should enable logging.
+        [InlineData(null, true)]
+        // Only Default category(ScriptConstants.DefaultAzureMonitorCategories) disables logging.
+        [InlineData(ScriptConstants.DefaultAzureMonitorCategories, false)]
+        // Absence of ScriptConstants.AzureMonitorTraceCategory category disables logging
+        [InlineData("SomeOtherCategory", false)]
+        // Only ScriptConstants.AzureMonitorTraceCategory category enables logging
+        [InlineData(ScriptConstants.AzureMonitorTraceCategory, true)]
+        // ScriptConstants.AzureMonitorTraceCategory category present among others enables logging
+        [InlineData($"{ScriptConstants.DefaultAzureMonitorCategories},{ScriptConstants.AzureMonitorTraceCategory}", true)]
+        [InlineData($"{ScriptConstants.AzureMonitorTraceCategory},{ScriptConstants.DefaultAzureMonitorCategories}", true)]
+        [InlineData($"{ScriptConstants.DefaultAzureMonitorCategories},{ScriptConstants.AzureMonitorTraceCategory},Other", true)]
+        // Empty string disables logging (no Trace category present)
+        [InlineData("", false)]
+        public void IsAzureMonitorLoggingEnabled_ReturnsExpected(string subscribedCategories, bool expectedResult)
+        {
+            var result = Utility.IsAzureMonitorLoggingEnabled(subscribedCategories);
+            Assert.Equal(expectedResult, result);
         }
 
         private static void VerifyLogLevel(IList<LogMessage> allLogs, string msg, LogLevel expectedLevel)

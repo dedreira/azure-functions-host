@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 namespace Microsoft.Azure.WebJobs.Script.Diagnostics
@@ -9,6 +9,9 @@ namespace Microsoft.Azure.WebJobs.Script.Diagnostics
         public const string ApplicationStartLatency = "host.application.start";
         public const string ApplicationInsightsEnabled = "host.applicationinsights.enabled";
         public const string ApplicationInsightsDisabled = "host.applicationinsights.disabled";
+        public const string OpenTelemetryAzMonEnabled = "host.otel.azmon.enabled";
+        public const string OpenTelemetryOtlpEnabled = "host.otel.otlp.enabled";
+        public const string AzureMonitorEnabled = "host.azuremonitor.enabled";
         public const string HostStartupLatency = "host.startup.latency";
         public const string HostStartupReadFunctionMetadataLatency = "host.startup.readfunctionmetadata.latency";
         public const string HostStartupInitializeBindingProvidersLatency = "host.startup.initializebindingproviders.latency";
@@ -16,6 +19,12 @@ namespace Microsoft.Azure.WebJobs.Script.Diagnostics
         public const string HostStartupGetFunctionDescriptorsLatency = "host.startup.getfunctiondescriptors.latency";
         public const string HostStartupGrpcServerLatency = "host.startup.outofproc.grpcserver.initialize.latency";
         public const string HostStartupRuntimeLanguage = "host.startup.runtime.language.{0}";
+        public const string NonIdentifiableSecretLoaded = "host.secrets.nonidentifiable";
+        public const string IdentifiableSecretLoaded = "host.secrets.identifiable";
+        public const string HISStrictModeEnabled = "host.hismode.strict";
+        public const string HISStrictModeWarn = "host.hismode.warn";
+        public const string SyncTriggersInvoked = "host.synctriggers.invoke";
+        public const string GetTriggersInvoked = "host.gettriggers.invoke";
 
         // Script host level events
         public const string ScriptHostManagerBuildScriptHost = "scripthostmanager.buildscripthost.latency";
@@ -28,6 +37,9 @@ namespace Microsoft.Azure.WebJobs.Script.Diagnostics
         public const string WorkerInvoked = "{0}worker.invoke";
         public const string WorkerInvokeSucceeded = "{0}worker.invoke.succeeded";
         public const string WorkerInvokeFailed = "{0}worker.invoke.failed";
+
+        // Raised once per worker channel, the first time a worker sends a custom metric.
+        public const string WorkerCustomMetric = "host.worker.custommetric";
 
         // FunctionMetadataprovider events
         public const string ReadFunctionsMetadata = "functionmetadataprovider.readfunctionsmetadata";
@@ -75,6 +87,7 @@ namespace Microsoft.Azure.WebJobs.Script.Diagnostics
         public const string SecretManagerPurgeOldSecrets = "secretmanager.purgeoldsecrets.{0}";
 
         // Linux container specialization events
+        public const string LinuxContainerSpecializationAssign = "linux.container.specialization.assign";
         public const string LinuxContainerSpecializationBindMount = "linux.container.specialization.bind.mount";
         public const string LinuxContainerSpecializationMountCifs = "linux.container.specialization.mount.cifs";
         public const string LinuxContainerSpecializationZipExtract = "linux.container.specialization.zip.extract";

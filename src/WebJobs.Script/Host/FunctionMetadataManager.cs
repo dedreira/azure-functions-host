@@ -1,17 +1,16 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Collections.Immutable;
+using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Logging;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Diagnostics.Extensions;
-using Microsoft.Azure.WebJobs.Script.Workers;
-using Microsoft.Azure.WebJobs.Script.Workers.Http;
 using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -19,46 +18,68 @@ using Microsoft.Extensions.Options;
 
 namespace Microsoft.Azure.WebJobs.Script
 {
-    public class FunctionMetadataManager : IFunctionMetadataManager
+    public sealed class FunctionMetadataManager : IFunctionMetadataManager, IDisposable
     {
-        private const string _functionConfigurationErrorMessage = "Unable to determine the primary function script.Make sure atleast one script file is present.Try renaming your entry point script to 'run' or alternatively you can specify the name of the entry point script explicitly by adding a 'scriptFile' property to your function metadata.";
+        private const string FunctionConfigurationErrorMessage = "Unable to determine the primary function script. Make sure at least one script file is present. Try renaming your entry point script to 'run' or alternatively you can specify the name of the entry point script explicitly by adding a 'scriptFile' property to your function metadata.";
+        private const string MetadataProviderName = "Custom";
         private readonly IServiceProvider _serviceProvider;
-        private readonly ILoggerFactory _loggerFactory;
-        private IFunctionMetadataProvider _functionMetadataProvider;
-        private bool _isHttpWorker;
-        private IEnvironment _environment;
-        private bool _servicesReset = false;
-        private ILogger _logger;
+        private readonly IFunctionMetadataProvider _functionMetadataProvider;
+        private readonly IEnvironment _environment;
+
+        private readonly IOptionsMonitor<LanguageWorkerOptions> _languageOptions;
+        private IDisposable _onChangeSubscription;
         private IOptions<ScriptJobHostOptions> _scriptOptions;
+        private IOptions<FunctionMetadataOptions> _metadataOptions;
+        private ILogger _logger;
+        private bool _servicesReset = false;
         private ImmutableArray<FunctionMetadata> _functionMetadataArray;
         private Dictionary<string, ICollection<string>> _functionErrors = new Dictionary<string, ICollection<string>>();
         private ConcurrentDictionary<string, FunctionMetadata> _functionMetadataMap = new ConcurrentDictionary<string, FunctionMetadata>(StringComparer.OrdinalIgnoreCase);
 
-        public FunctionMetadataManager(IOptions<ScriptJobHostOptions> scriptOptions, IFunctionMetadataProvider functionMetadataProvider,
-            IOptions<HttpWorkerOptions> httpWorkerOptions, IScriptHostManager scriptHostManager, ILoggerFactory loggerFactory,
-            IEnvironment environment)
+        // Some services are pulled from the ScriptHost when it is built. But it can also be shut down and there are periods
+        // where metadata is retrieved without any active host. Some checks in this class need to know this to know whether it can
+        // trust the services it is using.
+        private bool _scriptHostInitialized = false;
+
+        public FunctionMetadataManager(
+            IOptions<ScriptJobHostOptions> scriptOptions,
+            IFunctionMetadataProvider functionMetadataProvider,
+            IScriptHostManager scriptHostManager,
+            ILoggerFactory loggerFactory,
+            IEnvironment environment,
+            IOptionsMonitor<LanguageWorkerOptions> languageOptions,
+            IOptions<FunctionMetadataOptions> metadataOptions)
         {
             _scriptOptions = scriptOptions;
+            _metadataOptions = metadataOptions;
             _serviceProvider = scriptHostManager as IServiceProvider;
             _functionMetadataProvider = functionMetadataProvider;
-            _loggerFactory = loggerFactory;
             _logger = loggerFactory.CreateLogger(LogCategories.Startup);
-            _isHttpWorker = httpWorkerOptions?.Value?.Description != null;
             _environment = environment;
 
-            // Every time script host is re-intializing, we also need to re-initialize
+            _languageOptions = languageOptions;
+            _onChangeSubscription = languageOptions.OnChange(_ => _servicesReset = true);
+
+            // Every time script host is re-initializing, we also need to re-initialize
             // services that change with the scope of the script host.
             scriptHostManager.ActiveHostChanged += (s, e) =>
             {
                 if (e.NewHost is not null)
                 {
+                    _scriptHostInitialized = true;
                     InitializeServices();
+                }
+                else
+                {
+                    _scriptHostInitialized = false;
                 }
             };
         }
 
+        /// <inheritdoc />
         public ImmutableDictionary<string, ImmutableArray<string>> Errors { get; private set; }
 
+        /// <inheritdoc />
         public bool TryGetFunctionMetadata(string functionName, out FunctionMetadata functionMetadata, bool forceRefresh)
         {
             if (forceRefresh)
@@ -80,19 +101,22 @@ namespace Microsoft.Azure.WebJobs.Script
         /// </summary>
         /// <param name="forceRefresh">Forces reload from all providers.</param>
         /// <param name="applyAllowList">Apply functions allow list filter.</param>
-        /// <param name="includeCustomProviders">Include any metadata provided by IFunctionProvider when loading the metadata</param>
-        /// <returns> An Immmutable array of FunctionMetadata.</returns>
-        public ImmutableArray<FunctionMetadata> GetFunctionMetadata(bool forceRefresh, bool applyAllowList = true, bool includeCustomProviders = true, IList<RpcWorkerConfig> workerConfigs = null)
+        /// <param name="includeCustomProviders">Include any metadata provided by IFunctionProvider when loading the metadata.</param>
+        /// <returns> An Immutable array of FunctionMetadata.</returns>
+        public ImmutableArray<FunctionMetadata> GetFunctionMetadata(bool forceRefresh, bool applyAllowList = true, bool includeCustomProviders = true)
         {
             if (forceRefresh || _servicesReset || _functionMetadataArray.IsDefaultOrEmpty)
             {
-                _functionMetadataArray = LoadFunctionMetadata(forceRefresh, includeCustomProviders, workerConfigs: workerConfigs);
+                _functionMetadataArray = LoadFunctionMetadata(forceRefresh, includeCustomProviders);
                 _logger.FunctionMetadataManagerFunctionsLoaded(ApplyAllowList(_functionMetadataArray).Count());
                 _servicesReset = false;
             }
 
             return applyAllowList ? ApplyAllowList(_functionMetadataArray) : _functionMetadataArray;
         }
+
+        /// <inheritdoc />
+        public void Dispose() => _onChangeSubscription.Dispose();
 
         private ImmutableArray<FunctionMetadata> ApplyAllowList(ImmutableArray<FunctionMetadata> metadataList)
         {
@@ -110,31 +134,22 @@ namespace Microsoft.Azure.WebJobs.Script
         {
             _functionMetadataMap.Clear();
 
-            _isHttpWorker = _serviceProvider.GetService<IOptions<HttpWorkerOptions>>()?.Value?.Description != null;
             _scriptOptions = _serviceProvider.GetService<IOptions<ScriptJobHostOptions>>();
+            _metadataOptions = _serviceProvider.GetService<IOptions<FunctionMetadataOptions>>();
 
             // Resetting the logger switches the logger scope to Script Host level,
             // also making the logs available to Application Insights
             _logger = _serviceProvider?.GetService<ILoggerFactory>().CreateLogger(LogCategories.Startup);
-            _servicesReset = true;
-        }
 
-        /// <summary>
-        /// This is the worker configuration created in the jobhost scope during placeholder initialization
-        /// This is used as a fallback incase the config is not passed down from previous method call.
-        /// </summary>
-        private IList<RpcWorkerConfig> GetFallbackWorkerConfig()
-        {
-            return _serviceProvider.GetService<IOptionsMonitor<LanguageWorkerOptions>>().CurrentValue.WorkerConfigs;
+            _servicesReset = true;
         }
 
         /// <summary>
         /// Read all functions and populate function metadata.
         /// </summary>
-        internal ImmutableArray<FunctionMetadata> LoadFunctionMetadata(bool forceRefresh = false, bool includeCustomProviders = true, IFunctionInvocationDispatcher dispatcher = null, IList<RpcWorkerConfig> workerConfigs = null)
+        internal ImmutableArray<FunctionMetadata> LoadFunctionMetadata(bool forceRefresh = false, bool includeCustomProviders = true)
         {
-            workerConfigs ??= GetFallbackWorkerConfig();
-
+            var workerConfigs = _languageOptions.CurrentValue.WorkerConfigs;
             _functionMetadataMap.Clear();
 
             ICollection<string> functionsAllowList = _scriptOptions?.Value?.Functions;
@@ -142,7 +157,7 @@ namespace Microsoft.Azure.WebJobs.Script
 
             ImmutableArray<FunctionMetadata> immutableFunctionMetadata;
 
-            immutableFunctionMetadata = _functionMetadataProvider.GetFunctionMetadataAsync(workerConfigs, _environment, forceRefresh).GetAwaiter().GetResult();
+            immutableFunctionMetadata = _functionMetadataProvider.GetFunctionMetadataAsync(workerConfigs, forceRefresh).GetAwaiter().GetResult();
 
             var functionMetadataList = new List<FunctionMetadata>();
             _functionErrors = new Dictionary<string, ICollection<string>>();
@@ -180,25 +195,27 @@ namespace Microsoft.Azure.WebJobs.Script
                 Errors = _functionErrors.Where(kvp => functionsAllowList.Any(functionName => functionName.Equals(kvp.Key, StringComparison.CurrentCultureIgnoreCase))).ToImmutableDictionary(kvp => kvp.Key, kvp => kvp.Value.ToImmutableArray());
             }
 
+            if (functionMetadataList.Count == 0 && !_environment.IsPlaceholderModeEnabled())
+            {
+                // Validate the host.json file if no functions are found.
+                ValidateHostJsonFile();
+            }
+
             return functionMetadataList.OrderBy(f => f.Name, StringComparer.OrdinalIgnoreCase).ToImmutableArray();
         }
 
         internal bool IsScriptFileDetermined(FunctionMetadata functionMetadata)
         {
-            try
-            {
-                if (string.IsNullOrEmpty(functionMetadata.ScriptFile) && !_isHttpWorker && !functionMetadata.IsProxy() && _servicesReset)
-                {
-                    throw new FunctionConfigurationException(_functionConfigurationErrorMessage);
-                }
-            }
-            catch (FunctionConfigurationException exc)
+            // If we do not have an initialized scriptHost, we cannot trust the _metadataOptions, so simply return true. This happens during bundle evaluation, for example, when
+            // we do not yet have a built scriptHost.
+            if (_scriptHostInitialized && string.IsNullOrEmpty(functionMetadata.ScriptFile) && !_metadataOptions.Value.SkipScriptFileValidation && !functionMetadata.IsProxy() && _servicesReset)
             {
                 // for functions in error, log the error and don't
                 // add to the functions collection
-                Utility.AddFunctionError(_functionErrors, functionMetadata.Name, exc.Message);
+                Utility.AddFunctionError(_functionErrors, functionMetadata.Name, FunctionConfigurationErrorMessage);
                 return false;
             }
+
             return true;
         }
 
@@ -215,22 +232,39 @@ namespace Microsoft.Azure.WebJobs.Script
 
         private void AddMetadataFromCustomProviders(IEnumerable<IFunctionProvider> functionProviders, List<FunctionMetadata> functionMetadataList)
         {
-            _logger.FunctionMetadataProviderParsingFunctions();
+            _logger.ReadingFunctionMetadataFromProvider(MetadataProviderName);
 
             var functionProviderTasks = new List<Task<ImmutableArray<FunctionMetadata>>>();
+            var metadataProviderTimeout = _scriptOptions.Value.MetadataProviderTimeout;
+
             foreach (var functionProvider in functionProviders)
             {
-                functionProviderTasks.Add(functionProvider.GetFunctionMetadataAsync());
+                var getFunctionMetadataFromProviderTask = functionProvider.GetFunctionMetadataAsync();
+                var delayTask = Task.Delay(metadataProviderTimeout);
+
+                var completedTask = Task.WhenAny(getFunctionMetadataFromProviderTask, delayTask).ContinueWith(t =>
+                {
+                    if (t.Result == getFunctionMetadataFromProviderTask)
+                    {
+                        return getFunctionMetadataFromProviderTask.Result;
+                    }
+
+                    // Timeout case.
+                    throw new TimeoutException($"Timeout occurred while retrieving metadata from provider '{functionProvider.GetType().FullName}'. The operation exceeded the configured timeout of {metadataProviderTimeout.TotalSeconds} seconds.");
+                });
+
+                functionProviderTasks.Add(completedTask);
             }
 
-            var functionMetadataListArray = Task.WhenAll(functionProviderTasks).GetAwaiter().GetResult();
+            var providerFunctionMetadataResults = Task.WhenAll(functionProviderTasks).GetAwaiter().GetResult();
+            var totalFunctionsCount = providerFunctionMetadataResults.Where(metadataArray => !metadataArray.IsDefaultOrEmpty).Sum(metadataArray => metadataArray.Length);
 
             // This is used to make sure no duplicates are registered
             var distinctFunctionNames = new HashSet<string>(functionMetadataList.Select(m => m.Name));
 
-            _logger.FunctionMetadataProviderFunctionFound(functionMetadataListArray.Length);
+            _logger.FunctionsReturnedByProvider(totalFunctionsCount, MetadataProviderName);
 
-            foreach (var metadataArray in functionMetadataListArray)
+            foreach (var metadataArray in providerFunctionMetadataResults)
             {
                 if (!metadataArray.IsDefaultOrEmpty)
                 {
@@ -264,6 +298,34 @@ namespace Microsoft.Azure.WebJobs.Script
                 {
                     _functionErrors[errorKvp.Key] = errorKvp.Value.ToList();
                 }
+            }
+        }
+
+        private void ValidateHostJsonFile()
+        {
+            try
+            {
+                if (_scriptOptions.Value.RootScriptPath is not null && _scriptOptions.Value.IsDefaultHostConfig)
+                {
+                    // Search for the host.json file within nested directories to verify scenarios where it isn't located at the root. This situation often occurs when a function app has been improperly zipped.
+                    string hostFilePath = Path.Combine(_scriptOptions.Value.RootScriptPath, ScriptConstants.HostMetadataFileName);
+                    IEnumerable<string> hostJsonFiles = Directory.GetFiles(_scriptOptions.Value.RootScriptPath, ScriptConstants.HostMetadataFileName, SearchOption.AllDirectories)
+                        .Where(file => !file.Equals(hostFilePath, StringComparison.OrdinalIgnoreCase));
+
+                    if (hostJsonFiles != null && hostJsonFiles.Any())
+                    {
+                        string hostJsonFilesPath = string.Join(", ", hostJsonFiles).Replace(_scriptOptions.Value.RootScriptPath, string.Empty);
+                        _logger.HostJsonZipDeploymentIssue(hostJsonFilesPath);
+                    }
+                    else
+                    {
+                        _logger.NoHostJsonFile();
+                    }
+                }
+            }
+            catch
+            {
+                // Ignore any exceptions.
             }
         }
     }

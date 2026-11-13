@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
@@ -12,15 +12,20 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Azure.WebJobs.Script.Config;
 using Microsoft.Azure.WebJobs.Script.WebHost;
+using Microsoft.Azure.WebJobs.Script.Workers;
 using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
+using Moq;
 using Xunit;
+using Microsoft.WebJobs.Script.Tests;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests
 {
+    [Trait(TestTraits.Group, TestTraits.NonE2ESpecialization)]
     public class WarmupFunctionEndToEndTests : IClassFixture<WarmupFunctionEndToEndTests.TestFixture>
     {
         private readonly ScriptSettingsManager _settingsManager;
@@ -38,7 +43,18 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             HttpResponseMessage response = await _fixture.HttpClient.GetAsync($"/admin/warmup");
 
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-            Assert.False(response.Headers.Contains("myversion"), "/admin/warmup cannot be overriden by proxies.");
+            Assert.Empty(await response.Content.ReadAsStringAsync());
+            Assert.False(response.Headers.Contains("myversion"), "/admin/warmup cannot be overridden by proxies.");
+        }
+
+        [Fact]
+        public async Task Warmup_TrailingSlash_ReturnsNotFound()
+        {
+            HttpResponseMessage response = await _fixture.HttpClient.GetAsync("/admin/warmup/");
+
+            Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+            Assert.Empty(await response.Content.ReadAsStringAsync());
+            Assert.False(response.Headers.Contains("myversion"), "/admin/warmup/ cannot be overridden by proxies.");
         }
 
         [Fact]
@@ -57,7 +73,19 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             HttpResponseMessage response = await _fixture.HttpClient.GetAsync("/admin/123");
 
             string content = await response.Content.ReadAsStringAsync();
-            Assert.False(response.Headers.Contains("myversion"), "/admin/* endpoints cannot be overriden by proxies.");
+            Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+            Assert.Empty(content);
+            Assert.False(response.Headers.Contains("myversion"), "/admin/* endpoints cannot be overridden by proxies.");
+        }
+
+        [Fact]
+        public async Task FunctionRoutes_RuntimeOverride_Fails()
+        {
+            HttpResponseMessage response = await _fixture.HttpClient.GetAsync("/runtime/123");
+
+            string content = await response.Content.ReadAsStringAsync();
+            Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+            Assert.Empty(content);
         }
 
         [Fact]
@@ -73,15 +101,15 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
         public class TestFixture : IDisposable
         {
-            private readonly TestServer _testServer;
             private readonly string _testHome;
+            private readonly IHost _host;
 
             public TestFixture()
             {
                 ProxyEndToEndTests.EnableProxiesOnSystemEnvironment();
                 // copy test files to temp directory, since accessing the metadata APIs will result
                 // in file creations (for test data files)
-                var scriptSource = Path.Combine(Environment.CurrentDirectory, "..", "..", "..", "TestScripts", "WarmupFunction");
+                var scriptSource = Path.Combine(Environment.CurrentDirectory, "TestScripts", "WarmupFunction");
                 _testHome = Path.Combine(Path.GetTempPath(), @"WarmupFunction");
                 var scriptRoot = Path.Combine(_testHome, "site", "wwwroot");
                 FileUtility.CopyDirectory(scriptSource, scriptRoot);
@@ -91,11 +119,8 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                     IsSelfHost = true,
                     ScriptPath = scriptRoot,
                     LogPath = Path.Combine(_testHome, "LogFiles", "Application", "Functions"),
-                    SecretsPath = Path.Combine(_testHome, "data", "Functions", "Secrets"),
-                    TestDataPath = Path.Combine(_testHome, "data", "Functions", "SampleData")
+                    SecretsPath = Path.Combine(_testHome, "data", "Functions", "Secrets")
                 };
-
-                FileUtility.EnsureDirectoryExists(HostOptions.TestDataPath);
 
                 var optionsMonitor = TestHelpers.CreateOptionsMonitor(HostOptions);
 
@@ -104,26 +129,41 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                     WorkerConfigs = TestHelpers.GetTestWorkerConfigs()
                 };
 
-                var provider = new HostFunctionMetadataProvider(optionsMonitor, NullLogger<HostFunctionMetadataProvider>.Instance, new TestMetricsLogger(), SystemEnvironment.Instance);
+                var mockWorkerRuntimeResolver = new Mock<IWorkerRuntimeResolver>();
+                _ = new HostFunctionMetadataProvider(optionsMonitor, NullLogger<HostFunctionMetadataProvider>.Instance, new TestMetricsLogger(), mockWorkerRuntimeResolver.Object);
 
-                var builder = AspNetCore.WebHost.CreateDefaultBuilder()
-                   .UseStartup<Startup>()
-                   .ConfigureServices(services =>
-                   {
-                       services.Replace(new ServiceDescriptor(typeof(IOptions<ScriptApplicationHostOptions>), new OptionsWrapper<ScriptApplicationHostOptions>(HostOptions)));
-                       services.Replace(new ServiceDescriptor(typeof(ISecretManagerProvider), new TestSecretManagerProvider(new TestSecretManager())));
-                       services.Replace(new ServiceDescriptor(typeof(IOptionsMonitor<ScriptApplicationHostOptions>), optionsMonitor));
-                       services.Replace(new ServiceDescriptor(typeof(IFunctionMetadataProvider), provider));
+                var builder = Program.CreateHostBuilder()
+                    .ConfigureWebHost(webHostBuilder =>
+                    {
+                        webHostBuilder.UseTestServer();
+                    })
+                    .ConfigureServices(services =>
+                    {
+                        services.Replace(new ServiceDescriptor(typeof(IOptions<ScriptApplicationHostOptions>), new OptionsWrapper<ScriptApplicationHostOptions>(HostOptions)));
+                        services.Replace(new ServiceDescriptor(typeof(ISecretManagerProvider), new TestSecretManagerProvider(new TestSecretManager())));
+                        services.Replace(new ServiceDescriptor(typeof(IOptionsMonitor<ScriptApplicationHostOptions>), optionsMonitor));
 
-                       services.SkipDependencyValidation();
-                   });
+                        services.SkipDependencyValidation();
 
-                // TODO: https://github.com/Azure/azure-functions-host/issues/4876
-                _testServer = new TestServer(builder);
-                HostOptions.RootServiceProvider = _testServer.Host.Services;
-                var scriptConfig = _testServer.Host.Services.GetService<IOptions<ScriptJobHostOptions>>().Value;
+                        services.PostConfigure<ScriptApplicationHostOptions>(o =>
+                        {
+                            o.IsSelfHost = true;
+                            o.ScriptPath = Path.Combine(Environment.CurrentDirectory, "..", "..", "..", "..", "..", "sample", "csharp");
+                            o.LogPath = Path.Combine(Path.GetTempPath(), @"Functions", "WarmupFunctionTests");
+                            o.SecretsPath = Path.Combine(Path.GetTempPath(), @"FunctionsTests\Secrets");
+                            o.HasParentScope = true;
 
-                HttpClient = _testServer.CreateClient();
+                            HostOptions = o;
+                        });
+                    });
+
+                _host = builder.Build();
+                _host.StartAsync().GetAwaiter().GetResult();
+
+                HostOptions.RootServiceProvider = _host.Services;
+                var scriptConfig = _host.Services.GetService<IOptions<ScriptJobHostOptions>>().Value;
+
+                HttpClient = _host.GetTestClient();
                 HttpClient.BaseAddress = new Uri("https://localhost/");
 
                 TestHelpers.WaitForWebHost(HttpClient);
@@ -131,7 +171,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             public async Task<string> GetFunctionSecretAsync(string functionName)
             {
-                var secretManager = _testServer.Host.Services.GetService<ISecretManagerProvider>().Current;
+                var secretManager = _host.Services.GetService<ISecretManagerProvider>().Current;
                 var secrets = await secretManager.GetFunctionSecretsAsync(functionName);
                 return secrets.First().Value;
             }
@@ -144,7 +184,16 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             public void Dispose()
             {
-                _testServer?.Dispose();
+                try
+                {
+                    _host.StopAsync().GetAwaiter().GetResult();
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error stopping host during test cleanup: {ex.Message}");
+                }
+
+                _host.Dispose();
                 HttpServer?.Dispose();
                 HttpClient?.Dispose();
 

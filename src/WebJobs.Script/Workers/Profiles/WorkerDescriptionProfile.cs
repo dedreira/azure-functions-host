@@ -81,6 +81,8 @@ namespace Microsoft.Azure.WebJobs.Script.Workers.Profiles
             updatedDescription.Extensions = UseProfileOrDefault(ProfileDescription.Extensions, defaultWorkerDescription.Extensions) as List<string>;
             updatedDescription.Language = UseProfileOrDefault(ProfileDescription.Language, defaultWorkerDescription.Language);
             updatedDescription.WorkerDirectory = UseProfileOrDefault(ProfileDescription.WorkerDirectory, defaultWorkerDescription.WorkerDirectory);
+            updatedDescription.IsDisabled = ProfileDescription.IsDisabled ?? defaultWorkerDescription.IsDisabled ?? false;
+            updatedDescription.ExecutableWorkingDirectory = UseProfileOrDefault(ProfileDescription.ExecutableWorkingDirectory, defaultWorkerDescription.ExecutableWorkingDirectory);
             return updatedDescription;
         }
 

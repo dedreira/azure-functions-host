@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
@@ -7,13 +7,17 @@ using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.AspNetCore.Hosting;
+using System.Threading.Tasks.Dataflow;
+using Microsoft.Azure.WebJobs.Host.Executors.Internal;
+using Microsoft.Azure.WebJobs.Script.Config;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.Eventing;
 using Microsoft.Azure.WebJobs.Script.ManagedDependencies;
+using Microsoft.Azure.WebJobs.Script.Metrics;
 using Microsoft.Azure.WebJobs.Script.Workers;
 using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Microsoft.WebJobs.Script.Tests;
@@ -37,6 +41,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Workers.Rpc
             _testLoggerFactory.AddProvider(_testLoggerProvider);
 
             _testLogger = _testLoggerProvider.CreateLogger("FunctionDispatcherTests");
+            EnvironmentExtensions.ClearCache();
         }
 
         [Fact]
@@ -102,6 +107,35 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Workers.Rpc
 
             var finalJobhostChannelCount = functionDispatcher.JobHostLanguageWorkerChannelManager.GetChannels().Count();
             Assert.Equal(0, finalJobhostChannelCount);
+        }
+
+        [Fact]
+        public async Task WorkerIndexing_FirstStartupTimeoutBeforeMetadata_StopsApplicationWithoutRetry()
+        {
+            var eventManager = new ScriptEventManager();
+            var applicationLifetime = new Mock<IHostApplicationLifetime>();
+            var stopRequested = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            applicationLifetime.Setup(p => p.StopApplication()).Callback(() => stopRequested.TrySetResult());
+            var webHostChannelManager = new Mock<IWebHostRpcWorkerChannelManager>();
+            webHostChannelManager
+                .Setup(p => p.ShutdownChannelIfExistsAsync(
+                    RpcWorkerConstants.NodeLanguageWorkerName, "metadata-worker", It.IsAny<TimeoutException>()))
+                .ReturnsAsync(true);
+            RpcFunctionInvocationDispatcher functionDispatcher = GetTestFunctionDispatcher(
+                runtime: RpcWorkerConstants.NodeLanguageWorkerName, workerIndexing: true,
+                mockwebHostLanguageWorkerChannelManager: webHostChannelManager,
+                mockApplicationLifetime: applicationLifetime, eventManager: eventManager);
+
+            await functionDispatcher.InitializeAsync(Array.Empty<FunctionMetadata>());
+
+            eventManager.Publish(
+                new WorkerErrorEvent(RpcWorkerConstants.NodeLanguageWorkerName, "metadata-worker", new TimeoutException("StartStream was not received.")));
+
+            await stopRequested.Task.TestWaitAsync(TimeSpan.FromSeconds(5));
+
+            applicationLifetime.Verify(p => p.StopApplication(), Times.Once);
+            webHostChannelManager.VerifyAll();
+            Assert.Empty(functionDispatcher.JobHostLanguageWorkerChannelManager.GetChannels());
         }
 
         [Fact]
@@ -629,21 +663,151 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Workers.Rpc
             Assert.True(testLogs.Any(m => m.FormattedMessage.Contains("Removing errored webhost language worker channel for runtime")));
         }
 
-        private static RpcFunctionInvocationDispatcher GetTestFunctionDispatcher(int maxProcessCountValue = 1, bool addWebhostChannel = false,
-            Mock<IWebHostRpcWorkerChannelManager> mockwebHostLanguageWorkerChannelManager = null, bool throwOnProcessStartUp = false, TimeSpan? startupIntervals = null, string runtime = null, bool workerIndexing = false, bool placeholder = false)
+        [Fact]
+        public async Task FunctionDispatcher_InvokeAsync_SystemScope()
         {
-            var eventManager = new ScriptEventManager();
+            FunctionMetadata func1 = new FunctionMetadata()
+            {
+                Name = "func1",
+                Language = "node"
+            };
+            var functions = new List<FunctionMetadata>()
+            {
+                func1
+            };
+
+            ScriptInvocationContext context = new()
+            {
+                FunctionMetadata = func1,
+                ExecutionContext = new()
+                {
+                    InvocationId = Guid.NewGuid(),
+                    FunctionName = "func1",
+                },
+                ResultSource = new(),
+                CancellationToken = default,
+                Logger = _testLogger,
+                AsyncExecutionContext = System.Threading.ExecutionContext.Capture(),
+            };
+
+            BufferBlock<ScriptInvocationContext> inputBuffer = new();
+            ActionBlock<ScriptInvocationContext> actionBlock = new(context =>
+            {
+                try
+                {
+                    Assert.Equal(FunctionInvocationScope.System, FunctionInvoker.CurrentScope);
+                    context.ResultSource.TrySetResult(null);
+                }
+                catch (Exception ex)
+                {
+                    context.ResultSource.TrySetException(ex);
+                }
+            });
+
+            inputBuffer.LinkTo(actionBlock);
+
+            Mock<IDictionary<string, BufferBlock<ScriptInvocationContext>>> mockBufferBlocks = new();
+            mockBufferBlocks.Setup(m => m.TryGetValue(It.IsAny<string>(), out inputBuffer)).Returns(true);
+
+            Mock<IRpcWorkerChannel> mockChannel = new();
+            mockChannel.Setup(m => m.FunctionInputBuffers).Returns(mockBufferBlocks.Object);
+
+            IRpcWorkerChannel Create(
+                string workerRuntime, string language, IMetricsLogger metricsLogger, int attemptCount, IEnumerable<RpcWorkerConfig> workerConfigs)
+            {
+                var workerConfig = workerConfigs.SingleOrDefault(p => language.Equals(p.Description.Language, StringComparison.OrdinalIgnoreCase));
+                return new TestRpcWorkerChannel(
+                    Guid.NewGuid().ToString(), language, null, _testLogger, false, workerConfig: workerConfig)
+                {
+                    FunctionInputBuffers = mockBufferBlocks.Object,
+                };
+            }
+
+            Mock<IRpcWorkerChannelFactory> mockChannelFactory = new();
+            mockChannelFactory.Setup(
+                m => m.Create(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<IMetricsLogger>(), It.IsAny<int>(), It.IsAny<IEnumerable<RpcWorkerConfig>>()))
+                .Returns(Create);
+
+            RpcFunctionInvocationDispatcher functionDispatcher = GetTestFunctionDispatcher(
+                runtime: RpcWorkerConstants.NodeLanguageWorkerName, channelFactory: mockChannelFactory.Object);
+
+            await functionDispatcher.InitializeAsync(functions);
+            await WaitForFunctionDispactherStateInitialized(functionDispatcher);
+            using FunctionInvoker.Scope scope = FunctionInvoker.BeginUserScope();
+            await functionDispatcher.InvokeAsync(context);
+            await context.ResultSource.Task;
+            Assert.Equal(FunctionInvocationScope.User, FunctionInvoker.CurrentScope);
+        }
+
+        [Fact]
+        public async Task WorkerRestart_DuringApplicationStopping_DisposesChannel_DoesNotRestart()
+        {
+            // This test exercises the scenario where Host.StopAsync() fires ApplicationStopping,
+            // a worker exits (e.g. due to WorkerTerminate message), and the OnProcessExited handler
+            // publishes a WorkerRestartEvent before disposal. Without the fix, the dispatcher would
+            // restart the worker — creating a new channel during shutdown that will never be disposed
+            // and leads to a JobObjectRegistry deadlock.
+
+            int expectedProcessCount = 1;
+            var stoppingSource = new CancellationTokenSource();
+            RpcFunctionInvocationDispatcher functionDispatcher = GetTestFunctionDispatcher(
+                expectedProcessCount,
+                runtime: RpcWorkerConstants.NodeLanguageWorkerName,
+                applicationStoppingSource: stoppingSource);
+
+            await functionDispatcher.InitializeAsync(GetTestFunctionsList(RpcWorkerConstants.NodeLanguageWorkerName));
+            await WaitForJobhostWorkerChannelsToStartup(functionDispatcher, expectedProcessCount);
+
+            TestRpcWorkerChannel testWorkerChannel = (TestRpcWorkerChannel)functionDispatcher
+                .JobHostLanguageWorkerChannelManager.GetChannels().FirstOrDefault();
+            Assert.NotNull(testWorkerChannel);
+
+            // Simulate Host.StopAsync() beginning — fires ApplicationStopping before any
+            // hosted services stop or the dispatcher is disposed.
+            stoppingSource.Cancel();
+
+            // Worker exits and publishes WorkerRestartEvent (same as OnProcessExited with exit code 0).
+            // The event subscription is still alive — only Dispose() detaches it.
+            testWorkerChannel.RaiseWorkerRestart();
+
+            // Wait for the log that proves StartWorkerChannel was entered and skipped.
+            await TestHelpers.Await(
+                () => _testLoggerProvider.GetAllLogMessages().Any(m =>
+                    m.FormattedMessage.Contains("Skipping worker channel start") &&
+                    m.FormattedMessage.Contains("shutting down")),
+                timeout: 5000,
+                pollingInterval: 100);
+
+            // The original channel should be disposed (removed by ShutdownChannelIfExistsAsync).
+            // No new channel should be created — restart was blocked by IsShuttingDown.
+            int channelCount = functionDispatcher.JobHostLanguageWorkerChannelManager.GetChannels().Count();
+            Assert.Equal(0, channelCount);
+        }
+
+        private static RpcFunctionInvocationDispatcher GetTestFunctionDispatcher(
+            int maxProcessCountValue = 1,
+            bool addWebhostChannel = false,
+            Mock<IWebHostRpcWorkerChannelManager> mockwebHostLanguageWorkerChannelManager = null,
+            bool throwOnProcessStartUp = false,
+            TimeSpan? startupIntervals = null,
+            string runtime = null,
+            bool workerIndexing = false,
+            bool placeholder = false,
+            IRpcWorkerChannelFactory channelFactory = null,
+            CancellationTokenSource applicationStoppingSource = null,
+            Mock<IHostApplicationLifetime> mockApplicationLifetime = null,
+            IScriptEventManager eventManager = null)
+        {
+            eventManager ??= new ScriptEventManager();
             var metricsLogger = new Mock<IMetricsLogger>();
-            var mockApplicationLifetime = new Mock<IApplicationLifetime>();
+            var stoppingSource = applicationStoppingSource ?? new CancellationTokenSource();
+            mockApplicationLifetime ??= new Mock<IHostApplicationLifetime>();
+            mockApplicationLifetime.Setup(m => m.ApplicationStopping).Returns(stoppingSource.Token);
             var testEnv = new TestEnvironment();
             TimeSpan intervals = startupIntervals ?? TimeSpan.FromMilliseconds(100);
 
             testEnv.SetEnvironmentVariable(RpcWorkerConstants.FunctionsWorkerProcessCountSettingName, maxProcessCountValue.ToString());
 
-            if (runtime != null)
-            {
-                testEnv.SetEnvironmentVariable(EnvironmentSettingNames.FunctionWorkerRuntime, runtime);
-            }
             if (workerIndexing)
             {
                 testEnv.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebJobsFeatureFlags, ScriptConstants.FeatureFlagEnableWorkerIndexing);
@@ -665,8 +829,10 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Workers.Rpc
                 WorkerConfigs = TestHelpers.GetTestWorkerConfigs(processCountValue: maxProcessCountValue, processStartupInterval: intervals,
                                     processRestartInterval: intervals, processShutdownTimeout: TimeSpan.FromSeconds(1), workerIndexing: workerIndexing)
             };
-            IRpcWorkerChannelFactory testLanguageWorkerChannelFactory = new TestRpcWorkerChannelFactory(eventManager, _testLogger, scriptOptions.Value.RootScriptPath, throwOnProcessStartUp);
-            IWebHostRpcWorkerChannelManager testWebHostLanguageWorkerChannelManager = new TestRpcWorkerChannelManager(eventManager, _testLogger, scriptOptions.Value.RootScriptPath, testLanguageWorkerChannelFactory);
+
+            channelFactory ??= new TestRpcWorkerChannelFactory(eventManager, _testLogger, scriptOptions.Value.RootScriptPath, throwOnProcessStartUp);
+            IWebHostRpcWorkerChannelManager testWebHostLanguageWorkerChannelManager = new TestRpcWorkerChannelManager(
+                eventManager, _testLogger, scriptOptions.Value.RootScriptPath, channelFactory);
             IJobHostRpcWorkerChannelManager jobHostLanguageWorkerChannelManager = new JobHostRpcWorkerChannelManager(_testLoggerFactory);
 
             if (addWebhostChannel)
@@ -679,9 +845,15 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Workers.Rpc
             }
 
             var mockFunctionDispatcherLoadBalancer = new Mock<IRpcFunctionInvocationDispatcherLoadBalancer>();
+            mockFunctionDispatcherLoadBalancer.Setup(m => m.GetLanguageWorkerChannel(It.IsAny<IEnumerable<IRpcWorkerChannel>>()))
+                .Returns((IEnumerable<IRpcWorkerChannel> channels) => channels.FirstOrDefault());
+            var mockHostMetrics = new Mock<IHostMetrics>();
 
             _javaTestChannel = new TestRpcWorkerChannel(Guid.NewGuid().ToString(), "java", eventManager, _testLogger, false);
             var optionsMonitor = TestHelpers.CreateOptionsMonitor(workerConfigOptions);
+
+            var mockWorkerRuntimeResolver = new Mock<IWorkerRuntimeResolver>(MockBehavior.Strict);
+            mockWorkerRuntimeResolver.Setup(m => m.GetWorkerRuntime(It.IsAny<string>())).Returns(runtime);
 
             testEnv.SetEnvironmentVariable("APPLICATIONINSIGHTS_ENABLE_AGENT", "true");
             return new RpcFunctionInvocationDispatcher(scriptOptions,
@@ -690,13 +862,16 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Workers.Rpc
                 mockApplicationLifetime.Object,
                 eventManager,
                 _testLoggerFactory,
-                testLanguageWorkerChannelFactory,
+                channelFactory,
                 optionsMonitor,
                 testWebHostLanguageWorkerChannelManager,
                 jobHostLanguageWorkerChannelManager,
                 new OptionsWrapper<ManagedDependencyOptions>(new ManagedDependencyOptions()),
                 mockFunctionDispatcherLoadBalancer.Object,
-                Options.Create(new WorkerConcurrencyOptions()));
+                Options.Create(new WorkerConcurrencyOptions()),
+                Options.Create(new FunctionsHostingConfigOptions()),
+                mockHostMetrics.Object,
+                mockWorkerRuntimeResolver.Object);
         }
 
         private async Task<int> WaitForJobhostWorkerChannelsToStartup(RpcFunctionInvocationDispatcher functionDispatcher, int expectedCount, bool allReadyForInvocations = true)

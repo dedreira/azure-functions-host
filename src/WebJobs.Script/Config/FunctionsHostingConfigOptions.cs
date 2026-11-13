@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
@@ -22,9 +22,9 @@ namespace Microsoft.Azure.WebJobs.Script.Config
         public Dictionary<string, string> Features => _features;
 
         /// <summary>
-        /// Gets a value indicating whether worker concurency feature is enabled in the hosting config.
+        /// Gets a value indicating whether worker concurrency feature is enabled in the hosting config.
         /// </summary>
-        public bool FunctionsWorkerDynamicConcurrencyEnabled
+        internal bool FunctionsWorkerDynamicConcurrencyEnabled
         {
             get
             {
@@ -35,7 +35,7 @@ namespace Microsoft.Azure.WebJobs.Script.Config
         /// <summary>
         /// Gets a value indicating whether worker indexing feature is enabled in the hosting config.
         /// </summary>
-        public bool WorkerIndexingEnabled
+        internal bool WorkerIndexingEnabled
         {
             get
             {
@@ -44,9 +44,25 @@ namespace Microsoft.Azure.WebJobs.Script.Config
         }
 
         /// <summary>
+        /// Gets or Sets a value indicating whether the host should shutdown webhost worker channels during shutdown.
+        /// </summary>
+        internal bool ShutdownWebhostWorkerChannelsOnHostShutdown
+        {
+            get
+            {
+                return GetFeatureAsBooleanOrDefault(RpcWorkerConstants.ShutdownWebhostWorkerChannelsOnHostShutdown, true);
+            }
+
+            set
+            {
+                _features[RpcWorkerConstants.ShutdownWebhostWorkerChannelsOnHostShutdown] = value ? "1" : "0";
+            }
+        }
+
+        /// <summary>
         /// Gets a string delimited by '|' that contains the name of the apps with worker indexing disabled.
         /// </summary>
-        public string WorkerIndexingDisabledApps
+        internal string WorkerIndexingDisabledApps
         {
             get
             {
@@ -55,9 +71,32 @@ namespace Microsoft.Azure.WebJobs.Script.Config
         }
 
         /// <summary>
+        /// Gets a string delimited by '|' that contains the names of the language workers available through probing paths outside of the Host.
+        /// </summary>
+        internal string WorkersAvailableForDynamicResolution
+        {
+            get
+            {
+                return GetFeature(RpcWorkerConstants.WorkersAvailableForDynamicResolution) ?? string.Empty;
+            }
+        }
+
+        /// <summary>
+        /// Gets a string delimited by '|' that contains the versions of language workers to be ignored during probing outside of the Host.
+        /// Example value: "Worker1Name:Version1|Worker1Name:Version2|Worker2Name:Version1|Worker3Name:Version1".
+        /// </summary>
+        internal string IgnoredWorkerVersions
+        {
+            get
+            {
+                return GetFeature(RpcWorkerConstants.IgnoredWorkerVersions) ?? string.Empty;
+            }
+        }
+
+        /// <summary>
         /// Gets a value indicating whether Linux Log Backoff is disabled in the hosting config.
         /// </summary>
-        public bool DisableLinuxAppServiceLogBackoff
+        internal bool DisableLinuxAppServiceLogBackoff
         {
             get
             {
@@ -66,9 +105,9 @@ namespace Microsoft.Azure.WebJobs.Script.Config
         }
 
         /// <summary>
-        /// Gets or sets a value indicating whether Linux Appservice/EP Detailed Execution Event is disabled in the hosting config.
+        /// Gets or sets a value indicating whether Linux AppService/EP Detailed Execution Event is disabled in the hosting config.
         /// </summary>
-        public bool DisableLinuxAppServiceExecutionDetails
+        internal bool DisableLinuxAppServiceExecutionDetails
         {
             get
             {
@@ -77,7 +116,98 @@ namespace Microsoft.Azure.WebJobs.Script.Config
 
             set
             {
-               _features[ScriptConstants.HostingConfigDisableLinuxAppServiceDetailedExecutionEvents] = value ? "1" : "0";
+                _features[ScriptConstants.HostingConfigDisableLinuxAppServiceDetailedExecutionEvents] = value ? "1" : "0";
+            }
+        }
+
+        internal bool EnableOrderedInvocationMessages
+        {
+            get
+            {
+                return GetFeatureAsBooleanOrDefault(ScriptConstants.FeatureFlagEnableOrderedInvocationmessages, true);
+            }
+
+            set
+            {
+                _features[ScriptConstants.FeatureFlagEnableOrderedInvocationmessages] = value ? "1" : "0";
+            }
+        }
+
+        /// <summary>
+        /// Gets the highest version of extension bundle v3 supported.
+        /// </summary>
+        internal string MaximumBundleV3Version
+        {
+            get
+            {
+                return GetFeature(ScriptConstants.MaximumBundleV3Version);
+            }
+        }
+
+        /// <summary>
+        /// Gets the highest version of extension bundle v4 supported.
+        /// </summary>
+        internal string MaximumBundleV4Version
+        {
+            get
+            {
+                return GetFeature(ScriptConstants.MaximumBundleV4Version);
+            }
+        }
+
+        /// <summary>
+        /// Gets a value indicating whether the host should revert the worker shutdown behavior in the WebHostWorkerChannelManager.
+        /// </summary>
+        internal bool RevertWorkerShutdownBehavior
+        {
+            get
+            {
+                return GetFeature(RpcWorkerConstants.RevertWorkerShutdownBehavior) == "1";
+            }
+        }
+
+        internal bool ThrowOnMissingFunctionsWorkerRuntime
+        {
+            get
+            {
+                return GetFeature(RpcWorkerConstants.ThrowOnMissingFunctionsWorkerRuntime) == "1";
+            }
+        }
+
+        internal bool WorkerRuntimeStrictValidationEnabled
+        {
+            get
+            {
+                return GetFeatureAsBooleanOrDefault(RpcWorkerConstants.WorkerRuntimeStrictValidationEnabled, false);
+            }
+        }
+
+        internal bool IsDotNetInProcDisabled
+        {
+            get
+            {
+                return GetFeatureAsBooleanOrDefault(ScriptConstants.HostingConfigDotNetInProcDisabled, false);
+            }
+        }
+
+        /// <summary>
+        /// Gets the ARM webhook opt-in enforcement specification. Enforcement is enabled
+        /// when this property returns a non-empty value; the value itself is a '|'-delimited list
+        /// of extension names that are exempt from enforcement. A single <c>"|"</c> enables
+        /// enforcement with no exclusions.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// When the configuration key is not present, returns the default exemption list
+        /// (<see cref="ScriptConstants.DefaultArmWebhookOptInExemptExtensions"/>), which enables enforcement.
+        /// When the key is present but empty, enforcement is disabled.
+        /// </para>
+        /// </remarks>
+        internal string ArmWebhookOptInEnforcement
+        {
+            get
+            {
+                return GetFeatureOrDefault(ScriptConstants.HostingConfigArmWebhookOptInEnforcement, ScriptConstants.DefaultArmWebhookOptInExemptExtensions);
             }
         }
 
@@ -85,7 +215,7 @@ namespace Microsoft.Azure.WebJobs.Script.Config
         /// Gets feature by name.
         /// </summary>
         /// <param name="name">Feature name.</param>
-        /// <returns>String value from hostig configuration.</returns>
+        /// <returns>String value from hosting configuration.</returns>
         public string GetFeature(string name)
         {
             if (_features.TryGetValue(name, out string value))
@@ -93,6 +223,46 @@ namespace Microsoft.Azure.WebJobs.Script.Config
                 return value;
             }
             return null;
+        }
+
+        /// <summary>
+        /// Gets a feature by name, returning the specified default value if not found.
+        /// </summary>
+        /// <param name="name">Feature name.</param>
+        /// <param name="defaultValue">The default value to use.</param>
+        /// <returns>String value from hosting configuration.</returns>
+        public string GetFeatureOrDefault(string name, string defaultValue)
+        {
+            return GetFeature(name) ?? defaultValue;
+        }
+
+        /// <summary>
+        /// Gets a feature by name and attempts to parse it into a boolean.
+        /// Returns "True, False" or ints as booleans. Returns True for any non-zero integer.
+        /// If none of those (or empty), returns default.
+        /// </summary>
+        /// <param name="name">Feature name.</param>
+        /// <param name="defaultValue">The default value to return if the feature value cannot be parsed into a boolean.</param>
+        /// <returns>Boolean value if parse-able from hosting configuration. Otherwise, the defaultValue.</returns>
+        internal bool GetFeatureAsBooleanOrDefault(string name, bool defaultValue)
+        {
+            string featureValue = GetFeature(name);
+
+            if (string.IsNullOrWhiteSpace(featureValue))
+            {
+                return defaultValue;
+            }
+
+            if (bool.TryParse(featureValue, out bool parsedBool))
+            {
+                return parsedBool;
+            }
+
+            if (int.TryParse(featureValue, out int parsedInt))
+            {
+                return parsedInt != 0;
+            }
+            return defaultValue;
         }
     }
 }

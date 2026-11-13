@@ -6,6 +6,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text.RegularExpressions;
 using Microsoft.Azure.WebJobs.Script.Config;
+using Microsoft.Azure.WebJobs.Script.WebHost.Configuration;
 using Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -20,7 +21,9 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Diagnostics
 
         private readonly LinuxAppServiceEventGenerator _generator;
         private readonly List<string> _events;
+        private readonly int _pid = Environment.ProcessId;
         private IOptions<FunctionsHostingConfigOptions> _functionsHostingConfigOptions;
+        private IOptions<AzureMonitorLoggingOptions> _azureMonitorOptions;
 
         public LinuxAppServiceEventGeneratorTests()
         {
@@ -33,13 +36,14 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Diagnostics
             var loggerFactoryMock = new MockLinuxAppServiceFileLoggerFactory();
 
             _functionsHostingConfigOptions = Options.Create(new FunctionsHostingConfigOptions());
+            _azureMonitorOptions = Options.Create(new AzureMonitorLoggingOptions());
 
             var environmentMock = new Mock<IEnvironment>();
             environmentMock.Setup(f => f.GetEnvironmentVariable(It.Is<string>(v => v == "WEBSITE_HOSTNAME")))
                 .Returns<string>(s => _hostNameDefault);
 
             var hostNameProvider = new HostNameProvider(environmentMock.Object);
-            _generator = new LinuxAppServiceEventGenerator(loggerFactoryMock, hostNameProvider, _functionsHostingConfigOptions, writer);
+            _generator = new LinuxAppServiceEventGenerator(loggerFactoryMock, hostNameProvider, _functionsHostingConfigOptions, _azureMonitorOptions, writer);
         }
 
         public static string UnNormalize(string normalized)
@@ -63,7 +67,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Diagnostics
             var match = regex.Match(evt);
 
             Assert.True(match.Success);
-            Assert.Equal(17, match.Groups.Count);
+            Assert.Equal(18, match.Groups.Count);
 
             DateTime dt;
             var groupMatches = match.Groups.Cast<Group>().Select(p => p.Value).Skip(1).ToArray();
@@ -83,7 +87,8 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Diagnostics
                 p => Assert.Equal(exceptionMessage, LinuxContainerEventGeneratorTests.UnNormalize(p)),
                 p => Assert.Equal(functionInvocationId, p),
                 p => Assert.Equal(hostInstanceId, p),
-                p => Assert.Equal(activityId, p));
+                p => Assert.Equal(activityId, p),
+                p => Assert.Equal(_pid.ToString(), p));
         }
 
         [Theory]
@@ -143,9 +148,11 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Diagnostics
         }
 
         [Theory]
-        [MemberData(nameof(LinuxEventGeneratorTestData.GetAzureMonitorEvents), MemberType = typeof(LinuxEventGeneratorTestData))]
-        public void ParseAzureMonitoringEvents(LogLevel level, string resourceId, string operationName, string category, string regionName, string properties)
+        [MemberData(nameof(LinuxEventGeneratorTestData.GetAzureMonitorEventsForLinuxAppServiceEventGenerator), MemberType = typeof(LinuxEventGeneratorTestData))]
+        public void ParseAzureMonitoringEvents(LogLevel level, string resourceId, string operationName, string category, string regionName, string properties, bool isAzureMonitorTimeIsoFormatEnabled)
         {
+            _azureMonitorOptions.Value.IsAzureMonitorTimeIsoFormatEnabled = isAzureMonitorTimeIsoFormatEnabled;
+
             _generator.LogAzureMonitorDiagnosticLogEvent(level, resourceId, operationName, category, regionName, properties);
 
             string evt = _events.Single();
@@ -164,7 +171,11 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Diagnostics
                 p => Assert.Equal(category, p),
                 p => Assert.Equal(regionName, p),
                 p => Assert.Equal(properties, UnNormalize(p)),
-                p => Assert.True(DateTime.TryParse(p, out DateTime dt)));
+                p =>
+                {
+                    Assert.True(DateTime.TryParse(p, out DateTime dt));
+                    Assert.Equal(isAzureMonitorTimeIsoFormatEnabled, p.Contains('T'));
+                });
         }
 
         [Theory]

@@ -1,11 +1,11 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
-using Microsoft.Azure.WebJobs.Script.Workers.Profiles;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -13,34 +13,25 @@ namespace Microsoft.Azure.WebJobs.Script.Workers.Rpc
 {
     internal class LanguageWorkerOptionsSetup : IConfigureOptions<LanguageWorkerOptions>
     {
-        private readonly IConfiguration _configuration;
-        private readonly ILogger _logger;
         private readonly IEnvironment _environment;
         private readonly IMetricsLogger _metricsLogger;
-        private readonly IWorkerProfileManager _workerProfileManager;
+        private readonly IWorkerConfigurationResolver _workerConfigurationResolver;
+        private readonly IWorkerRuntimeResolver _workerRuntimeResolver;
 
-        public LanguageWorkerOptionsSetup(IConfiguration configuration,
-                                          ILoggerFactory loggerFactory,
-                                          IEnvironment environment,
+        public LanguageWorkerOptionsSetup(IEnvironment environment,
                                           IMetricsLogger metricsLogger,
-                                          IWorkerProfileManager workerProfileManager)
+                                          IWorkerConfigurationResolver workerConfigurationResolver,
+                                          IWorkerRuntimeResolver workerRuntimeResolver)
         {
-            if (loggerFactory is null)
-            {
-                throw new ArgumentNullException(nameof(loggerFactory));
-            }
-
-            _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
             _environment = environment ?? throw new ArgumentNullException(nameof(environment));
             _metricsLogger = metricsLogger ?? throw new ArgumentNullException(nameof(metricsLogger));
-            _workerProfileManager = workerProfileManager ?? throw new ArgumentNullException(nameof(workerProfileManager));
-
-            _logger = loggerFactory.CreateLogger("Host.LanguageWorkerConfig");
+            _workerConfigurationResolver = workerConfigurationResolver ?? throw new ArgumentNullException(nameof(workerConfigurationResolver));
+            _workerRuntimeResolver = workerRuntimeResolver ?? throw new ArgumentNullException(nameof(workerRuntimeResolver));
         }
 
         public void Configure(LanguageWorkerOptions options)
         {
-            string workerRuntime = _environment.GetEnvironmentVariable(RpcWorkerConstants.FunctionWorkerRuntimeSettingName);
+            string workerRuntime = _workerRuntimeResolver.GetWorkerRuntime();
 
             // Parsing worker.config.json should always be done in case of multi language worker
             if (!string.IsNullOrEmpty(workerRuntime) &&
@@ -52,8 +43,35 @@ namespace Microsoft.Azure.WebJobs.Script.Workers.Rpc
                 return;
             }
 
-            var configFactory = new RpcWorkerConfigFactory(_configuration, _logger, SystemRuntimeInformation.Instance, _environment, _metricsLogger, _workerProfileManager);
-            options.WorkerConfigs = configFactory.GetConfigs();
+            using (_metricsLogger.LatencyEvent(MetricEventNames.GetConfigs))
+            {
+                var workerDescriptionDictionary = _workerConfigurationResolver.GetWorkerConfigs();
+                options.WorkerConfigs = workerDescriptionDictionary.Values.ToList();
+            }
+        }
+    }
+
+    /// <summary>
+    /// This implementation of IPostConfigureOptions validates that LanguageWorkerOptions are not configured within the JobHost scope.
+    /// LanguageWorkerOptions should be forwarded from the parent scope.
+    /// Triggers a debug failure and logs a message if unexpected configuration is detected.
+    /// </summary>
+    internal class JobHostLanguageWorkerOptionsSetup : IPostConfigureOptions<LanguageWorkerOptions>
+    {
+        private readonly ILoggerFactory _loggerFactory;
+
+        public JobHostLanguageWorkerOptionsSetup(ILoggerFactory loggerFactory)
+        {
+            _loggerFactory = loggerFactory;
+        }
+
+        public void PostConfigure(string name, LanguageWorkerOptions options)
+        {
+            var message = "Unexpected configuration of LanguageWorkerOptions from the JobHost scope. LanguageWorkerOptions should be forwarded from the parent scope with no additional configuration.";
+            Debug.Fail(message);
+
+            var logger = _loggerFactory.CreateLogger<JobHostLanguageWorkerOptionsSetup>();
+            logger.LogInformation(message);
         }
     }
 }

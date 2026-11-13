@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
@@ -20,7 +20,6 @@ using Moq;
 using WebJobs.Script.Tests;
 using Xunit;
 using Xunit.Abstractions;
-using IApplicationLifetime = Microsoft.AspNetCore.Hosting.IApplicationLifetime;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests.Workers
 {
@@ -30,7 +29,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Workers
         private readonly ILoggerFactory _loggerFactory;
         private readonly TestEnvironment _testEnvironment;
         private readonly IOptionsMonitor<FunctionsHostingConfigOptions> _optionsMonitor;
-        private readonly IApplicationLifetime _applicationLifetime;
+        private readonly IScriptApplicationLifetime _applicationLifetime;
         private readonly ITestOutputHelper _output;
 
         public WorkerConcurrencyManagerTest(ITestOutputHelper output)
@@ -40,14 +39,13 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Workers
             _loggerFactory.AddProvider(_loggerProvider);
             _testEnvironment = new TestEnvironment();
             _testEnvironment.SetEnvironmentVariable(RpcWorkerConstants.FunctionsWorkerDynamicConcurrencyEnabled, "true");
-            _testEnvironment.SetEnvironmentVariable(RpcWorkerConstants.FunctionWorkerRuntimeSettingName, RpcWorkerConstants.PythonLanguageWorkerName);
             _testEnvironment.SetEnvironmentVariable(EnvironmentSettingNames.FunctionWorkerRuntime, RpcWorkerConstants.NodeLanguageWorkerName);
 
             var optionsMonitor = new Mock<IOptionsMonitor<FunctionsHostingConfigOptions>>();
             optionsMonitor.Setup(x => x.CurrentValue).Returns(new FunctionsHostingConfigOptions());
             _optionsMonitor = optionsMonitor.Object;
 
-            Mock<IApplicationLifetime> applicationLifetime = new Mock<IApplicationLifetime>();
+            Mock<IScriptApplicationLifetime> applicationLifetime = new Mock<IScriptApplicationLifetime>();
             applicationLifetime.Setup(x => x.StopApplication()).Verifiable();
             _applicationLifetime = applicationLifetime.Object;
 

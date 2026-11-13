@@ -4,10 +4,12 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Script.Binding;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Extensibility;
+using Microsoft.Azure.WebJobs.Script.Metrics;
 using Microsoft.Azure.WebJobs.Script.Workers;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -28,19 +30,27 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
         public WorkerFunctionDescriptorProviderTests()
         {
-            var mockApplicationLifetime = new Mock<Microsoft.AspNetCore.Hosting.IApplicationLifetime>();
+            var mockApplicationLifetime = new Mock<IScriptApplicationLifetime>();
             var mockFunctionInvocationDispatcher = new Mock<IFunctionInvocationDispatcher>();
 
             string rootPath = Path.Combine(Environment.CurrentDirectory, @"TestScripts\Node");
 
             _host = new HostBuilder().ConfigureDefaultTestWebScriptHost(b =>
             {
-                b.AddAzureStorage();
+                b.AddAzureStorageCoreServices();
+                b.AddAzureStorageBlobs();
+                b.AddAzureStorageQueues();
             },
             o =>
             {
                 o.ScriptPath = rootPath;
                 o.LogPath = TestHelpers.GetHostLogFileDirectory().Parent.FullName;
+            })
+            .ConfigureServices((context, services) =>
+            {
+                services.AddMetrics();
+                services.AddSingleton<IEnvironment>(new TestEnvironment());
+                services.AddSingleton<IHostMetrics, HostMetrics>();
             })
             .Build();
 
@@ -48,7 +58,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             scriptHost.InitializeAsync().GetAwaiter().GetResult();
 
             var config = _host.Services.GetService<IOptions<ScriptJobHostOptions>>().Value;
-            var providers = _host.Services.GetService<ICollection<IScriptBindingProvider>>();
+            var providers = _host.Services.GetService<IEnumerable<IScriptBindingProvider>>().ToArray();
 
             _provider = new TestWorkerDescriptorProvider(scriptHost, config, providers, mockFunctionInvocationDispatcher.Object,
                                 NullLoggerFactory.Instance, mockApplicationLifetime.Object, TimeSpan.FromSeconds(5));
@@ -208,7 +218,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         private class TestWorkerDescriptorProvider : WorkerFunctionDescriptorProvider
         {
             public TestWorkerDescriptorProvider(ScriptHost host, ScriptJobHostOptions config, ICollection<IScriptBindingProvider> bindingProviders,
-                            IFunctionInvocationDispatcher dispatcher, ILoggerFactory loggerFactory, Microsoft.AspNetCore.Hosting.IApplicationLifetime applicationLifetime, TimeSpan workerInitializationTimeout)
+                            IFunctionInvocationDispatcher dispatcher, ILoggerFactory loggerFactory, IScriptApplicationLifetime applicationLifetime, TimeSpan workerInitializationTimeout)
                 : base(host, config, bindingProviders, dispatcher, loggerFactory, applicationLifetime, workerInitializationTimeout)
             {
             }

@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 using System;
 using System.IO;
@@ -8,86 +8,93 @@ using System.Web.Http;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Azure.WebJobs.Script.Config;
+using Microsoft.Azure.WebJobs.Script.Tests.Integration.Fixtures;
 using Microsoft.Azure.WebJobs.Script.WebHost;
-using Microsoft.Azure.WebJobs.Script.WebHost.Configuration;
-using Microsoft.Azure.WebJobs.Script.WebHost.DependencyInjection;
-using Microsoft.Extensions.Configuration;
+using Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Options;
 using Xunit;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests.Controllers
 {
-    public class ControllerScenarioTestFixture : IAsyncLifetime, IDisposable
+    public class ControllerScenarioTestFixture : IAsyncLifetime
     {
         private ScriptSettingsManager _settingsManager;
         private HttpConfiguration _config;
+        private TemporaryScriptRoot _scriptRoot;
 
         public ScriptApplicationHostOptions HostOptions { get; private set; }
 
         public HttpClient HttpClient { get; set; }
 
-        public TestServer HttpServer { get; set; }
+        public IHost Host { get; set; }
 
-        protected virtual void ConfigureWebHostBuilder(IWebHostBuilder webHostBuilder)
-        {
-            webHostBuilder.ConfigureServices(c => c.AddSingleton(HostOptions));
-        }
-
-        public void Dispose()
-        {
-            HttpServer?.Dispose();
-            HttpClient?.Dispose();
-        }
+        protected virtual void ConfigureWebHostBuilder(IWebHostBuilder webHostBuilder) { }
 
         public virtual async Task InitializeAsync()
         {
             _config = new HttpConfiguration();
             _settingsManager = ScriptSettingsManager.Instance;
 
-            HostOptions = new ScriptApplicationHostOptions
-            {
-                IsSelfHost = true,
-                ScriptPath = Path.Combine(Environment.CurrentDirectory, "..", "..", "..", "..", "..", "sample", "csharp"),
-                LogPath = Path.Combine(Path.GetTempPath(), @"Functions"),
-                SecretsPath = Path.Combine(Path.GetTempPath(), @"FunctionsTests\Secrets"),
-                HasParentScope = true
-            };
+            string sourcePath = Path.Combine(Environment.CurrentDirectory, "..", "..", "..", "..", "sample", "csharp");
+            _scriptRoot = new TemporaryScriptRoot(sourcePath, "FunctionsControllerScenarios");
 
-            var optionsMonitor = TestHelpers.CreateOptionsMonitor(HostOptions);
-            var webHostBuilder = new WebHostBuilder()
+            var webHostBuilder = Program.CreateHostBuilder()
+                .ConfigureWebHost(webBuilder =>
+                {
+                    webBuilder.UseTestServer();
+
+                    ConfigureWebHostBuilder(webBuilder);
+                })
                 .ConfigureServices(services =>
                 {
-                    services.Replace(ServiceDescriptor.Singleton<IServiceProviderFactory<IServiceCollection>>(new WebHostServiceProviderFactory()));
-                    services.AddSingleton<IOptions<ScriptApplicationHostOptions>>(new OptionsWrapper<ScriptApplicationHostOptions>(HostOptions));
-                    services.Replace(new ServiceDescriptor(typeof(IOptionsMonitor<ScriptApplicationHostOptions>), optionsMonitor));
-                })
-                .ConfigureAppConfiguration((builderContext, config) =>
-                {
-                    config.Add(new WebScriptHostConfigurationSource
+                    services.AddSingleton<IDiagnosticEventRepository, DiagnosticEventNullRepository>();
+                    services.AddSingleton<IDiagnosticEventRepositoryFactory, TestDiagnosticEventRepositoryFactory>();
+                    services.PostConfigure<ScriptApplicationHostOptions>(o =>
                     {
-                        IsAppServiceEnvironment = SystemEnvironment.Instance.IsAppService(),
-                        IsLinuxContainerEnvironment = SystemEnvironment.Instance.IsAnyLinuxConsumption()
+                        o.IsSelfHost = true;
+                        o.ScriptPath = _scriptRoot.RootPath;
+                        o.LogPath = Path.Combine(Path.GetTempPath(), @"Functions", "ControllerScenarioTests");
+                        o.SecretsPath = Path.Combine(Path.GetTempPath(), @"FunctionsTests\Secrets");
+                        o.HasParentScope = true;
+
+                        HostOptions = o;
                     });
-                })
-                .UseStartup<Startup>()
-                .ConfigureAppConfiguration(c => c.AddEnvironmentVariables());
 
-            ConfigureWebHostBuilder(webHostBuilder);
+                    services.PostConfigure<ScriptJobHostOptions>(o =>
+                    {
+                        o.Functions = ["HttpTrigger"];
+                    });
+                });
 
-            HttpServer = new TestServer(webHostBuilder);
-            HttpClient = HttpServer.CreateClient();
+            Host = webHostBuilder.Build();
+            await Host.StartAsync();
+
+            HttpClient = Host.GetTestClient();
             HttpClient.BaseAddress = new Uri("https://localhost/");
 
-            var manager = HttpServer.Host.Services.GetService<IScriptHostManager>();
-            await manager.DelayUntilHostReady();
+            var manager = Host.Services.GetService<IScriptHostManager>();
+            await manager.DelayUntilHostReadyAsync();
         }
 
-        public Task DisposeAsync()
+        public async Task DisposeAsync()
         {
-            return Task.CompletedTask;
+            HttpClient?.Dispose();
+
+            if (Host is not null)
+            {
+                try
+                {
+                    await Host.StopAsync();
+                }
+                catch
+                {
+                }
+
+                Host.Dispose();
+            }
+
+            _scriptRoot?.Dispose();
         }
     }
 }

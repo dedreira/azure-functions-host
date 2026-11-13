@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
@@ -14,7 +14,7 @@ using Moq;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests.Workers.Rpc
 {
-    public class TestRpcWorkerChannelManager : IWebHostRpcWorkerChannelManager
+    internal class TestRpcWorkerChannelManager : IWebHostRpcWorkerChannelManager
     {
         private IScriptEventManager _eventManager;
         private ILogger _testLogger;
@@ -35,7 +35,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Workers.Rpc
             throw new System.NotImplementedException();
         }
 
-        public Dictionary<string, TaskCompletionSource<IRpcWorkerChannel>> GetChannels(string language)
+        public IDictionary<string, TaskCompletionSource<IRpcWorkerChannel>> GetChannels(string language)
         {
             if (_workerChannels.TryGetValue(language, out Dictionary<string, TaskCompletionSource<IRpcWorkerChannel>> workerChannels))
             {
@@ -96,7 +96,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Workers.Rpc
                         IRpcWorkerChannel channel = await value?.Task;
                         if (channel != null)
                         {
-                            channel.TryFailExecutions(workerException);
+                            channel.Shutdown(workerException);
                             (channel as IDisposable)?.Dispose();
                             rpcWorkerChannels.Remove(workerId);
                             return true;

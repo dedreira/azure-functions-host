@@ -80,10 +80,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Management
                 StatusCode = HttpStatusCode.OK
             });
 
-            var connectionString =
-                "DefaultEndpointsProtocol=https;AccountName=storageaccount;AccountKey=whXtW6WP8QTh84TT5wdjgzeFTj7Vc1aOiCVjTXohpE+jALoKOQ9nlQpj5C5zpgseVJxEVbaAhptP5j5DpaLgtA==";
-
-            await _meshServiceClient.MountCifs(connectionString, "sharename", "/data");
+            await _meshServiceClient.MountCifs(TestHelpers.StorageEmulatorConnectionString, "sharename", "/data");
 
             await Task.Delay(500);
 
@@ -213,6 +210,40 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Management
             _handlerMock.Protected().Verify<Task<HttpResponseMessage>>("SendAsync", Times.Once(),
                 ItExpr.Is<HttpRequestMessage>(r => IsCreateBindMountRequest(r, sourcePath, targetPath)),
                 ItExpr.IsAny<CancellationToken>());
+        }
+
+        [Fact]
+        public async Task NotifyTriggersChanged_PostsExpectedOperation()
+        {
+            HttpRequestMessage capturedRequest = null;
+            _handlerMock.Protected().Setup<Task<HttpResponseMessage>>(
+                    "SendAsync",
+                    ItExpr.IsAny<HttpRequestMessage>(),
+                    ItExpr.IsAny<CancellationToken>())
+                .Callback<HttpRequestMessage, CancellationToken>((req, _) => capturedRequest = req)
+                .ReturnsAsync(new HttpResponseMessage { StatusCode = HttpStatusCode.OK });
+
+            await _meshServiceClient.NotifyTriggersChanged();
+
+            Assert.NotNull(capturedRequest);
+            Assert.Equal(MeshInitUri, capturedRequest.RequestUri.AbsoluteUri);
+            Assert.Equal(HttpMethod.Post, capturedRequest.Method);
+
+            var formData = await capturedRequest.Content.ReadAsFormDataAsync();
+            Assert.Equal(MeshServiceClient.UpdateTriggersOperation, formData["operation"]);
+            Assert.Equal(ContainerName, capturedRequest.Headers.GetValues(ScriptConstants.ContainerInstanceHeader).Single());
+        }
+
+        [Fact]
+        public async Task NotifyTriggersChanged_NonSuccessStatus_Throws()
+        {
+            _handlerMock.Protected().Setup<Task<HttpResponseMessage>>(
+                    "SendAsync",
+                    ItExpr.IsAny<HttpRequestMessage>(),
+                    ItExpr.IsAny<CancellationToken>())
+                .ReturnsAsync(new HttpResponseMessage { StatusCode = HttpStatusCode.InternalServerError });
+
+            await Assert.ThrowsAsync<HttpRequestException>(() => _meshServiceClient.NotifyTriggersChanged());
         }
 
         [Fact]

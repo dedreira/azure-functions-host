@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System.Text;
@@ -9,10 +9,9 @@ using Microsoft.Azure.WebJobs.Script.DependencyInjection;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.Eventing;
 using Microsoft.Azure.WebJobs.Script.FileProvisioning;
-using Microsoft.Azure.WebJobs.Script.Scale;
+using Microsoft.Azure.WebJobs.Script.Host;
 using Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.Workers;
-using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -46,17 +45,20 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.DependencyInjection
                 .ExpectFactory<ExternalConfigurationStartupValidatorService>()
                 .ExpectFactory<IFileMonitoringService>()
                 .Expect<WorkerConsoleLogService>()
-                .Expect<FunctionInvocationDispatcherShutdownManager>()
-                .Expect<WorkerConcurrencyManager>()
+                .Expect<DeferredLogForwardingService>()
+                .OptionalExternal("Microsoft.Azure.WebJobs.Script.Workers.FunctionInvocationDispatcherShutdownManager", "Microsoft.Azure.WebJobs.Script.Grpc", null)
+                .OptionalExternal("Microsoft.Azure.WebJobs.Script.Workers.WorkerConcurrencyManager", "Azure.Functions.Rpc.Server", null)
+                .Optional<FunctionAppValidationService>() // Conditionally registered.
                 .Optional<FuncAppFileProvisioningService>() // Used by powershell.
                 .Optional<JobHostService>() // Missing when host is offline.
                 .Optional<FunctionsSyncService>() // Conditionally registered.
                 .OptionalExternal("Microsoft.AspNetCore.DataProtection.Internal.DataProtectionHostedService", "Microsoft.AspNetCore.DataProtection", "adb9793829ddae60") // Popularly-registered by DataProtection.
                 .OptionalExternal("Microsoft.Extensions.Diagnostics.HealthChecks.HealthCheckPublisherHostedService", "Microsoft.Extensions.Diagnostics.HealthChecks", "adb9793829ddae60") // Popularly-registered by Health Check Monitor.
-                .OptionalExternal("OpenTelemetry.Extensions.Hosting.Implementation.TelemetryHostedService", "OpenTelemetry.Extensions.Hosting", "7bd6737fe5b67e3c") // Enable OpenTelemetry.Net instrumentation library
                 .OptionalExternal("Microsoft.Azure.WebJobs.Hosting.PrimaryHostCoordinator", "Microsoft.Azure.WebJobs.Host", "31bf3856ad364e35")
                 .OptionalExternal("Microsoft.Azure.WebJobs.Host.Scale.ConcurrencyManagerService", "Microsoft.Azure.WebJobs.Host", "31bf3856ad364e35")
-                .OptionalExternal("Microsoft.Azure.WebJobs.Host.Scale.ScaleMonitorService", "Microsoft.Azure.WebJobs.Host", "31bf3856ad364e35");
+                .OptionalExternal("Microsoft.Azure.WebJobs.Host.Scale.ScaleMonitorService", "Microsoft.Azure.WebJobs.Host", "31bf3856ad364e35")
+                .OptionalExternal("OpenTelemetry.Extensions.Hosting.Implementation.TelemetryHostedService", "OpenTelemetry.Extensions.Hosting", "7bd6737fe5b67e3c") // Enable OpenTelemetry.Net instrumentation library
+                .OptionalExternal("Azure.Monitor.OpenTelemetry.Exporter.OpenTelemetryBuilderExtensions", "Azure.Monitor.OpenTelemetry.Exporter", "92742159e12e44c8"); // Enable live metrics
 
             expected.ExpectSubcollection<ILoggerProvider>()
                 .Expect<FunctionFileLoggerProvider>()

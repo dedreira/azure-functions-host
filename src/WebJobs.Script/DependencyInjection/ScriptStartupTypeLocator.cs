@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
@@ -7,19 +7,19 @@ using System.Collections.Immutable;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Text.Json;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Hosting;
+using Microsoft.Azure.WebJobs.Script.Config;
+using Microsoft.Azure.WebJobs.Script.Configuration;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.Diagnostics.Extensions;
 using Microsoft.Azure.WebJobs.Script.ExtensionBundle;
 using Microsoft.Azure.WebJobs.Script.ExtensionRequirements;
 using Microsoft.Azure.WebJobs.Script.Models;
-using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
-using Newtonsoft.Json;
-using Newtonsoft.Json.Linq;
 
 namespace Microsoft.Azure.WebJobs.Script.DependencyInjection
 {
@@ -27,7 +27,7 @@ namespace Microsoft.Azure.WebJobs.Script.DependencyInjection
     /// An implementation of an <see cref="IWebJobsStartupTypeLocator"/> that locates startup types
     /// from extension registrations.
     /// </summary>
-    public class ScriptStartupTypeLocator : IWebJobsStartupTypeLocator
+    public sealed class ScriptStartupTypeLocator : IWebJobsStartupTypeLocator
     {
         private const string ApplicationInsightsStartupType = "Microsoft.Azure.WebJobs.Extensions.ApplicationInsights.ApplicationInsightsWebJobsStartup, Microsoft.Azure.WebJobs.Extensions.ApplicationInsights, Version=1.0.0.0, Culture=neutral, PublicKeyToken=9475d07f10cb09df";
 
@@ -36,31 +36,40 @@ namespace Microsoft.Azure.WebJobs.Script.DependencyInjection
         private readonly IExtensionBundleManager _extensionBundleManager;
         private readonly IFunctionMetadataManager _functionMetadataManager;
         private readonly IMetricsLogger _metricsLogger;
+        private readonly IEnvironment _environment;
+        private readonly IOptions<ExtensionRequirementOptions> _extensionRequirementOptions;
         private readonly Lazy<IEnumerable<Type>> _startupTypes;
-        private readonly IOptionsMonitor<LanguageWorkerOptions> _languageWorkerOptions;
-
-        private static readonly ExtensionRequirementsInfo _extensionRequirements = DependencyHelper.GetExtensionRequirements();
+        private readonly WorkerConfigCacheInvalidator _workerConfigCacheInvalidator;
         private static string[] _builtinExtensionAssemblies = GetBuiltinExtensionAssemblies();
 
-        public ScriptStartupTypeLocator(string rootScriptPath, ILogger<ScriptStartupTypeLocator> logger, IExtensionBundleManager extensionBundleManager,
-            IFunctionMetadataManager functionMetadataManager, IMetricsLogger metricsLogger, IOptionsMonitor<LanguageWorkerOptions> languageWorkerOptions)
+        public ScriptStartupTypeLocator(
+            string rootScriptPath,
+            ILogger<ScriptStartupTypeLocator> logger,
+            IExtensionBundleManager extensionBundleManager,
+            IFunctionMetadataManager functionMetadataManager,
+            IMetricsLogger metricsLogger,
+            IEnvironment environment,
+            IOptions<ExtensionRequirementOptions> extensionRequirementOptions,
+            WorkerConfigCacheInvalidator workerConfigCacheInvalidator)
         {
             _rootScriptPath = rootScriptPath ?? throw new ArgumentNullException(nameof(rootScriptPath));
             _extensionBundleManager = extensionBundleManager ?? throw new ArgumentNullException(nameof(extensionBundleManager));
             _logger = logger;
             _functionMetadataManager = functionMetadataManager;
             _metricsLogger = metricsLogger;
+            _environment = environment;
+            _extensionRequirementOptions = extensionRequirementOptions;
             _startupTypes = new Lazy<IEnumerable<Type>>(() => GetExtensionsStartupTypesAsync().ConfigureAwait(false).GetAwaiter().GetResult());
-            _languageWorkerOptions = languageWorkerOptions;
+            _workerConfigCacheInvalidator = workerConfigCacheInvalidator ?? throw new ArgumentNullException(nameof(workerConfigCacheInvalidator));
         }
 
         private static string[] GetBuiltinExtensionAssemblies()
         {
-            return new[]
-            {
+            return
+            [
                 typeof(WebJobs.Extensions.Http.HttpWebJobsStartup).Assembly.GetName().Name,
                 typeof(WebJobs.Extensions.ExtensionsWebJobsStartup).Assembly.GetName().Name
-            };
+            ];
         }
 
         public Type[] GetStartupTypes()
@@ -83,36 +92,55 @@ namespace Microsoft.Azure.WebJobs.Script.DependencyInjection
             bool isPrecompiledFunctionApp = false;
 
             // dotnet app precompiled -> Do not use bundles
-            var workerConfigs = _languageWorkerOptions.CurrentValue.WorkerConfigs;
+            ExtensionRequirementsInfo extensionRequirements = GetExtensionRequirementsInfo();
+            ImmutableArray<FunctionMetadata> functionMetadataCollection = ImmutableArray<FunctionMetadata>.Empty;
+            var isLogicApp = _environment.IsLogicApp();
+
             if (bundleConfigured)
             {
                 ExtensionBundleDetails bundleDetails = await _extensionBundleManager.GetExtensionBundleDetails();
-                ValidateBundleRequirements(bundleDetails);
+                ValidateBundleRequirements(bundleDetails, extensionRequirements);
 
-                var functionMetadataCollection = _functionMetadataManager.GetFunctionMetadata(forceRefresh: true, includeCustomProviders: false, workerConfigs: workerConfigs);
-                bindingsSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-                // Generate a Hashset of all the binding types used in the function app
-                foreach (var functionMetadata in functionMetadataCollection)
+                if (isLogicApp)
                 {
-                    foreach (var binding in functionMetadata.Bindings)
+                    // Logic Apps doesn't fetch metadata here, so there's no worker about to start
+                    // that would capture stale LanguageWorkerOptions. Defer invalidation to
+                    // post-build, after the bundle's IWebJobsConfigurationStartup has contributed
+                    // its languageWorkers:* entries to the JobHost IConfiguration.
+                    _workerConfigCacheInvalidator.EnableInvalidationForNextBuild();
+                }
+                else
+                {
+                    // refresh the cache immediately before we attempt to start a worker and get metadata for bundles
+                    _workerConfigCacheInvalidator.InvalidateCacheForBundles();
+
+                    functionMetadataCollection = _functionMetadataManager.GetFunctionMetadata(forceRefresh: true, includeCustomProviders: false);
+                    bindingsSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                    foreach (var functionMetadata in functionMetadataCollection)
                     {
-                        bindingsSet.Add(binding.Type);
+                        foreach (var binding in functionMetadata.Bindings)
+                        {
+                            bindingsSet.Add(binding.Type);
+                        }
+                        isPrecompiledFunctionApp = isPrecompiledFunctionApp || functionMetadata.Language == DotNetScriptTypes.DotNetAssembly;
                     }
-                    isPrecompiledFunctionApp = isPrecompiledFunctionApp || functionMetadata.Language == DotNetScriptTypes.DotNetAssembly;
                 }
             }
 
-            if (SystemEnvironment.Instance.IsPlaceholderModeEnabled())
+            bool isDotnetIsolatedApp = Utility.IsDotnetIsolatedApp(_environment, functionMetadataCollection);
+            bool isDotnetApp = isPrecompiledFunctionApp || isDotnetIsolatedApp;
+
+            if (_environment.IsPlaceholderModeEnabled())
             {
                 // Do not move this.
-                // Calling this log statement in the placeholder mode to avoid jitting during specializtion
-                _logger.ScriptStartNotLoadingExtensionBundle("WARMUP_LOG_ONLY", bundleConfigured, isPrecompiledFunctionApp, isLegacyExtensionBundle);
+                // Calling this log statement in the placeholder mode to avoid jitting during specialization
+                _logger.ScriptStartNotLoadingExtensionBundle("WARMUP_LOG_ONLY", bundleConfigured, isPrecompiledFunctionApp, isLegacyExtensionBundle, isDotnetIsolatedApp, isLogicApp);
             }
 
             string baseProbingPath = null;
 
-            if (bundleConfigured && (!isPrecompiledFunctionApp || isLegacyExtensionBundle))
+            if (bundleConfigured && (!isDotnetApp || isLegacyExtensionBundle || isLogicApp))
             {
                 extensionsMetadataPath = await _extensionBundleManager.GetExtensionBundleBinPathAsync();
                 if (string.IsNullOrEmpty(extensionsMetadataPath))
@@ -125,12 +153,16 @@ namespace Microsoft.Azure.WebJobs.Script.DependencyInjection
             }
             else
             {
+                // we now know that we're not going to be using bundles, so we need to invalidate the worker
+                // configuration cache the next time we build the host
+                _workerConfigCacheInvalidator.EnableInvalidationForNextBuild();
+
                 extensionsMetadataPath = Path.Combine(_rootScriptPath, "bin");
                 if (Utility.TryResolveExtensionsMetadataPath(_rootScriptPath, out string resolvedPath, out baseProbingPath))
                 {
-                      extensionsMetadataPath = resolvedPath;
+                    extensionsMetadataPath = resolvedPath;
                 }
-                _logger.ScriptStartNotLoadingExtensionBundle(extensionsMetadataPath, bundleConfigured, isPrecompiledFunctionApp, isLegacyExtensionBundle);
+                _logger.ScriptStartNotLoadingExtensionBundle(extensionsMetadataPath, bundleConfigured, isPrecompiledFunctionApp, isLegacyExtensionBundle, isDotnetIsolatedApp, isLogicApp);
             }
 
             baseProbingPath ??= extensionsMetadataPath;
@@ -142,7 +174,7 @@ namespace Microsoft.Azure.WebJobs.Script.DependencyInjection
             string metadataFilePath = Path.Combine(extensionsMetadataPath, ScriptConstants.ExtensionsMetadataFileName);
 
             // parse the extensions file to get declared startup extensions
-            ExtensionReference[] extensionItems = ParseExtensions(metadataFilePath);
+            ExtensionReference[] extensionItems = await ParseExtensionsAsync(metadataFilePath);
 
             var startupTypes = new List<Type>();
 
@@ -155,9 +187,14 @@ namespace Microsoft.Azure.WebJobs.Script.DependencyInjection
                     continue;
                 }
 
-                if (!bundleConfigured
-                    || extensionItem.Bindings.Count == 0
-                    || extensionItem.Bindings.Intersect(bindingsSet, StringComparer.OrdinalIgnoreCase).Any())
+                // When no bundle is configured, or the extension declares no bindings, we always load it.
+                bool shouldLoadAllExtensions = !bundleConfigured
+                    || extensionItem.Bindings is null
+                    || extensionItem.Bindings.Count == 0;
+
+                if (shouldLoadAllExtensions
+                    // Load specific extensions if it is used by the functions in the app.
+                    || (bindingsSet is not null && extensionItem.Bindings.Intersect(bindingsSet, StringComparer.OrdinalIgnoreCase).Any()))
                 {
                     string startupExtensionName = extensionItem.Name ?? extensionItem.TypeName;
                     _logger.ScriptStartUpLoadingStartUpExtension(startupExtensionName);
@@ -213,45 +250,45 @@ namespace Microsoft.Azure.WebJobs.Script.DependencyInjection
                 }
             }
 
-            ValidateExtensionRequirements(startupTypes);
+            ValidateExtensionRequirements(startupTypes, extensionRequirements);
 
             return startupTypes;
         }
 
-        private ExtensionReference[] ParseExtensions(string metadataFilePath)
+        private async Task<ExtensionReference[]> ParseExtensionsAsync(string metadataFilePath)
         {
             using (_metricsLogger.LatencyEvent(MetricEventNames.ParseExtensions))
             {
                 if (!File.Exists(metadataFilePath))
                 {
-                    return Array.Empty<ExtensionReference>();
+                    return [];
                 }
 
                 try
                 {
-                    var extensionMetadata = JObject.Parse(File.ReadAllText(metadataFilePath));
+                    await using var stream = File.OpenRead(metadataFilePath);
+                    var extensionReferences = await JsonSerializer.DeserializeAsync(stream, ExtensionReferencesJsonContext.Default.ExtensionReferences);
 
-                    var extensionItems = extensionMetadata["extensions"]?.ToObject<List<ExtensionReference>>();
-                    if (extensionItems == null)
+                    if (extensionReferences?.Extensions == null)
                     {
                         _logger.ScriptStartUpUnableParseMetadataMissingProperty(metadataFilePath);
-                        return Array.Empty<ExtensionReference>();
+                        return [];
                     }
 
-                    return extensionItems.ToArray();
+                    return extensionReferences.Extensions;
                 }
-                catch (JsonReaderException exc)
+                catch (JsonException exc)
                 {
                     _logger.ScriptStartUpUnableParseMetadata(exc, metadataFilePath);
-
-                    return Array.Empty<ExtensionReference>();
+                    return [];
                 }
             }
         }
 
-        private void ValidateBundleRequirements(ExtensionBundleDetails bundleDetails)
+        private void ValidateBundleRequirements(ExtensionBundleDetails bundleDetails, ExtensionRequirementsInfo requirementsInfo)
         {
-            if (_extensionRequirements.BundleRequirementsByBundleId.TryGetValue(bundleDetails.Id, out BundleRequirement requirement))
+            if (requirementsInfo.BundleRequirementsByBundleId != null
+                && requirementsInfo.BundleRequirementsByBundleId.TryGetValue(bundleDetails.Id, out BundleRequirement requirement))
             {
                 var bundleVersion = new Version(bundleDetails.Version);
                 var minimumVersion = new Version(requirement.MinimumVersion);
@@ -264,20 +301,26 @@ namespace Microsoft.Azure.WebJobs.Script.DependencyInjection
             }
         }
 
-        private void ValidateExtensionRequirements(List<Type> startupTypes)
+        private void ValidateExtensionRequirements(List<Type> startupTypes, ExtensionRequirementsInfo requirementsInfo)
         {
-            var errors = new List<string>();
+            if (requirementsInfo.ExtensionRequirementsByStartupType is null)
+            {
+                return;
+            }
+
+            List<string> errors = null;
 
             void CollectError(Type extensionType, Version minimumVersion, ExtensionStartupTypeRequirement requirement)
             {
                 _logger.MinimumExtensionVersionNotSatisfied(extensionType.Name, extensionType.Assembly.FullName, minimumVersion, requirement.PackageName, requirement.MinimumPackageVersion);
                 string requirementNotMetError = $"ExtensionStartupType {extensionType.Name} from assembly '{extensionType.Assembly.FullName}' does not meet the required minimum version of {minimumVersion}. Update your NuGet package reference for {requirement.PackageName} to {requirement.MinimumPackageVersion} or later.";
+                errors ??= [];
                 errors.Add(requirementNotMetError);
             }
 
             foreach (var extensionType in startupTypes)
             {
-                if (_extensionRequirements.ExtensionRequirementsByStartupType.TryGetValue(extensionType.Name, out ExtensionStartupTypeRequirement requirement))
+                if (requirementsInfo.ExtensionRequirementsByStartupType.TryGetValue(extensionType.Name, out ExtensionStartupTypeRequirement requirement))
                 {
                     Version minimumAssemblyVersion = new Version(requirement.MinimumAssemblyVersion);
 
@@ -318,7 +361,7 @@ namespace Microsoft.Azure.WebJobs.Script.DependencyInjection
                 }
             }
 
-            if (errors.Count > 0)
+            if (errors != null && errors.Count > 0)
             {
                 var builder = new System.Text.StringBuilder();
                 builder.AppendLine("One or more loaded extensions do not meet the minimum requirements. For more information see https://aka.ms/func-min-extension-versions.");
@@ -329,6 +372,14 @@ namespace Microsoft.Azure.WebJobs.Script.DependencyInjection
 
                 throw new HostInitializationException(builder.ToString());
             }
+        }
+
+        private ExtensionRequirementsInfo GetExtensionRequirementsInfo()
+        {
+            ExtensionRequirementsInfo requirementsInfo = _extensionRequirementOptions.Value.Bundles != null || _extensionRequirementOptions.Value.Extensions != null
+                ? new ExtensionRequirementsInfo(_extensionRequirementOptions.Value.Bundles?.ToArray() ?? [], _extensionRequirementOptions.Value.Extensions?.ToArray() ?? [])
+                : DependencyHelper.GetExtensionRequirements();
+            return requirementsInfo;
         }
 
         private class TypeNameEqualityComparer : IEqualityComparer<Type>

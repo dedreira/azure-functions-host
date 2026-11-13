@@ -1,24 +1,38 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
+using System.Collections.Generic;
+using System.Collections.Immutable;
+using System.IO.Abstractions;
+using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs;
 using Microsoft.Azure.WebJobs.Host.Storage;
 using Microsoft.Azure.WebJobs.Script;
+using Microsoft.Azure.WebJobs.Script.AppCapabilities;
+using Microsoft.Azure.WebJobs.Script.Composition;
+using Microsoft.Azure.WebJobs.Script.Configuration;
+using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
+using Microsoft.Azure.WebJobs.Script.ExtensionBundle;
 using Microsoft.Azure.WebJobs.Script.Grpc;
+using Microsoft.Azure.WebJobs.Script.Metrics;
 using Microsoft.Azure.WebJobs.Script.Tests;
 using Microsoft.Azure.WebJobs.Script.WebHost;
 using Microsoft.Azure.WebJobs.Script.WebHost.DependencyInjection;
 using Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.Workers;
+using Microsoft.Azure.WebJobs.Script.Workers.Profiles;
 using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
+using Microsoft.Azure.WebJobs.Script.Workers.Rpc.Configuration;
+using Microsoft.Azure.WebJobs.Script.Workers.SharedMemoryDataTransfer;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Hosting.Internal;
 using Microsoft.Extensions.Options;
 using Moq;
-using IApplicationLifetime = Microsoft.AspNetCore.Hosting.IApplicationLifetime;
 
 namespace Microsoft.WebJobs.Script.Tests
 {
@@ -30,7 +44,8 @@ namespace Microsoft.WebJobs.Script.Tests
         }
 
         public static IHostBuilder ConfigureDefaultTestWebScriptHost(this IHostBuilder builder, Action<IWebJobsBuilder> configureWebJobs,
-            Action<ScriptApplicationHostOptions> configure = null, bool runStartupHostedServices = false, Action<IServiceCollection> configureRootServices = null)
+            Action<ScriptApplicationHostOptions> configure = null, bool runStartupHostedServices = false,
+            Action<IServiceCollection> configureRootServices = null, IWorkerComposition composition = null)
         {
             var webHostOptions = new ScriptApplicationHostOptions()
             {
@@ -50,6 +65,10 @@ namespace Microsoft.WebJobs.Script.Tests
                     o.ScriptPath = webHostOptions.ScriptPath;
                     o.LogPath = webHostOptions.LogPath;
                 });
+
+            // Sets up the HttpClient for ExtensionBundleManager.
+            services.AddHttpClient(nameof(ExtensionBundleManager));
+
             AddMockedSingleton<IDebugStateProvider>(services);
             AddMockedSingleton<IScriptHostManager>(services);
             AddMockedSingleton<IEnvironment>(services);
@@ -57,23 +76,63 @@ namespace Microsoft.WebJobs.Script.Tests
             AddMockedSingleton<IEventGenerator>(services);
             AddMockedSingleton<IFunctionInvocationDispatcherFactory>(services);
             AddMockedSingleton<IHttpWorkerService>(services);
-            AddMockedSingleton<IApplicationLifetime>(services);
             AddMockedSingleton<IDependencyValidator>(services);
+            AddMockedSingleton<ISharedMemoryManager>(services);
+            AddMockedSingleton<IFunctionDataCache>(services);
             AddMockedSingleton<IAzureBlobStorageProvider>(services);
-            AddMockedSingleton<IDiagnosticEventRepositoryFactory>(services);
+            AddMockedSingleton<IAzureTableStorageProvider>(services);
+            services.AddSingleton<IWorkerProfileManager, WorkerProfileManager>();
+            services.AddSingleton<IDiagnosticEventRepository, TestDiagnosticEventRepository>();
+            services.AddSingleton<IDiagnosticEventRepositoryFactory, TestDiagnosticEventRepositoryFactory>();
+            services.AddSingleton<ISecretManagerProvider, TestSecretManagerProvider>();
+            services.AddSingleton<IFileSystem>(FileUtility.Instance);
+            services.AddSingleton<ISystemRuntimeInformation>(SystemRuntimeInformation.Instance);
+            services.AddSingleton<IWorkerConfigurationResolver, WorkerConfigurationResolver>();
+            services.AddSingleton<IWorkerConfigurationProvider, DefaultWorkerConfigurationProvider>();
+            services.AddSingleton<IWorkerConfigurationProvider, DynamicWorkerConfigurationProvider>();
+            services.AddSingleton<IWorkerConfigurationProvider, ExplicitWorkerConfigurationProvider>();
+            services.AddSingleton<IAppCapabilitiesStore, DefaultAppCapabilitiesStore>();
+            services.AddSingleton<IOptionsChangeTokenSource<AppCapabilitiesOptions>, AppCapabilitiesChangeTokenSource>();
+            services.AddOptions<AppCapabilitiesOptions>();
+            services.ConfigureOptions<AppCapabilitiesOptionsSetup>();
+            services.AddSingleton<IValidateOptions<AppCapabilitiesOptions>, AppCapabilitiesOptionsValidator>();
+            services.AddSingleton<IWorkerRuntimeResolver, ScriptHostWorkerRuntimeResolver>();
             services.AddSingleton<HostNameProvider>();
             services.AddSingleton<IMetricsLogger>(metricsLogger);
+            services.AddSingleton<IHostApplicationLifetime, ApplicationLifetime>();
+            services.AddSingleton<IScriptApplicationLifetime, ScriptApplicationLifetime>();
+            services.AddSingleton(_ => new WorkerConfigCacheInvalidator(null, null));
             services.AddWebJobsScriptHostRouting();
             services.AddLogging();
             services.AddFunctionMetadataManager();
+            services.AddHostMetrics();
+            services.AddConfiguration();
+            services.ConfigureOptions<WorkerConfigurationResolverOptionsSetup>();
+            services.ConfigureOptions<LanguageWorkerOptionsSetup>();
 
             configureRootServices?.Invoke(services);
 
-            var rootProvider = new WebHostServiceProvider(services);
+            var rootProvider = services.BuildServiceProvider();
 
-            builder
-                .AddWebScriptHost(rootProvider, rootProvider, webHostOptions, configureWebJobs)
-                .ConfigureAppConfiguration(c =>
+            Action<IWebJobsBuilder> configureWebJobsAction = webJobsBuilder =>
+            {
+                configureWebJobs?.Invoke(webJobsBuilder);
+                if (composition is null)
+                {
+                    webJobsBuilder.Services.AddCommonRpcServices();
+                }
+            };
+
+            if (composition is null)
+            {
+                builder.AddWebScriptHost(rootProvider, services, webHostOptions, configureWebJobsAction);
+            }
+            else
+            {
+                builder.AddWebScriptHost(rootProvider, services, webHostOptions, configureWebJobsAction, composition);
+            }
+
+            builder.ConfigureAppConfiguration(c =>
                 {
                     c.AddTestSettings();
                 })
@@ -97,11 +156,28 @@ namespace Microsoft.WebJobs.Script.Tests
             return services.AddSingleton<T>(mock.Object);
         }
 
+        private static IServiceCollection AddConfiguration(this IServiceCollection services)
+        {
+            var builder = new ConfigurationBuilder();
+            services.AddSingleton<IConfiguration>(builder.Build());
+            return services;
+        }
+
+        private static IServiceCollection AddHostMetrics(this IServiceCollection services)
+        {
+            services.AddMetrics();
+            services.AddSingleton<IHostMetrics, HostMetrics>();
+            return services;
+        }
+
         private static IServiceCollection AddFunctionMetadataManager(this IServiceCollection services)
         {
-            AddMockedSingleton<IWorkerFunctionMetadataProvider>(services);
+            var workerMetadataProvider = new Mock<IWorkerFunctionMetadataProvider>();
+            workerMetadataProvider.Setup(m => m.GetFunctionMetadataAsync(It.IsAny<IEnumerable<RpcWorkerConfig>>(), It.IsAny<bool>())).Returns(Task.FromResult(new FunctionMetadataResult(true, ImmutableArray<FunctionMetadata>.Empty)));
+
             services.AddSingleton<IHostFunctionMetadataProvider, HostFunctionMetadataProvider>();
             services.AddSingleton<IFunctionMetadataProvider, FunctionMetadataProvider>();
+            services.AddSingleton<IWorkerFunctionMetadataProvider>(workerMetadataProvider.Object);
 
             services.AddSingleton<IScriptHostManager>(s =>
             {

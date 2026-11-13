@@ -23,8 +23,6 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
     [ResourceContainsSecrets]
     public class KeysController : Controller
     {
-        private const string MasterKeyName = "_master";
-
         private static readonly Lazy<Dictionary<string, string>> EmptyKeys = new Lazy<Dictionary<string, string>>(() => new Dictionary<string, string>());
         private readonly ISecretManagerProvider _secretManagerProvider;
         private readonly ILogger _logger;
@@ -71,7 +69,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
                 // Extensions that are webhook providers create their default system keys
                 // as part of host initialization (when those keys aren't already present).
                 // So we must delay key retrieval until host initialization is complete.
-                await _hostManager.DelayUntilHostReady();
+                await _hostManager.DelayUntilHostReadyAsync();
             }
 
             Dictionary<string, string> keys = await GetHostSecretsByScope(hostKeyScope);
@@ -187,7 +185,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
             }
 
             KeyOperationResult operationResult;
-            if (secretsType == ScriptSecretsType.Host && string.Equals(keyName, MasterKeyName, StringComparison.OrdinalIgnoreCase))
+            if (secretsType == ScriptSecretsType.Host && string.Equals(keyName, ScriptConstants.MasterKeyName, StringComparison.OrdinalIgnoreCase))
             {
                 operationResult = await _secretManagerProvider.Current.SetMasterKeyAsync(value);
             }
@@ -216,6 +214,8 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
                     return NotFound();
                 case OperationResult.Conflict:
                     return StatusCode(StatusCodes.Status409Conflict);
+                case OperationResult.BadRequest:
+                    return StatusCode(StatusCodes.Status400BadRequest);
                 default:
                     return StatusCode(StatusCodes.Status500InternalServerError);
             }
@@ -237,7 +237,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
                 {
                     keys = new Dictionary<string, string>(keys)
                     {
-                        { MasterKeyName, hostSecrets.MasterKey }
+                        { ScriptConstants.MasterKeyName, hostSecrets.MasterKey }
                     };
                 }
 
@@ -276,7 +276,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
 
         internal bool IsBuiltInSystemKeyName(string keyName)
         {
-            if (keyName.Equals(MasterKeyName, StringComparison.OrdinalIgnoreCase))
+            if (keyName.Equals(ScriptConstants.MasterKeyName, StringComparison.OrdinalIgnoreCase))
             {
                 return true;
             }
@@ -285,6 +285,11 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
 
         private bool IsFunction(string functionName)
         {
+            if (string.IsNullOrEmpty(functionName) || !Utility.IsValidFunctionName(functionName))
+            {
+                return false;
+            }
+
             string functionPath = Path.Combine(_applicationOptions.Value.ScriptPath, functionName);
             if (Utility.TryReadFunctionConfig(functionPath, out _, _fileSystem))
             {

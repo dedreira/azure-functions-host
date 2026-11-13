@@ -4,10 +4,8 @@
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
-using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Authorization.Policy;
-using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.Abstractions;
@@ -44,6 +42,9 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Middleware
             var functionExecution = context.Features.Get<IFunctionExecutionFeature>();
             if (functionExecution != null && !context.Response.HasStarted)
             {
+                // Identify this context
+                context.Items.TryAdd(ScriptConstants.AzureFunctionsHttpTriggerContext, null);
+
                 // LiveLogs session id is used to show only contextual logs in the "Code + Test" experience. The id is included in the custom dimension.
                 string sessionId = context.Request?.Headers[ScriptConstants.LiveLogsSessionAIKey];
                 if (!string.IsNullOrWhiteSpace(sessionId))
@@ -54,9 +55,9 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Middleware
                 int nestedProxiesCount = GetNestedProxiesCount(context, functionExecution);
                 IActionResult result = await GetResultAsync(context, functionExecution);
 
-                if (context.Items.TryGetValue(ScriptConstants.HttpProxyingEnabled, out var value))
+                if (context.Items.TryGetValue(ScriptConstants.HttpProxyingEnabled, out var httpProxyingEnabled))
                 {
-                    if (value?.ToString() == bool.TrueString)
+                    if (httpProxyingEnabled?.ToString() == bool.TrueString)
                     {
                         return;
                     }
@@ -133,14 +134,12 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Middleware
                 var scopeState = new Dictionary<string, object>()
                 {
                     [ScriptConstants.LoggerHttpRequest] = context.Request,
+                    [ScriptConstants.AzureFunctionsRequestIdKey] = context.Request.GetRequestId(),
                 };
 
                 using (logger.BeginScope(scopeState))
                 {
-                    var applicationLifetime = context.RequestServices.GetService<IApplicationLifetime>();
-                    CancellationToken cancellationToken = context.RequestAborted;
-
-                    await functionExecution.ExecuteAsync(context.Request, cancellationToken);
+                    await functionExecution.ExecuteAsync(context.Request, cancellationToken: context.RequestAborted);
 
                     if (context.Items.TryGetValue(ScriptConstants.AzureFunctionsDuplicateHttpHeadersKey, out object value))
                     {

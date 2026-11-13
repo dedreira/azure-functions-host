@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
@@ -13,5 +13,25 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Security.Authentication
     {
         public const string AuthLevelClaimType = "http://schemas.microsoft.com/2017/07/functions/claims/authlevel";
         public const string AuthLevelKeyNameClaimType = "http://schemas.microsoft.com/2017/07/functions/claims/keyid";
+
+        /// <summary>
+        /// Claim indicating whether a principal is authorized to invoke an http triggered function via a direct http
+        /// request to the function. Note that this claim will not be required for invocations triggered via the
+        /// /admin/functions/{function} API.
+        /// </summary>
+        public const string InvokeClaimType = "http://schemas.microsoft.com/2017/07/functions/claims/invoke";
+
+        /// <summary>
+        /// Claim indicating if the principal has the role to perform platform-only operations
+        /// such as unencrypted assignment and triggers retrieval.
+        /// </summary>
+        public const string FuncPlatformClaimType = "http://schemas.microsoft.com/2017/07/functions/claims/func-platform";
+
+        /// <summary>
+        /// Claim indicating that the principal was authenticated via a site token issued by the
+        /// SCM (Kudu) site. This identifies the request as originating from the same-sandbox Kudu
+        /// peer.
+        /// </summary>
+        public const string ScmSiteTokenClaimType = "http://schemas.microsoft.com/2017/07/functions/claims/scm-site";
     }
 }

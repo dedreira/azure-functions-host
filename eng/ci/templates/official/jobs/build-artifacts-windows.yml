@@ -1,0 +1,104 @@
+jobs:
+- job: BuildArtifactsWindows
+  displayName: Build Windows Artifacts
+
+  pool:
+    name: 1es-pool-azfunc
+    image: 1es-windows-2022 
+    os: windows
+
+  variables:
+    drop_path: $(Build.ArtifactStagingDirectory)
+    nuget_drop_path: $(drop_path)/nuget
+    windows_drop_path: $(drop_path)/windows
+
+  templateContext:
+    sdl:
+      binskim:
+        analyzeTargetGlob: "+:f|$(drop_path)\\**\\*.dll;+:f|$(drop_path)\\**\\*.exe;-:f|$(drop_path)\\**\\*MonoPosixHelper.dll;-:f|$(drop_path)\\**\\FunctionsNetHost.exe;-:f|$(drop_path)\\**\\grpc_csharp_ext.*.dll"
+    outputParentDirectory: $(drop_path)
+    outputs:
+    - output: pipelineArtifact
+      displayName: Publish site extension
+      path: $(windows_drop_path)
+      artifact: drop_windows
+    - output: pipelineArtifact
+      displayName: Publish nuget packages
+      path: $(nuget_drop_path)
+      artifact: drop_nuget
+
+  steps:
+  - template: /eng/ci/templates/install-dotnet.yml@self
+  - template: /eng/ci/templates/steps/build-site-ext.yml@self
+    parameters:
+      publishDir: $(windows_drop_path)
+
+  - task: DotNetCoreCLI@2
+    displayName: Build host packages
+    inputs:
+      command: custom
+      custom: pack
+      arguments: -c release -o $(nuget_drop_path)
+      projects: |
+        **/Functions.Rpc.Server.csproj
+        **/WebJobs.Script.csproj
+        **/WebJobs.Script.WebHost.csproj
+        **/WebJobs.Script.Grpc.csproj
+
+  - task: DotNetCoreCLI@2
+    displayName: Build Abstractions and ExtensionsMetadataGenerator
+    inputs:
+      command: build
+      arguments: '-c release'
+      projects: |
+        **/ExtensionsMetadataGenerator.csproj
+        **/WebJobs.Script.Abstractions.csproj
+
+  - template: ci/sign-files.yml@eng
+    parameters:
+      displayName: Sign Abstractions assemblies
+      folderPath: out/bin/WebJobs.Script.Abstractions/release
+      pattern: Microsoft.Azure.WebJobs.Script.Abstractions*.dll
+      signType: dll
+
+  - task: DotNetCoreCLI@2
+    displayName: Pack Abstractions
+    inputs:
+      command: custom
+      custom: pack
+      arguments: '--no-build -c release -o $(nuget_drop_path)'
+      projects: |
+        **/WebJobs.Script.Abstractions.csproj
+
+  - template: ci/sign-files.yml@eng
+    parameters:
+      displayName: Sign ExtensionsMetadataGenerator assemblies
+      folderPath: out/bin/ExtensionsMetadataGenerator
+      pattern: Microsoft.Azure.WebJobs.Script.ExtensionsMetadataGenerator*.dll
+      signType: dll-strong-name
+
+  - task: DotNetCoreCLI@2
+    displayName: Pack ExtensionsMetadataGenerator
+    inputs:
+      command: custom
+      custom: pack
+      arguments: '--no-build -c release -o $(nuget_drop_path)'
+      projects: |
+        **/ExtensionsMetadataGenerator.csproj
+
+  - template: ci/sign-files.yml@eng
+    parameters:
+      displayName: Sign NugetPackages
+      folderPath: $(nuget_drop_path)
+      pattern: '*.nupkg'
+      signType: nuget
+
+  - task: DeleteFiles@1
+    displayName: Delete CodeSignSummary files
+    inputs:
+      contents: '**/CodeSignSummary-*.md'
+
+  - task: DeleteFiles@1
+    displayName: Delete CodeSignSummary files
+    inputs:
+      contents: '$(nuget_package_path)/**/CodeSignSummary-*.md'

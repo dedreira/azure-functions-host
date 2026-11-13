@@ -1,16 +1,22 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
+using System.Runtime.Serialization;
 using System.Threading;
-using Microsoft.Azure.Cosmos.Table;
+using Azure;
+using Azure.Data.Tables;
 using Microsoft.Azure.WebJobs.Script.WebHost.Helpers;
 using Microsoft.Extensions.Logging;
 
 namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
 {
-    public class DiagnosticEvent : TableEntity
+    public class DiagnosticEvent : ITableEntity
     {
+        private int _hitCount;
+
+        internal const string CurrentEventVersion = "2024-05-01";
+
         public DiagnosticEvent() { }
 
         public DiagnosticEvent(string hostId, DateTime timestamp)
@@ -18,9 +24,24 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
             RowKey = TableStorageHelpers.GetRowKey(timestamp);
             PartitionKey = $"{hostId}-{timestamp:yyyyMMdd}";
             Timestamp = timestamp;
+            EventVersion = CurrentEventVersion;
         }
 
-        public int HitCount { get; set; }
+        public string PartitionKey { get; set; }
+
+        public string RowKey { get; set; }
+
+        public DateTimeOffset? Timestamp { get; set; }
+
+        public ETag ETag { get; set; }
+
+        public string EventVersion { get; set; }
+
+        public int HitCount
+        {
+            get => _hitCount;
+            set => _hitCount = value;
+        }
 
         public string Message { get; set; }
 
@@ -30,13 +51,18 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
 
         public int Level { get; set; }
 
-        [IgnoreProperty]
+        public string Details { get; set; }
+
+        [IgnoreDataMember]
         public LogLevel LogLevel
         {
             get { return (LogLevel)Level; }
             set { Level = (int)value; }
         }
 
-        public string Details { get; set; }
+        internal void IncrementHitCount()
+        {
+            Interlocked.Increment(ref _hitCount);
+        }
     }
 }

@@ -1,12 +1,15 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
+using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
 using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
+using System.Text.Json;
+using AwesomeAssertions;
 using Microsoft.Azure.WebJobs.Script.Configuration;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.Workers;
@@ -15,15 +18,17 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Microsoft.WebJobs.Script.Tests;
+using Moq;
 using Xunit;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests.Configuration
 {
     public class HttpWorkerOptionsSetupTests
     {
-        private readonly TestEnvironment _environment = new TestEnvironment();
-        private readonly TestLoggerProvider _loggerProvider = new TestLoggerProvider();
-        private readonly TestMetricsLogger _metricsLogger = new TestMetricsLogger();
+        private readonly IWorkerRuntimeResolver _workerRuntimeResolver;
+        private readonly TestEnvironment _environment = new();
+        private readonly TestLoggerProvider _loggerProvider = new();
+        private readonly TestMetricsLogger _metricsLogger = new();
         private readonly string _hostJsonFile;
         private readonly string _rootPath;
         private readonly ScriptApplicationHostOptions _options;
@@ -34,6 +39,10 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Configuration
 
         public HttpWorkerOptionsSetupTests()
         {
+            var workerRuntimeResolverMock = new Mock<IWorkerRuntimeResolver>();
+            workerRuntimeResolverMock.Setup(r => r.GetWorkerRuntime(It.IsAny<string>())).Returns("go");
+            _workerRuntimeResolver = workerRuntimeResolverMock.Object;
+
             _testLoggerProvider = new TestLoggerProvider();
             _testLoggerFactory = new LoggerFactory();
             _testLoggerFactory.AddProvider(_testLoggerProvider);
@@ -86,8 +95,8 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Configuration
         {
             File.WriteAllText(_hostJsonFile, hostJsonContent);
             var configuration = BuildHostJsonConfiguration();
-            HttpWorkerOptionsSetup setup = new HttpWorkerOptionsSetup(new OptionsWrapper<ScriptJobHostOptions>(_scriptJobHostOptions), configuration, _testLoggerFactory, _metricsLogger);
-            HttpWorkerOptions options = new HttpWorkerOptions();
+            HttpWorkerOptionsSetup setup = new(new OptionsWrapper<ScriptJobHostOptions>(_scriptJobHostOptions), configuration, _testLoggerFactory, _metricsLogger, _workerRuntimeResolver);
+            HttpWorkerOptions options = new();
             options.Description = new HttpWorkerDescription();
             options.Description.FileExists = path =>
             {
@@ -123,8 +132,8 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Configuration
         {
             File.WriteAllText(_hostJsonFile, hostJsonContent);
             var configuration = BuildHostJsonConfiguration();
-            HttpWorkerOptionsSetup setup = new HttpWorkerOptionsSetup(new OptionsWrapper<ScriptJobHostOptions>(_scriptJobHostOptions), configuration, _testLoggerFactory, _metricsLogger);
-            HttpWorkerOptions options = new HttpWorkerOptions();
+            HttpWorkerOptionsSetup setup = new(new OptionsWrapper<ScriptJobHostOptions>(_scriptJobHostOptions), configuration, _testLoggerFactory, _metricsLogger, _workerRuntimeResolver);
+            HttpWorkerOptions options = new();
             var ex = Record.Exception(() => setup.Configure(options));
             Assert.NotNull(ex);
             if (options.Description == null)
@@ -137,6 +146,46 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Configuration
                 Assert.IsType<ValidationException>(ex);
                 Assert.Equal($"WorkerDescription DefaultExecutablePath cannot be empty", ex.Message);
             }
+        }
+
+        [Theory]
+        [InlineData(0)]
+        [InlineData(1234567)]
+        public void CustomHandlerConfig_Configure_InvalidPort_ExpandEnvVars(int value)
+        {
+            HttpWorkerOptions options = new();
+
+            IConfiguration configuration = new ConfigurationBuilder()
+                .AddInMemoryCollection(new List<KeyValuePair<string, string>>()
+                        {
+                        new("AzureFunctionsJobHost:customHandler:description:defaultExecutablePath", "%TestEnv%"),
+                        new("AzureFunctionsJobHost:customHandler:port", value.ToString())
+                        }).Build();
+
+            HttpWorkerOptionsSetup setup = new(new OptionsWrapper<ScriptJobHostOptions>(_scriptJobHostOptions), configuration, _testLoggerFactory, _metricsLogger, _workerRuntimeResolver);
+
+            Action act = () =>
+                    {
+                        setup.Configure(options);
+                    };
+
+            Assert.NotNull(options.Port);
+        }
+
+        [Theory]
+        [InlineData(0)]
+        [InlineData(1234567)]
+        public void CustomHandlerConfig_Validate_InvalidPort_ExpandEnvVars(int value)
+        {
+            HttpWorkerOptions options = new() { Port = value };
+            HttpWorkerOptionsSetup setup = new(new OptionsWrapper<ScriptJobHostOptions>(_scriptJobHostOptions), new ConfigurationBuilder().Build(), _testLoggerFactory, _metricsLogger, _workerRuntimeResolver);
+
+            Action act = () =>
+            {
+                setup.Validate(nameof(options), options);
+            };
+
+            act.Should().ThrowExactly<HostConfigurationException>().WithMessage($"Unable to bind to port {value} specified in configuration. Please specify a different port or remove the section to allow dynamic binding of port.");
         }
 
         [Fact]
@@ -156,11 +205,14 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Configuration
                 Environment.SetEnvironmentVariable("TestEnv", "TestVal");
                 File.WriteAllText(_hostJsonFile, hostJsonContent);
                 var configuration = BuildHostJsonConfiguration();
-                HttpWorkerOptionsSetup setup = new HttpWorkerOptionsSetup(new OptionsWrapper<ScriptJobHostOptions>(_scriptJobHostOptions), configuration, _testLoggerFactory, _metricsLogger);
-                HttpWorkerOptions options = new HttpWorkerOptions();
+                HttpWorkerOptionsSetup setup = new(new OptionsWrapper<ScriptJobHostOptions>(_scriptJobHostOptions), configuration, _testLoggerFactory, _metricsLogger, _workerRuntimeResolver);
+                HttpWorkerOptions options = new();
                 setup.Configure(options);
+                setup.Validate(nameof(options), options);
                 Assert.Equal("TestVal", options.Description.DefaultExecutablePath);
                 Assert.Contains("TestVal", options.Description.DefaultWorkerPath);
+                Assert.NotEqual(options.Port, 0);
+                Assert.False(options.IsPortManuallySet);
             }
             finally
             {
@@ -211,8 +263,8 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Configuration
         {
             File.WriteAllText(_hostJsonFile, hostJsonContent);
             var configuration = BuildHostJsonConfiguration();
-            HttpWorkerOptionsSetup setup = new HttpWorkerOptionsSetup(new OptionsWrapper<ScriptJobHostOptions>(_scriptJobHostOptions), configuration, _testLoggerFactory, _metricsLogger);
-            HttpWorkerOptions options = new HttpWorkerOptions();
+            HttpWorkerOptionsSetup setup = new(new OptionsWrapper<ScriptJobHostOptions>(_scriptJobHostOptions), configuration, _testLoggerFactory, _metricsLogger, _workerRuntimeResolver);
+            HttpWorkerOptions options = new();
             setup.Configure(options);
 
             //Verify worker exe path is expected
@@ -258,7 +310,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Configuration
                                 'workerDirectory': 'c:/myWorkerDir'
                             }
                         }
-                    }", false, false, false)]
+                    }", false, false, false, false, 0)]
         [InlineData(@"{
                     'version': '2.0',
                     'customHandler': {
@@ -268,19 +320,47 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Configuration
                                 'workerDirectory': 'myWorkerDir'
                             }
                         }
-                    }", true, true, true)]
-        public void CustomHandler_Config_ExpectedValues_WorkerDirectory_WorkingDirectory(string hostJsonContent, bool appendCurrentDirToDefaultExe, bool appendCurrentDirToWorkingDir, bool appendCurrentDirToWorkerDir)
+                    }", true, true, true, false, 0)]
+        [InlineData(@"{
+                    'version': '2.0',
+                    'customHandler': {
+                            'description': {
+                                'defaultExecutablePath': 'node',
+                                'arguments': ['httpWorker.js'],
+                                'workingDirectory': 'myWorkingDir',
+                                'workerDirectory': 'myWorkerDir'
+                            },
+                            'port': 1234
+                        }
+                    }", true, true, true, true, 1234)]
+        [InlineData(@"{
+                    'version': '2.0',
+                    'customHandler': {
+                            'description': {
+                                'defaultExecutablePath': 'node',
+                                'workingDirectory': 'myWorkingDir',
+                                'workerDirectory': 'myWorkerDir'
+                            },
+                            'port': '5678'
+                        }
+                    }", true, true, true, true, 5678)]
+        public void CustomHandler_Config_ExpectedValues_WorkerDirectory_WorkingDirectory(string hostJsonContent, bool appendCurrentDirToDefaultExe, bool appendCurrentDirToWorkingDir, bool appendCurrentDirToWorkerDir, bool portProvided, int outputPort)
         {
+            _loggerProvider.ClearAllLogMessages();
+            var loggerFactory = new LoggerFactory();
+            loggerFactory.AddProvider(_loggerProvider);
+
             File.WriteAllText(_hostJsonFile, hostJsonContent);
             var configuration = BuildHostJsonConfiguration();
-            HttpWorkerOptionsSetup setup = new HttpWorkerOptionsSetup(new OptionsWrapper<ScriptJobHostOptions>(_scriptJobHostOptions), configuration, _testLoggerFactory, _metricsLogger);
-            HttpWorkerOptions options = new HttpWorkerOptions();
+            HttpWorkerOptionsSetup setup = new(new OptionsWrapper<ScriptJobHostOptions>(_scriptJobHostOptions), configuration, loggerFactory, _metricsLogger, _workerRuntimeResolver);
+            HttpWorkerOptions options = new();
             options.Description = new HttpWorkerDescription();
             options.Description.FileExists = path =>
             {
                 return appendCurrentDirToDefaultExe;
             };
             setup.Configure(options);
+            setup.Validate(nameof(options), options);
 
             Assert.True(_metricsLogger.LoggedEvents.Contains(MetricEventNames.CustomHandlerConfiguration));
 
@@ -313,6 +393,14 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Configuration
             {
                 Assert.Equal(@"c:/myWorkingDir", options.Description.WorkingDirectory);
             }
+
+            if (portProvided)
+            {
+                Assert.Equal(outputPort, options.Port);
+                Assert.True(options.IsPortManuallySet);
+                var logs = _loggerProvider.GetAllLogMessages();
+                Assert.True(logs.Any(l => l.FormattedMessage.Contains($"Using port {options.Port} specified via configuration for custom handler.")));
+            }
         }
 
         [Fact]
@@ -335,9 +423,9 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Configuration
                 File.WriteAllText(_hostJsonFile, hostJsonContent);
                 Environment.SetEnvironmentVariable("AzureFunctionsJobHost:httpWorker:description:defaultWorkerPath", "OneSecondTimer/run.csx");
                 Environment.SetEnvironmentVariable("AzureFunctionsJobHost:httpWorker:description:arguments", "[\"--xTest5\", \"--xTest6\", \"--xTest7\"]");
-                var configuration = BuildHostJsonConfiguration();
-                HttpWorkerOptionsSetup setup = new HttpWorkerOptionsSetup(new OptionsWrapper<ScriptJobHostOptions>(_scriptJobHostOptions), configuration, _testLoggerFactory, _metricsLogger);
-                HttpWorkerOptions options = new HttpWorkerOptions();
+                IConfiguration configuration = BuildHostJsonConfiguration();
+                HttpWorkerOptionsSetup setup = new(new OptionsWrapper<ScriptJobHostOptions>(_scriptJobHostOptions), configuration, _testLoggerFactory, _metricsLogger, _workerRuntimeResolver);
+                HttpWorkerOptions options = new();
                 setup.Configure(options);
                 Assert.Equal("dotnet", options.Description.DefaultExecutablePath);
                 // Verify options are overridden
@@ -353,8 +441,8 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Configuration
             }
             finally
             {
-                Environment.SetEnvironmentVariable("AzureFunctionsJobHost:httpWorker:description:defaultWorkerPath", string.Empty);
-                Environment.SetEnvironmentVariable("AzureFunctionsJobHost:httpWorker:description:arguments", string.Empty);
+                Environment.SetEnvironmentVariable("AzureFunctionsJobHost:httpWorker:description:defaultWorkerPath", null);
+                Environment.SetEnvironmentVariable("AzureFunctionsJobHost:httpWorker:description:arguments", null);
             }
         }
 
@@ -374,19 +462,178 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Configuration
             }
         }
 
+        [Fact]
+        public void Format_SerializesOptionsToJson()
+        {
+            var options = new HttpWorkerOptions
+            {
+                Type = CustomHandlerType.Http,
+                Port = 8080,
+                EnableForwardingHttpRequest = true,
+                EnableProxyingHttpRequest = false,
+                InitializationTimeout = TimeSpan.FromSeconds(45),
+                Description = new HttpWorkerDescription
+                {
+                    DefaultExecutablePath = "node",
+                    DefaultWorkerPath = "server.js",
+                    WorkingDirectory = "/app"
+                },
+                Arguments = new WorkerProcessArguments
+                {
+                    ExecutablePath = "node",
+                    WorkerPath = "server.js"
+                }
+            };
+
+            string json = options.Format();
+
+            Assert.NotNull(json);
+            Assert.NotEmpty(json);
+
+            var jsonDocument = JsonDocument.Parse(json);
+            Assert.NotNull(jsonDocument);
+
+            var root = jsonDocument.RootElement;
+            Assert.True(root.TryGetProperty("Type", out var typeProperty));
+            Assert.Equal(0, typeProperty.GetInt32()); // CustomHandlerType.Http = 0
+
+            Assert.True(root.TryGetProperty("Port", out var portProperty));
+            Assert.Equal(8080, portProperty.GetInt32());
+
+            Assert.True(root.TryGetProperty("EnableForwardingHttpRequest", out var forwardingProperty));
+            Assert.True(forwardingProperty.GetBoolean());
+
+            Assert.True(root.TryGetProperty("EnableProxyingHttpRequest", out var proxyingProperty));
+            Assert.False(proxyingProperty.GetBoolean());
+
+            Assert.True(root.TryGetProperty("InitializationTimeout", out var timeoutProperty));
+            Assert.Equal("00:00:45", timeoutProperty.GetString());
+
+            Assert.True(root.TryGetProperty("Description", out var descriptionProperty));
+            Assert.Equal(JsonValueKind.Object, descriptionProperty.ValueKind);
+
+            Assert.True(root.TryGetProperty("Arguments", out var argumentsProperty));
+            Assert.Equal(JsonValueKind.Object, argumentsProperty.ValueKind);
+        }
+
+        [Fact]
+        public void Format_WithNullProperties_SerializesSuccessfully()
+        {
+            var options = new HttpWorkerOptions
+            {
+                Type = CustomHandlerType.None,
+                Port = 0,
+                Description = null,
+                Arguments = null
+            };
+
+            string json = options.Format();
+
+            Assert.NotNull(json);
+            Assert.NotEmpty(json);
+
+            var jsonDocument = JsonDocument.Parse(json);
+            Assert.NotNull(jsonDocument);
+
+            var root = jsonDocument.RootElement;
+            Assert.True(root.TryGetProperty("Type", out var typeProperty));
+            Assert.Equal(1, typeProperty.GetInt32()); // CustomHandlerType.None = 1
+
+            Assert.True(root.TryGetProperty("Port", out var portProperty));
+            Assert.Equal(0, portProperty.GetInt32());
+        }
+
         private IConfiguration BuildHostJsonConfiguration(IEnvironment environment = null)
         {
-            environment = environment ?? new TestEnvironment();
-            var loggerFactory = new LoggerFactory();
+            environment ??= new TestEnvironment();
+            LoggerFactory loggerFactory = new();
             loggerFactory.AddProvider(_loggerProvider);
 
-            var configSource = new HostJsonFileConfigurationSource(_options, environment, loggerFactory, new TestMetricsLogger());
+            HostJsonFileConfigurationOptions options = new(environment, _options);
+            HostJsonFileConfigurationSource configSource = new(options, loggerFactory, new TestMetricsLogger());
 
-            var configurationBuilder = new ConfigurationBuilder()
-                .Add(configSource)
-                .Add(new ScriptEnvironmentVariablesConfigurationSource());
-
+            IConfigurationBuilder configurationBuilder = new ConfigurationBuilder()
+                .Add(configSource).Add(new ScriptEnvironmentVariablesConfigurationSource());
             return configurationBuilder.Build();
+        }
+
+        [Fact]
+        public void CustomHandler_WithValidHttpRoutes_ConfiguresRoutes()
+        {
+            string hostJsonContent = @"{
+              'version': '2.0',
+              'customHandler': {
+                 'description': {
+                    'defaultExecutablePath': 'handlerExecutable'
+                 },
+                 'http': {
+                    'routes': [
+                       { 'route': '/alpha', 'authorizationLevel': 'function' },
+                       { 'route': '{*catchAll}', 'authorizationLevel': 'function' }
+                    ]
+                 }
+              }
+            }";
+
+            File.WriteAllText(_hostJsonFile, hostJsonContent);
+            var configuration = BuildHostJsonConfiguration();
+            var setup = new HttpWorkerOptionsSetup(new OptionsWrapper<ScriptJobHostOptions>(_scriptJobHostOptions), configuration, _testLoggerFactory, _metricsLogger, _workerRuntimeResolver);
+            var options = new HttpWorkerOptions
+            {
+                Description = new HttpWorkerDescription
+                {
+                    FileExists = _ => true
+                }
+            };
+
+            setup.Configure(options);
+
+            Assert.NotNull(options.Http);
+            Assert.NotNull(options.Http.Routes);
+            Assert.Equal(2, options.Http.Routes.Count());
+            Assert.Collection(options.Http.Routes,
+                r => Assert.Equal("/alpha", r.Route),
+                r => Assert.Equal("{*catchAll}", r.Route));
+        }
+
+        [Theory]
+        [InlineData("customHandler", "custom", true)]
+        [InlineData("customHandler", "node", false)]
+        [InlineData("httpWorker", "custom", true)]
+        [InlineData("httpWorker", "node", false)]
+        public void Configure_SetsCustomRoutesEnabled_BasedOnWorkerRuntime(string section, string workerRuntime, bool expectedEnabled)
+        {
+            string hostJsonContent = $@"{{
+  'version': '2.0',
+  '{section}': {{
+     'description': {{
+        'defaultExecutablePath': 'handlerExe'
+     }},
+     'http': {{
+        'routes': [
+           {{ 'route': '/alpha', 'authorizationLevel': 'function' }}
+        ]
+     }}
+  }}
+}}";
+            File.WriteAllText(_hostJsonFile, hostJsonContent);
+
+            var workerRuntimeResolverMock = new Moq.Mock<IWorkerRuntimeResolver>();
+            workerRuntimeResolverMock.Setup(r => r.GetWorkerRuntime(It.IsAny<string>())).Returns(workerRuntime);
+
+            var configuration = BuildHostJsonConfiguration(_environment);
+            var setup = new HttpWorkerOptionsSetup(new OptionsWrapper<ScriptJobHostOptions>(_scriptJobHostOptions), configuration, _testLoggerFactory, _metricsLogger, workerRuntimeResolverMock.Object);
+            var options = new HttpWorkerOptions
+            {
+                Description = new HttpWorkerDescription
+                {
+                    FileExists = _ => true
+                }
+            };
+
+            setup.Configure(options);
+
+            Assert.Equal(expectedEnabled, options.CustomRoutesEnabled);
         }
     }
 }

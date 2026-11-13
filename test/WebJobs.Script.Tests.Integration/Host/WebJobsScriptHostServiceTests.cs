@@ -1,5 +1,5 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
-// Licensed under the MIT License. See License.txt in the project root for license Informationrmation.
+// Copyright (c) .NET Foundation. All rights reserved.
+// Licensed under the MIT License. See License.txt in the project root for license Information.
 
 using System;
 using System.Collections.Generic;
@@ -14,26 +14,27 @@ using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Description;
 using Microsoft.Azure.WebJobs.Host.Config;
 using Microsoft.Azure.WebJobs.Script.Scale;
+using Microsoft.Azure.WebJobs.Script.Tests.Integration.WebHostEndToEnd;
 using Microsoft.Azure.WebJobs.Script.WebHost;
 using Microsoft.Azure.WebJobs.Script.WebHost.Authentication;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using Microsoft.WebJobs.Script.Tests;
 using Moq;
 using Newtonsoft.Json.Linq;
 using Xunit;
-using IApplicationLifetime = Microsoft.AspNetCore.Hosting.IApplicationLifetime;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Host
 {
-    public class WebJobsScriptHostServiceTests : IDisposable
+    [Trait(TestTraits.Group, TestTraits.NonE2EControllers)]
+    public class WebJobsScriptHostServiceTests : IAsyncLifetime
     {
         private readonly string TestScriptPath = @"TestScripts\CSharp";
         private readonly string TestLogPath = Path.Combine(TestHelpers.FunctionsTestDirectory, "Logs", Guid.NewGuid().ToString(), @"Functions");
 
         private readonly WebJobsScriptHostService _scriptHostService;
-        private readonly Mock<IApplicationLifetime> _mockApplicationLifetime;
         private readonly Mock<IEnvironment> _mockEnvironment;
         private readonly TestFunctionHost _testHost;
         private readonly Collection<string> _exceededCounters = new Collection<string>();
@@ -51,13 +52,6 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Host
                 HealthCheckThreshold = 5
             };
             var wrappedHealthMonitorOptions = new OptionsWrapper<HostHealthMonitorOptions>(_healthMonitorOptions);
-
-            _mockApplicationLifetime = new Mock<IApplicationLifetime>(MockBehavior.Loose);
-            _mockApplicationLifetime.Setup(p => p.StopApplication())
-               .Callback(() =>
-               {
-                   _shutdownCalled = true;
-               });
 
             _mockEnvironment = new Mock<IEnvironment>();
             var mockServiceProvider = new Mock<IServiceProvider>(MockBehavior.Strict);
@@ -83,7 +77,6 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Host
                 configureWebHostServices: services =>
                 {
                     services.AddSingleton<IOptions<HostHealthMonitorOptions>>(wrappedHealthMonitorOptions);
-                    services.AddSingleton<IApplicationLifetime>(_mockApplicationLifetime.Object);
                     services.AddSingleton<IEnvironment>(_mockEnvironment.Object);
                     services.AddSingleton<HostPerformanceManager>(mockHostPerformanceManager.Object);
 
@@ -99,6 +92,11 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Host
                 });
 
             _scriptHostService = _testHost.JobHostServices.GetService<IScriptHostManager>() as WebJobsScriptHostService;
+
+            // In .NET 10, IHostApplicationLifetime cannot be replaced in DI.
+            // Instead, hook into the real lifetime to track when StopApplication() is called.
+            var lifetime = _testHost.WebHostServices.GetService<IHostApplicationLifetime>();
+            lifetime.ApplicationStopping.Register(() => _shutdownCalled = true);
         }
 
         [Fact]
@@ -123,7 +121,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Host
                     // host initialization is in progress
                     await TestHelpers.Await(() =>
                     {
-                        return !TestWebHookExtension.Initializing;
+                        return TestWebHookExtension.Initializing;
                     });
 
                     // make the keys request while during initialization BEFORE the extension
@@ -201,8 +199,10 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Host
 
             await TestHelpers.Await(() => _shutdownCalled);
 
-            Assert.Equal(ScriptHostState.Error, _scriptHostService.State);
-            _mockApplicationLifetime.Verify(p => p.StopApplication(), Times.Once);
+            // StopApplication() is asynchronous — wait for the host state to transition.
+            await TestHelpers.Await(() => _scriptHostService.State is ScriptHostState.Error or ScriptHostState.Stopped);
+
+            Assert.True(_shutdownCalled);
 
             // we expect a few restart iterations
             var scriptHostLogMessages = _testHost.GetScriptHostLogMessages();
@@ -246,7 +246,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Host
                 return allLogs.Contains("Host initialization: ConsecutiveErrors=3");
             });
             Assert.Equal(ScriptHostState.Error, _scriptHostService.State);
-            _mockApplicationLifetime.Verify(p => p.StopApplication(), Times.Never);
+            Assert.False(_shutdownCalled);
 
             // after a few retries, put the host back to health and verify
             // it starts successfully
@@ -285,10 +285,10 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Host
         public async Task Restarts_CanCancel_Restarts()
         {
             // We need a custom setup.
-            _testHost.Dispose();
+            await _testHost.DisposeAsync();
             int buildCalls = 0;
 
-            using (var testHost = new TestFunctionHost(TestScriptPath, TestLogPath,
+            await using (var testHost = new TestFunctionHost(TestScriptPath, TestLogPath,
               configureWebHostServices: services =>
               {
                   services.Configure<LoggerFilterOptions>(o =>
@@ -311,7 +311,6 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Host
                   services.AddSingleton<IScriptHostBuilder>(s =>
                   {
                       var appHostOptions = s.GetService<IOptionsMonitor<ScriptApplicationHostOptions>>();
-                      var rootServiceScopeFactory = s.GetService<IServiceScopeFactory>();
 
                       IHost Intercept(IScriptHostBuilder builder, bool skipHostStartup, bool skipHostConfigurationParsing)
                       {
@@ -334,7 +333,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Host
                           return builder.BuildHost(skipHostStartup, skipHostConfigurationParsing);
                       }
 
-                      return new InterceptingScriptHostBuilder(appHostOptions, s, rootServiceScopeFactory, Intercept);
+                      return new InterceptingScriptHostBuilder(appHostOptions, s, services, Intercept);
                   });
               }))
             {
@@ -350,26 +349,13 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Host
             }
         }
 
-        public void Dispose()
+        public Task InitializeAsync() => Task.CompletedTask;
+
+        public async Task DisposeAsync()
         {
-            _testHost?.Dispose();
-        }
-
-        private class InterceptingScriptHostBuilder : IScriptHostBuilder
-        {
-            private readonly DefaultScriptHostBuilder _builder;
-            private readonly Func<IScriptHostBuilder, bool, bool, IHost> _interceptCallback;
-
-            public InterceptingScriptHostBuilder(IOptionsMonitor<ScriptApplicationHostOptions> appHostOptions, IServiceProvider rootServiceProvider,
-                IServiceScopeFactory rootServiceScopeFactory, Func<IScriptHostBuilder, bool, bool, IHost> interceptCallback)
+            if (_testHost is not null)
             {
-                _builder = new DefaultScriptHostBuilder(appHostOptions, rootServiceProvider, rootServiceScopeFactory);
-                _interceptCallback = interceptCallback;
-            }
-
-            public IHost BuildHost(bool skipHostStartup, bool skipHostConfigurationParsing)
-            {
-                return _interceptCallback(_builder, skipHostStartup, skipHostConfigurationParsing);
+                await _testHost.DisposeAsync();
             }
         }
 

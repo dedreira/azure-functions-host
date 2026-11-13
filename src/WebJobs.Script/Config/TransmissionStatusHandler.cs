@@ -37,12 +37,16 @@ namespace Microsoft.Azure.WebJobs.Script.Config
         internal static string FormattedLog(object sender, TransmissionStatusEventArgs args)
         {
             var transmission = sender as Transmission;
-            var items = transmission?.TelemetryItems.GroupBy(n => n.GetEnvelopeName())
+            var items = transmission?.TelemetryItems?.GroupBy(n => n.GetEnvelopeName())
                         .Select(n => new TelemetryItem
                         {
                             Type = n.Key,
                             Count = n.Count()
                         });
+
+            // Log all the unique ikeys in the transmission, avoid storing the complete key.
+            IEnumerable<string> iKeys = transmission?.TelemetryItems?.GroupBy(n => n.Context.InstrumentationKey)
+                                        .Select(n => n.Key.Length > 24 ? $"{n.Key[..24]}************" : n.Key);
 
             IngestionServiceResponse response = null;
             if (!string.IsNullOrWhiteSpace(args?.Response?.Content))
@@ -70,7 +74,9 @@ namespace Microsoft.Azure.WebJobs.Script.Config
                 ErrorMessage = topErrorMessage,
                 ErrorCode = topStatusCode,
                 ResponseTimeInMs = args?.ResponseDurationInMs,
-                RetryAfterHeader = args?.Response?.RetryAfterHeader
+                RetryAfterHeader = args?.Response?.RetryAfterHeader,
+                EndpointAddress = transmission?.EndpointAddress.OriginalString,
+                IKeys = iKeys
             };
             return JsonSerializer.Serialize(log, LogMessageContext.Default.LogMessage);
         }
@@ -136,7 +142,11 @@ namespace Microsoft.Azure.WebJobs.Script.Config
 
         public string RetryAfterHeader { get; set; }
 
+        public string EndpointAddress { get; set; }
+
         public IEnumerable<TelemetryItem> Items { get; set; }
+
+        public IEnumerable<string> IKeys { get; set; }
     }
 
     internal class TelemetryItem

@@ -1,13 +1,16 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.ObjectModel;
 using System.IO;
 using System.Linq;
-using System.Runtime.CompilerServices;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
+using Azure.Identity;
+using Azure.Monitor.OpenTelemetry.Exporter;
 using Microsoft.ApplicationInsights.AspNetCore;
 using Microsoft.ApplicationInsights.AspNetCore.Extensions;
 using Microsoft.ApplicationInsights.DependencyCollector;
@@ -15,29 +18,40 @@ using Microsoft.ApplicationInsights.Extensibility;
 using Microsoft.ApplicationInsights.Extensibility.Implementation.ApplicationId;
 using Microsoft.Azure.WebJobs.Host;
 using Microsoft.Azure.WebJobs.Logging;
+using Microsoft.Azure.WebJobs.Script.AppCapabilities;
+using Microsoft.Azure.WebJobs.Script.Config;
 using Microsoft.Azure.WebJobs.Script.Configuration;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.Eventing;
+using Microsoft.Azure.WebJobs.Script.Metrics;
 using Microsoft.Azure.WebJobs.Script.Scale;
+using Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics.Extensions;
+using Microsoft.Azure.WebJobs.Script.Workers;
+using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
-using IApplicationLifetime = Microsoft.AspNetCore.Hosting.IApplicationLifetime;
+using OpenTelemetry.Logs;
+using OpenTelemetry.Metrics;
+using OpenTelemetry.Trace;
+using static Microsoft.Azure.WebJobs.Script.EnvironmentSettingNames;
+using AppInsightsCredentialOptions = Microsoft.Azure.WebJobs.Logging.ApplicationInsights.TokenCredentialOptions;
 
 namespace Microsoft.Azure.WebJobs.Script.WebHost
 {
     public class WebJobsScriptHostService : IHostedService, IScriptHostManager, IServiceProvider, IDisposable
     {
-        private readonly IApplicationLifetime _applicationLifetime;
+        private readonly IHostApplicationLifetime _applicationLifetime;
         private readonly IOptionsMonitor<ScriptApplicationHostOptions> _applicationHostOptions;
         private readonly IScriptWebHostEnvironment _scriptWebHostEnvironment;
         private readonly IScriptHostBuilder _scriptHostBuilder;
         private readonly ILogger _logger;
         private readonly IEnvironment _environment;
         private readonly IMetricsLogger _metricsLogger;
+        private readonly WorkerConfigCacheInvalidator _workerConfigCacheInvalidator;
         private readonly HostPerformanceManager _performanceManager;
         private readonly IOptions<HostHealthMonitorOptions> _healthMonitorOptions;
         private readonly IConfiguration _config;
@@ -46,8 +60,17 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
         private readonly SemaphoreSlim _hostStartSemaphore = new SemaphoreSlim(1, 1);
         private readonly TaskCompletionSource<bool> _hostStartedSource = new TaskCompletionSource<bool>();
         private readonly Task _hostStarted;
-        private IScriptEventManager _eventManager;
+        private readonly IHostMetrics _hostMetrics;
+        private readonly IOptions<FunctionsHostingConfigOptions> _hostingConfigOptions;
+        private readonly bool _originalStandbyModeValue;
+        private readonly string _originalFunctionsWorkerRuntime;
+        private readonly string _originalFunctionsWorkerRuntimeVersion;
+        private readonly IAppCapabilitiesStore _appCapabilitiesStore;
+        private readonly IWorkerRuntimeResolver _workerRuntimeResolver;
+        // we're only using this dictionary's keys so it acts as a "ConcurrentHashSet"
+        private readonly ConcurrentDictionary<ScriptHostStartupOperation, byte> _activeStartupOperations = new();
 
+        private IScriptEventManager _eventManager;
         private IHost _host;
         private ScriptHostState _state;
         private CancellationTokenSource _startupLoopTokenSource;
@@ -60,10 +83,23 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
         private int _applicationStopping;
         private int _applicationStopped;
 
-        public WebJobsScriptHostService(IOptionsMonitor<ScriptApplicationHostOptions> applicationHostOptions, IScriptHostBuilder scriptHostBuilder, ILoggerFactory loggerFactory,
-            IScriptWebHostEnvironment scriptWebHostEnvironment, IEnvironment environment,
-            HostPerformanceManager hostPerformanceManager, IOptions<HostHealthMonitorOptions> healthMonitorOptions,
-            IMetricsLogger metricsLogger, IApplicationLifetime applicationLifetime, IConfiguration config, IScriptEventManager eventManager)
+        public WebJobsScriptHostService(
+            IOptionsMonitor<ScriptApplicationHostOptions> applicationHostOptions,
+            IScriptHostBuilder scriptHostBuilder,
+            ILoggerFactory loggerFactory,
+            IScriptWebHostEnvironment scriptWebHostEnvironment,
+            IEnvironment environment,
+            HostPerformanceManager hostPerformanceManager,
+            IOptions<HostHealthMonitorOptions> healthMonitorOptions,
+            IMetricsLogger metricsLogger,
+            IHostApplicationLifetime applicationLifetime,
+            IConfiguration config,
+            IScriptEventManager eventManager,
+            IHostMetrics hostMetrics,
+            IWorkerRuntimeResolver workerRuntimeResolver,
+            IOptions<FunctionsHostingConfigOptions> hostingConfigOptions,
+            WorkerConfigCacheInvalidator workerConfigCacheInvalidator,
+            IAppCapabilitiesStore appCapabilitiesStore)
         {
             ArgumentNullException.ThrowIfNull(loggerFactory);
 
@@ -74,6 +110,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             RegisterApplicationLifetimeEvents();
 
             _metricsLogger = metricsLogger;
+            _workerConfigCacheInvalidator = workerConfigCacheInvalidator ?? throw new ArgumentNullException(nameof(workerConfigCacheInvalidator));
             _applicationHostOptions = applicationHostOptions ?? throw new ArgumentNullException(nameof(applicationHostOptions));
             _scriptWebHostEnvironment = scriptWebHostEnvironment ?? throw new ArgumentNullException(nameof(scriptWebHostEnvironment));
             _scriptHostBuilder = scriptHostBuilder ?? throw new ArgumentNullException(nameof(scriptHostBuilder));
@@ -83,6 +120,8 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             _logger = loggerFactory.CreateLogger(ScriptConstants.LogCategoryHostGeneral);
             _config = config ?? throw new ArgumentNullException(nameof(config));
             _eventManager = eventManager;
+            _hostMetrics = hostMetrics ?? throw new ArgumentNullException(nameof(hostMetrics));
+            _appCapabilitiesStore = appCapabilitiesStore ?? throw new ArgumentNullException(nameof(appCapabilitiesStore));
 
             _hostStarted = _hostStartedSource.Task;
 
@@ -93,6 +132,17 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
                 _healthCheckWindow = new SlidingWindow<bool>(_healthMonitorOptions.Value.HealthCheckWindow);
                 _hostHealthCheckTimer = new Timer(OnHostHealthCheckTimer, null, TimeSpan.Zero, _healthMonitorOptions.Value.HealthCheckInterval);
             }
+
+            _hostingConfigOptions = hostingConfigOptions;
+
+            _workerRuntimeResolver = workerRuntimeResolver ?? throw new ArgumentNullException(nameof(workerRuntimeResolver));
+            // we'll use this to emit telemetry on if and how this process has been specialized
+            _originalStandbyModeValue = _scriptWebHostEnvironment.InStandbyMode;
+            // Read directly from environment rather than through _workerRuntimeResolver to avoid
+            // a circular dependency: this constructor → resolver.GetWorkerRuntime() →
+            // IScriptHostManager → WebJobsScriptHostService (this class).
+            _originalFunctionsWorkerRuntime = _environment.GetEnvironmentVariable(EnvironmentSettingNames.FunctionWorkerRuntime) ?? string.Empty;
+            _originalFunctionsWorkerRuntimeVersion = _environment.GetEnvironmentVariable(RpcWorkerConstants.FunctionWorkerRuntimeVersionSettingName);
         }
 
         public event EventHandler HostInitializing;
@@ -193,7 +243,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             }
         }
 
-        private void CheckFileSystem()
+        private async Task CheckFileSystemAsync()
         {
             if (_environment.ZipDeploymentAppSettingsExist())
             {
@@ -216,10 +266,44 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
                     }
                     finally
                     {
-                        _logger.LogError(errorPrefix + errorSuffix);
+                        var errorMessage = $"{errorPrefix}{errorSuffix}";
+
+                        _logger.LogError(errorMessage);
+                        await LogErrorWithTransientOtelLoggerAsync(errorMessage);
                     }
                     _applicationLifetime.StopApplication();
                 }
+            }
+        }
+
+        private void ValidateLinuxSKUConfiguration(ILogger logger)
+        {
+            var websiteRunFromPackageValue = _environment.GetEnvironmentVariable(AzureWebsiteRunFromPackage);
+            var scmRunFromPackageValue = _environment.GetEnvironmentVariable(ScmRunFromPackage);
+
+            if (string.IsNullOrEmpty(websiteRunFromPackageValue) &&
+                string.IsNullOrEmpty(scmRunFromPackageValue) &&
+                _environment.IsLinuxConsumptionOnAtlas() &&
+                !_environment.IsManagedAppEnvironment())
+            {
+                logger?.LogError($"Unable to load the functions payload since the app was not provisioned with valid {AzureWebJobsSecretStorage} connection string.");
+            }
+
+            var functionsTimeZone = _environment.GetEnvironmentVariable(EnvironmentSettingNames.FunctionsTimeZone);
+            var functionsWebsiteTimeZone = _environment.GetEnvironmentVariable(EnvironmentSettingNames.FunctionsWebsiteTimeZone);
+
+            // If we have a linux consumption app and the time zone env variable is set, log a warning and diagnostic event
+            if (_environment.IsLinuxConsumptionOnAtlas() &&
+                (!string.IsNullOrEmpty(functionsTimeZone) ||
+                !string.IsNullOrEmpty(functionsWebsiteTimeZone)))
+            {
+                string message = Script.Properties.Resources.LinuxConsumptionRemoveTimeZone;
+
+                // Log diagnostic event
+                logger?.LogDiagnosticEventError(DiagnosticEventConstants.LinuxConsumptionTimeZoneErrorCode, message, DiagnosticEventConstants.LinuxConsumptionTimeZoneErrorHelpLink, new InvalidOperationException(message));
+
+                // Log warning so this message goes to App insights
+                logger?.LogWarning(message);
             }
         }
 
@@ -227,7 +311,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             JobHostStartupMode startupMode = JobHostStartupMode.Normal, Guid? parentOperationId = null)
         {
             // Add this to the list of trackable startup operations. Restarts can use this to cancel any ongoing or pending operations.
-            var activeOperation = ScriptHostStartupOperation.Create(cancellationToken, _logger, parentOperationId);
+            var activeOperation = BeginStartupOperation(cancellationToken, parentOperationId);
 
             using (_metricsLogger.LatencyEvent(MetricEventNames.ScriptHostManagerStartService))
             {
@@ -244,7 +328,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
                 }
                 finally
                 {
-                    activeOperation.Dispose();
+                    EndStartupOperation(activeOperation);
                     _hostStartSemaphore.Release();
                 }
             }
@@ -255,9 +339,28 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
         /// before calling this method. Host starts and restarts must be synchronous to prevent orphaned
         /// hosts or an incorrect ActiveHost.
         /// </summary>
-        private async Task UnsynchronizedStartHostAsync(ScriptHostStartupOperation activeOperation, int attemptCount = 0, JobHostStartupMode startupMode = JobHostStartupMode.Normal)
+        private Task UnsynchronizedStartHostAsync(ScriptHostStartupOperation activeOperation, int attemptCount = 0, JobHostStartupMode startupMode = JobHostStartupMode.Normal)
         {
-            CheckFileSystem();
+            // We may be started from a variety of contexts, some of which may carry AsyncLocal state (such as Activity). We do not want any of this
+            // to flow into the host startup logic, so we suppress the flow of the ExecutionContext.
+            Task start;
+            using (System.Threading.ExecutionContext.SuppressFlow())
+            {
+                start = UnsynchronizedStartHostCoreAsync(activeOperation, attemptCount, startupMode);
+            }
+
+            return start;
+        }
+
+        /// <summary>
+        /// Starts the host without taking a lock. Callers must take a lock on _hostStartSemaphore
+        /// before calling this method. Host starts and restarts must be synchronous to prevent orphaned
+        /// hosts or an incorrect ActiveHost.
+        /// </summary>
+        private async Task UnsynchronizedStartHostCoreAsync(ScriptHostStartupOperation activeOperation, int attemptCount, JobHostStartupMode startupMode)
+        {
+            await Task.Yield(); // ensure any async context is properly suppressed.
+            await CheckFileSystemAsync();
             if (ShutdownRequested)
             {
                 return;
@@ -295,6 +398,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
                 }
 
                 ActiveHost = localHost;
+                _workerConfigCacheInvalidator.InvalidateCachePostBuildIfEnabled();
 
                 var scriptHost = (ScriptHost)ActiveHost.Services.GetService<ScriptHost>();
                 if (scriptHost != null)
@@ -310,6 +414,8 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
                 }
 
                 LogInitialization(localHost, isOffline, attemptCount, ++_hostStartCount, activeOperation.Id);
+
+                ValidateLinuxSKUConfiguration(GetHostLogger(localHost));
 
                 if (!_scriptWebHostEnvironment.InStandbyMode)
                 {
@@ -365,6 +471,11 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
                 }
 
                 attemptCount++;
+
+                if (attemptCount > 3)
+                {
+                    _hostMetrics.AppFailure();
+                }
 
                 if (ShutdownHostIfUnhealthy())
                 {
@@ -466,8 +577,10 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             State = ScriptHostState.Stopped;
         }
 
-        public async Task RestartHostAsync(CancellationToken cancellationToken)
+        public async Task RestartHostAsync(string reason, CancellationToken cancellationToken)
         {
+            ArgumentException.ThrowIfNullOrWhiteSpace(reason);
+
             if (ShutdownRequested)
             {
                 return;
@@ -483,11 +596,11 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
                     await _hostStarted;
                 }
 
-                _logger.EnteringRestart();
+                _logger.EnteringRestart(reason);
 
                 // If anything is mid-startup, cancel it.
                 _startupLoopTokenSource?.Cancel();
-                foreach (var startupOperation in ScriptHostStartupOperation.ActiveOperations)
+                foreach (var startupOperation in _activeStartupOperations.Keys)
                 {
                     _logger.CancelingStartupOperationForRestart(startupOperation.Id);
                     try
@@ -515,15 +628,18 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
 
                     var previousHost = ActiveHost;
                     ActiveHost = null;
+                    _appCapabilitiesStore.Clear();
 
-                    using (var activeOperation = ScriptHostStartupOperation.Create(cancellationToken, _logger))
+                    var activeOperation = BeginStartupOperation(cancellationToken);
+
+                    try
                     {
                         Task startTask, stopTask;
 
                         // If we are running in development mode with core tools, do not overlap the restarts.
                         // Overlapping restarts are problematic when language worker processes are listening
                         // to the same debug port
-                        if (ShouldEnforceSequentialRestart())
+                        if (ShouldEnforceSequentialRestart(previousHost))
                         {
                             stopTask = Orphan(previousHost, cancellationToken);
                             await stopTask;
@@ -531,11 +647,16 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
                         }
                         else
                         {
+                            await NotifyHostStoppingAsync(previousHost, cancellationToken);
                             startTask = UnsynchronizedStartHostAsync(activeOperation);
                             stopTask = Orphan(previousHost, cancellationToken);
                         }
 
                         await startTask;
+                    }
+                    finally
+                    {
+                        EndStartupOperation(activeOperation);
                     }
 
                     _logger.Restarted();
@@ -558,16 +679,20 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             }
         }
 
-        internal bool ShouldEnforceSequentialRestart()
+        // Because we fire-and-forget the host disposal, we cannot be guaranteed when it will be stopped
+        // or disposed. Use this method to explicitly stop any services in the host that may be
+        // problematic to run side-by-side with the new host that is starting.
+        private static Task NotifyHostStoppingAsync(IHost previousHost, CancellationToken cancellationToken)
         {
-            var sequentialRestartSetting = _config.GetSection(ConfigurationSectionNames.SequentialJobHostRestart);
-            if (sequentialRestartSetting != null)
-            {
-                bool.TryParse(sequentialRestartSetting.Value, out bool enforceSequentialOrder);
-                return enforceSequentialOrder;
-            }
+            var scriptHost = previousHost?.Services?.GetService<ScriptHost>();
+            return scriptHost?.NotifyStoppingAsync(cancellationToken) ?? Task.CompletedTask;
+        }
 
-            return false;
+        internal bool ShouldEnforceSequentialRestart(IHost host = null)
+        {
+            var options = host?.Services?.GetService<IOptions<ScriptHostRecycleOptions>>().Value;
+            options ??= ScriptHostRecycleOptions.Create(_config);
+            return options.SequentialHostRestartRequired;
         }
 
         private void OnHostInitializing(object sender, EventArgs e)
@@ -629,7 +754,20 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
 
             // Attempt to get the host logger with JobHost configuration applied
             // using the default logger as a fallback
-            return hostLoggerFactory?.CreateLogger(LogCategories.Startup) ?? _logger;
+            if (hostLoggerFactory is not null)
+            {
+                return hostLoggerFactory?.CreateLogger(LogCategories.Startup);
+            }
+
+            // An error occurred before the host was built; a minimal logger factory is being created to send telemetry to AppInsights/Otel.
+            var otelLoggerFactory = BuildOtelLoggerFactory();
+
+            // If the Otel logger factory is null, use the fallback logger instead. These logs will not be accessible in AppInsights/Otel.
+            if (otelLoggerFactory is null)
+            {
+                return _logger;
+            }
+            return new CompositeLogger(_logger, otelLoggerFactory.CreateLogger(LogCategories.Startup));
         }
 
         private void LogInitialization(IHost host, bool isOffline, int attemptCount, int startCount, Guid operationId)
@@ -651,6 +789,44 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
                 // Reading the string from resources to make sure resource loading code path is warmed up during placeholder as well.
                 logger.InStandByMode(operationId);
             }
+
+            LogInitializationSettings(logger, _metricsLogger, _environment, _scriptWebHostEnvironment, _hostingConfigOptions.Value, _originalStandbyModeValue, _originalFunctionsWorkerRuntime, _originalFunctionsWorkerRuntimeVersion);
+        }
+
+        internal static void LogInitializationSettings(ILogger logger, IMetricsLogger metricsLogger, IEnvironment environment, IScriptWebHostEnvironment scriptWebHostEnvironment, FunctionsHostingConfigOptions hostingConfigOptions, bool originalStandbyModeValue,
+            string originalFunctionsWorkerRuntime, string originalFunctionsWorkerRuntimeVersion)
+        {
+            // Log settings
+            var functionWorkerRuntime = environment.GetEnvironmentVariable(FunctionWorkerRuntime);
+            var functionWorkerRuntimeVersion = environment.GetEnvironmentVariable(RpcWorkerConstants.FunctionWorkerRuntimeVersionSettingName);
+            var functionExtensionVersion = environment.GetEnvironmentVariable(FunctionsExtensionVersion);
+            var currentDirectory = Directory.GetCurrentDirectory();
+            var inStandbyMode = scriptWebHostEnvironment.InStandbyMode;
+            var hasBeenSpecialized = originalStandbyModeValue && !inStandbyMode;
+            var usePlaceholderDotNetIsolated = environment.UsePlaceholderDotNetIsolated();
+            var websiteSku = environment.GetEnvironmentVariable(AzureWebsiteSku);
+            var featureFlags = environment.GetEnvironmentVariable(AzureWebJobsFeatureFlags);
+            var hostingConfigDict = hostingConfigOptions.Features;
+            var adminIsolationEnabled = environment.IsAdminIsolationEnabled();
+            var functionsSiteUpdateId = environment.GetFunctionsSiteUpdateId();
+
+            string hisMode = "Disabled";
+            if (FeatureFlags.IsEnabled(ScriptConstants.FeatureFlagStrictHISModeEnabled))
+            {
+                hisMode = "Strict";
+                metricsLogger.LogEvent(MetricEventNames.HISStrictModeEnabled);
+                logger.LogDebug($"HIS Strict mode enabled.");
+            }
+            else if (FeatureFlags.IsEnabled(ScriptConstants.FeatureFlagStrictHISModeWarn))
+            {
+                hisMode = "Warn";
+                metricsLogger.LogEvent(MetricEventNames.HISStrictModeWarn);
+                logger.LogDebug($"HIS Warn mode enabled.");
+            }
+
+            logger.LogHostInitializationSettings(originalFunctionsWorkerRuntime, functionWorkerRuntime, originalFunctionsWorkerRuntimeVersion, functionWorkerRuntimeVersion,
+                functionExtensionVersion, currentDirectory, inStandbyMode, hasBeenSpecialized, usePlaceholderDotNetIsolated, websiteSku, featureFlags, hostingConfigDict, hisMode, adminIsolationEnabled,
+                functionsSiteUpdateId);
         }
 
         private void OnHostHealthCheckTimer(object state)
@@ -665,7 +841,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
                 // fail and we'll enter a restart loop (exponentially backing off)
                 // until the host is healthy again and we can resume host processing.
                 _logger.UnhealthyRestart();
-                var tIgnore = RestartHostAsync(CancellationToken.None);
+                var tIgnore = RestartHostAsync("Host health check detected an unhealthy host.", CancellationToken.None);
             }
         }
 
@@ -773,6 +949,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
                 else
                 {
                     DisposeDependencyTrackingModule(instance);
+                    FlushOpenTelemetry(instance);
                     instance.Dispose();
                     _logger.LogDebug("ScriptHost disposed");
                 }
@@ -814,8 +991,6 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
                     {
                         _logger.LogDebug("Application Stopping: initiate drain mode");
                         drainModeManager.EnableDrainModeAsync(CancellationToken.None);
-                        // Workaround until https://github.com/Azure/azure-functions-host/issues/7188 is addressed.
-                        Thread.Sleep(TimeSpan.FromMinutes(10));
                     }
                 }
             });
@@ -859,6 +1034,138 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
         public object GetService(Type serviceType)
         {
             return Services?.GetService(serviceType);
+        }
+
+        private void FlushOpenTelemetry(IHost host)
+        {
+            var logger = GetHostLogger(host);
+            foreach (var meterProvider in host.Services.GetServices<MeterProvider>())
+            {
+                logger.LogDebug(@"Flushing {providerName} ...", meterProvider);
+                meterProvider.ForceFlush();
+            }
+
+            foreach (var tracerProvider in host.Services.GetServices<TracerProvider>())
+            {
+                logger.LogDebug(@"Flushing {providerName} ...", tracerProvider);
+                tracerProvider.ForceFlush();
+            }
+
+            foreach (var loggerProvider in host.Services.GetServices<LoggerProvider>())
+            {
+                logger.LogDebug(@"Flushing {providerName} ...", loggerProvider);
+                loggerProvider.ForceFlush();
+            }
+        }
+
+        /// <summary>
+        /// Creates a new startup operation and adds it to the list of active operations. This operation should be completed by
+        /// calling <see cref="EndStartupOperation(ScriptHostStartupOperation)"/>."/>.
+        /// </summary>
+        /// <param name="parentToken">A CancellationToken to link to this operation. It can be canceled via the <see cref="ScriptHostStartupOperation.CancellationTokenSource"/> property.</param>
+        /// <param name="parentId">The Id of the parent operation if this one is being created due to a startup exception.</param>
+        /// <returns>The operation.</returns>
+        private ScriptHostStartupOperation BeginStartupOperation(CancellationToken parentToken, Guid? parentId = null)
+        {
+            var operation = new ScriptHostStartupOperation(parentToken, parentId);
+            _activeStartupOperations.TryAdd(operation, byte.MinValue);
+            _logger.StartupOperationCreated(operation.Id, operation.ParentId);
+            return operation;
+        }
+
+        /// <summary>
+        /// Removes the startup operation from the list of active operations and disposes of it.
+        /// </summary>
+        /// <param name="operation">The operation to complete.</param>
+        private void EndStartupOperation(ScriptHostStartupOperation operation)
+        {
+            if (_activeStartupOperations.TryRemove(operation, out _))
+            {
+                operation.Dispose();
+            }
+
+            _logger.StartupOperationCompleted(operation.Id);
+        }
+
+        private async Task LogErrorWithTransientOtelLoggerAsync(string log)
+        {
+            var loggerFactory = BuildOtelLoggerFactory();
+
+            if (loggerFactory is not null)
+            {
+                var logger = loggerFactory.CreateLogger(ScriptConstants.LogCategoryHostGeneral);
+                logger.LogError(log);
+
+                // Delay increases the chance that the log is sent to AppInsights/Otel before the logger factory is disposed
+                await Task.Delay(2000);
+                // Do a force flush as the host is shutting down and we want to ensure the logs are sent before disposing the logger factory
+                ForceFlush(loggerFactory);
+                // Give some time for the logger to flush
+                await Task.Delay(4000);
+            }
+        }
+
+        private ILoggerFactory BuildOtelLoggerFactory()
+        {
+            var appInsightsConnStr = GetConfigurationValue(AppInsightsConnectionString, _config);
+            var otlpEndpoint = GetConfigurationValue(OtlpEndpoint, _config);
+            if (appInsightsConnStr is not { Length: > 0 } && otlpEndpoint is not { Length: > 0 })
+            {
+                return null; // Nothing configured
+            }
+
+            // Create a minimal logger factory with OpenTelemetry and Azure Monitor exporter
+            return LoggerFactory.Create(builder =>
+            {
+                builder.AddOpenTelemetry(logging =>
+                {
+                    logging.IncludeScopes = true;
+                    logging.IncludeFormattedMessage = true;
+
+                    if (appInsightsConnStr is { Length: > 0 })
+                    {
+                        logging.AddAzureMonitorLogExporter(options =>
+                        {
+                            options.ConnectionString = appInsightsConnStr;
+
+                            var appInsightsAuthStr = GetConfigurationValue(AppInsightsAuthenticationString, _config);
+                            if (appInsightsAuthStr is { Length: > 0 })
+                            {
+                                var credOptions = AppInsightsCredentialOptions.ParseAuthenticationString(appInsightsAuthStr);
+                                options.Credential = new ManagedIdentityCredential(credOptions.ClientId);
+                            }
+                        });
+                    }
+
+                    if (otlpEndpoint is { Length: > 0 })
+                    {
+                        logging.AddOtlpExporter();
+                    }
+                });
+            });
+        }
+
+        private void ForceFlush(ILoggerFactory loggerFactory)
+        {
+            var serviceProvider = (IServiceProvider)loggerFactory.GetType()
+            .GetField("_serviceProvider", BindingFlags.NonPublic | BindingFlags.Instance)
+            .GetValue(loggerFactory);
+
+            // Get all logger providers from the service provider
+            var providers = serviceProvider?.GetServices<ILoggerProvider>() ?? Enumerable.Empty<ILoggerProvider>();
+
+            foreach (var provider in providers)
+            {
+                if (provider is OpenTelemetryLoggerProvider otelProvider)
+                {
+                    otelProvider.Dispose();
+                }
+            }
+        }
+
+        private static string GetConfigurationValue(string key, IConfiguration configuration = null)
+        {
+            return configuration?[key] ?? Environment.GetEnvironmentVariable(key);
         }
 
         protected virtual void Dispose(bool disposing)

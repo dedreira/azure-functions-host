@@ -27,7 +27,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
 {
     /// <summary>
     /// Controller responsible for administrative and management operations on functions
-    /// example retrieving a list of functions, invoking a function, creating a function, etc
+    /// example retrieving a list of functions, invoking a function, creating a function, etc.
     /// </summary>
     public class FunctionsController : Controller
     {
@@ -80,12 +80,10 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
                 return BadRequest($"{name} is not a valid function name");
             }
 
-            bool success, configChanged;
-            FunctionMetadataResponse functionMetadataResponse;
-            using (fileMonitoringService.SuspendRestart(true))
-            {
-                (success, configChanged, functionMetadataResponse) = await _functionsManager.CreateOrUpdate(name, functionMetadata, Request);
-            }
+            var restartSuspensionScope = fileMonitoringService.SuspendRestart(true);
+            Response.RegisterForDispose(restartSuspensionScope);
+
+            (bool success, _, FunctionMetadataResponse functionMetadataResponse) = await _functionsManager.CreateOrUpdate(name, functionMetadata, Request);
 
             if (success)
             {
@@ -200,12 +198,10 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
                 return NotFound();
             }
 
-            bool deleted;
-            string error;
-            using (fileMonitoringService.SuspendRestart(true))
-            {
-                (deleted, error) = await _functionsManager.TryDeleteFunction(function);
-            }
+            var restartSuspensionScope = fileMonitoringService.SuspendRestart(true);
+            Response.RegisterForDispose(restartSuspensionScope);
+
+            (bool deleted, string error) = await _functionsManager.TryDeleteFunction(function);
 
             if (deleted)
             {

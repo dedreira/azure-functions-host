@@ -3,6 +3,7 @@
 
 using System;
 using Microsoft.Azure.WebJobs.Script.Config;
+using Microsoft.Azure.WebJobs.Script.WebHost.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -13,6 +14,8 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
         private readonly Action<string> _writeEvent;
         private readonly HostNameProvider _hostNameProvider;
         private readonly IOptions<FunctionsHostingConfigOptions> _functionsHostingConfigOptions;
+        private readonly IOptions<AzureMonitorLoggingOptions> _azureMonitorLoggingOptions;
+        private readonly int _pid = Environment.ProcessId;
         private ILinuxAppServiceFileLogger _functionsExecutionEventsCategoryLogger;
         private ILinuxAppServiceFileLogger _functionsLogsCategoryLogger;
         private ILinuxAppServiceFileLogger _functionsMetricsCategoryLogger;
@@ -22,11 +25,13 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
             ILinuxAppServiceFileLoggerFactory loggerFactory,
             HostNameProvider hostNameProvider,
             IOptions<FunctionsHostingConfigOptions> functionsHostingConfigOptions,
+            IOptions<AzureMonitorLoggingOptions> azureMonitorLoggingOptions,
             Action<string> writeEvent = null)
         {
             _writeEvent = writeEvent ?? WriteEvent;
             _hostNameProvider = hostNameProvider ?? throw new ArgumentNullException(nameof(hostNameProvider));
             _functionsHostingConfigOptions = functionsHostingConfigOptions;
+            _azureMonitorLoggingOptions = azureMonitorLoggingOptions;
             _functionsExecutionEventsCategoryLogger = loggerFactory.Create(FunctionsExecutionEventsCategory, backoffEnabled: !_functionsHostingConfigOptions.Value.DisableLinuxAppServiceLogBackoff);
             _functionsLogsCategoryLogger = loggerFactory.Create(FunctionsLogsCategory, backoffEnabled: false);
             _functionsMetricsCategoryLogger = loggerFactory.Create(FunctionsMetricsCategory, false);
@@ -41,7 +46,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
 
         internal ILinuxAppServiceFileLogger FunctionsDetailsCategoryLogger => _functionsDetailsCategoryLogger;
 
-        public static string TraceEventRegex { get; } = "(?<Level>[0-6]),(?<SubscriptionId>[^,]*),(?<HostName>[^,]*),(?<AppName>[^,]*),(?<FunctionName>[^,]*),(?<EventName>[^,]*),(?<Source>[^,]*),\"(?<Details>.*)\",\"(?<Summary>.*)\",(?<HostVersion>[^,]*),(?<EventTimestamp>[^,]+),(?<ExceptionType>[^,]*),\"(?<ExceptionMessage>.*)\",(?<FunctionInvocationId>[^,]*),(?<HostInstanceId>[^,]*),(?<ActivityId>[^,\"]*)";
+        public static string TraceEventRegex { get; } = "(?<Level>[0-6]),(?<SubscriptionId>[^,]*),(?<HostName>[^,]*),(?<AppName>[^,]*),(?<FunctionName>[^,]*),(?<EventName>[^,]*),(?<Source>[^,]*),\"(?<Details>.*)\",\"(?<Summary>.*)\",(?<HostVersion>[^,]*),(?<EventTimestamp>[^,]+),(?<ExceptionType>[^,]*),\"(?<ExceptionMessage>.*)\",(?<FunctionInvocationId>[^,]*),(?<HostInstanceId>[^,]*),(?<ActivityId>[^,\"]*),(?<Pid>[^,\"]*)";
 
         public static string MetricEventRegex { get; } = "(?<SubscriptionId>[^,]*),(?<AppName>[^,]*),(?<FunctionName>[^,]*),(?<EventName>[^,]*),(?<Average>\\d*),(?<Min>\\d*),(?<Max>\\d*),(?<Count>\\d*),(?<HostVersion>[^,]*),(?<EventTimestamp>[^,]+),(?<Details>[^,\"]*)";
 
@@ -60,7 +65,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
             var hostName = _hostNameProvider.Value;
             using (FunctionsSystemLogsEventSource.SetActivityId(activityId))
             {
-                WriteEvent(_functionsLogsCategoryLogger, $"{(int)ToEventLevel(level)},{subscriptionId},{hostName},{appName},{functionName},{eventName},{source},{NormalizeString(details)},{NormalizeString(summary)},{hostVersion},{formattedEventTimestamp},{exceptionType},{NormalizeString(exceptionMessage)},{functionInvocationId},{hostInstanceId},{activityId}");
+                WriteEvent(_functionsLogsCategoryLogger, $"{(int)ToEventLevel(level)},{subscriptionId},{hostName},{appName},{functionName},{eventName},{source},{NormalizeString(details)},{NormalizeString(summary)},{hostVersion},{formattedEventTimestamp},{exceptionType},{NormalizeString(exceptionMessage)},{functionInvocationId},{hostInstanceId},{activityId},{_pid}");
             }
         }
 
@@ -110,7 +115,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
 
         public override void LogAzureMonitorDiagnosticLogEvent(LogLevel level, string resourceId, string operationName, string category, string regionName, string properties)
         {
-            _writeEvent($"{ScriptConstants.LinuxAzureMonitorEventStreamName} {(int)ToEventLevel(level)},{resourceId},{operationName},{category},{regionName},{NormalizeString(properties.Replace("'", string.Empty))},{DateTime.UtcNow}");
+            _writeEvent($"{ScriptConstants.LinuxAzureMonitorEventStreamName} {(int)ToEventLevel(level)},{resourceId},{operationName},{category},{regionName},{NormalizeString(properties.Replace("'", string.Empty))},{_azureMonitorLoggingOptions.Value.GetUtcDateTime()}");
         }
 
         public static void LogUnhandledException(Exception e)

@@ -1,14 +1,18 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Threading.Tasks;
+using System.Text;
+using Microsoft.Azure.WebJobs.Host;
+using Microsoft.Azure.WebJobs.Host.Listeners;
 using Microsoft.Azure.WebJobs.Logging;
 using Microsoft.Azure.WebJobs.Script.Configuration;
 using Microsoft.Azure.WebJobs.Script.WebHost;
 using Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics;
+using Microsoft.Azure.WebJobs.Script.WebHost.Security;
+using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -104,6 +108,295 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             _mockEventGenerator.VerifyAll();
         }
 
+        [Theory]
+        [InlineData("Microsoft.Azure.WebJobs.Extensions.Storage.Common.Listeners.QueueListener", "GetMessages")]
+        [InlineData("Microsoft.Azure.WebJobs.Extensions.Storage.Common.Listeners.QueueListener", "BackoffDelay")]
+        [InlineData("Microsoft.Azure.WebJobs.Host.Queues.Listeners.QueueListener", "GetMessages")]
+        [InlineData("Microsoft.Azure.WebJobs.Host.Queues.Listeners.QueueListener", "BackoffDelay")]
+        [InlineData("Microsoft.Azure.WebJobs.Extensions.Storage.Blobs.Listeners.BlobListener", "PollBlobContainer")]
+        [InlineData("Microsoft.Azure.WebJobs.Extensions.Storage.Blobs.Listeners.BlobListener", "BlobAlreadyProcessed")]
+        [InlineData("Microsoft.Azure.WebJobs.Extensions.Storage.Blobs.Listeners.BlobListener", "BlobDoesNotMatchPattern")]
+        public void Log_SuppressedEvent_DoesNotEmitEvent(string category, string eventName)
+        {
+            bool formatterInvoked = false;
+            var localLogger = new SystemLogger(_hostInstanceId, category, _mockEventGenerator.Object, _environment, _debugStateProvider.Object, null, new LoggerExternalScopeProvider(), _appServiceOptions);
+
+            localLogger.Log(
+                LogLevel.Debug,
+                new EventId(1, eventName),
+                state: string.Empty,
+                exception: null,
+                (state, exception) =>
+                {
+                    formatterInvoked = true;
+                    return "TestMessage";
+                });
+
+            Assert.False(formatterInvoked);
+            _mockEventGenerator.Verify(
+                p => p.LogFunctionTraceEvent(
+                    It.IsAny<LogLevel>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<DateTime>()),
+                Times.Never);
+        }
+
+        [Theory]
+        [InlineData(null)]
+        [InlineData("")]
+        public void Log_NullOrEmptyCategory_DoesNotThrow(string category)
+        {
+            _mockEventGenerator.Setup(p => p.LogFunctionTraceEvent(
+                It.IsAny<LogLevel>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(),
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(),
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(),
+                It.IsAny<DateTime>()));
+
+            var localLogger = new SystemLogger(_hostInstanceId, category, _mockEventGenerator.Object, _environment, _debugStateProvider.Object, null, new LoggerExternalScopeProvider(), _appServiceOptions);
+
+            localLogger.LogDebug("TestMessage");
+
+            _mockEventGenerator.VerifyAll();
+        }
+
+        [Fact]
+        public void Log_SuppressedCategory_UnnamedEvent_IsEmitted()
+        {
+            // Listener lifecycle logs carry no EventName and must survive named-event suppression.
+            const string category = "Microsoft.Azure.WebJobs.Extensions.Storage.Common.Listeners.QueueListener";
+            var localLogger = new SystemLogger(_hostInstanceId, category, _mockEventGenerator.Object, _environment, _debugStateProvider.Object, null, new LoggerExternalScopeProvider(), _appServiceOptions);
+
+            _mockEventGenerator.Setup(p => p.LogFunctionTraceEvent(
+                LogLevel.Debug, _subscriptionId, _websiteName, string.Empty, string.Empty, category, string.Empty,
+                "Storage queue listener started", string.Empty, string.Empty, string.Empty, _hostInstanceId,
+                string.Empty, _runtimeSiteName, _slotName, It.IsAny<DateTime>()));
+
+            localLogger.LogDebug("Storage queue listener started");
+
+            _mockEventGenerator.VerifyAll();
+        }
+
+        [Fact]
+        public void Log_SuppressedCategory_NullStateEventName_DoesNotThrow()
+        {
+            const string category = "Microsoft.Azure.WebJobs.Extensions.Storage.Common.Listeners.QueueListener";
+            var localLogger = new SystemLogger(_hostInstanceId, category, _mockEventGenerator.Object, _environment, _debugStateProvider.Object, null, new LoggerExternalScopeProvider(), _appServiceOptions);
+            var state = new Dictionary<string, object>
+            {
+                [ScriptConstants.LogPropertyEventNameKey] = null
+            };
+
+            _mockEventGenerator.Setup(p => p.LogFunctionTraceEvent(
+                LogLevel.Debug, _subscriptionId, _websiteName, string.Empty, string.Empty, category, string.Empty,
+                "TestMessage", string.Empty, string.Empty, string.Empty, _hostInstanceId,
+                string.Empty, _runtimeSiteName, _slotName, It.IsAny<DateTime>()));
+
+            localLogger.Log(LogLevel.Debug, eventId: 0, state, null, (s, e) => "TestMessage");
+
+            _mockEventGenerator.VerifyAll();
+        }
+
+        [Fact]
+        public void Log_SuppressedEvent_TraceLevel_DoesNotThrow()
+        {
+            // Trace only passes IsEnabled in diagnostic mode, where suppression is bypassed.
+            const string category = "Microsoft.Azure.WebJobs.Extensions.Storage.Common.Listeners.QueueListener";
+            var localLogger = new SystemLogger(_hostInstanceId, category, _mockEventGenerator.Object, _environment, _debugStateProvider.Object, null, new LoggerExternalScopeProvider(), _appServiceOptions);
+
+            localLogger.Log(LogLevel.Trace, new EventId(1, "GetMessages"), string.Empty, null, (s, e) => "TestMessage");
+
+            _mockEventGenerator.Verify(
+                p => p.LogFunctionTraceEvent(
+                    It.IsAny<LogLevel>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(),
+                    It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(),
+                    It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(),
+                    It.IsAny<DateTime>()),
+                Times.Never);
+
+            _inDiagnosticMode = true;
+            _mockEventGenerator.Setup(p => p.LogFunctionTraceEvent(
+                LogLevel.Trace, _subscriptionId, _websiteName, string.Empty, "GetMessages", category, string.Empty,
+                "TestMessage", string.Empty, string.Empty, string.Empty, _hostInstanceId,
+                string.Empty, _runtimeSiteName, _slotName, It.IsAny<DateTime>()));
+
+            localLogger.Log(LogLevel.Trace, new EventId(1, "GetMessages"), string.Empty, null, (s, e) => "TestMessage");
+
+            _mockEventGenerator.VerifyAll();
+        }
+
+        [Theory]
+        [InlineData("Host.Executor")]
+        [InlineData("Microsoft.Azure.WebJobs.EventHubs.EventHubProducerClientImpl")]
+        public void Log_SuppressedCategory_DoesNotEmitEvent(string category)
+        {
+            var localLogger = new SystemLogger(_hostInstanceId, category, _mockEventGenerator.Object, _environment, _debugStateProvider.Object, null, new LoggerExternalScopeProvider(), _appServiceOptions);
+
+            localLogger.LogDebug("TestMessage");
+
+            _mockEventGenerator.Verify(
+                p => p.LogFunctionTraceEvent(
+                    It.IsAny<LogLevel>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<DateTime>()),
+                Times.Never);
+        }
+
+        [Fact]
+        public void Log_SuppressedStateEventName_DoesNotEmitEvent()
+        {
+            const string category = "Microsoft.Azure.WebJobs.Extensions.Storage.Common.Listeners.QueueListener";
+            var localLogger = new SystemLogger(_hostInstanceId, category, _mockEventGenerator.Object, _environment, _debugStateProvider.Object, null, new LoggerExternalScopeProvider(), _appServiceOptions);
+            var state = new Dictionary<string, object>
+            {
+                [ScriptConstants.LogPropertyEventNameKey] = "GetMessages"
+            };
+
+            localLogger.Log(LogLevel.Debug, eventId: 0, state, null, (logState, exception) => "TestMessage");
+
+            _mockEventGenerator.Verify(
+                p => p.LogFunctionTraceEvent(
+                    It.IsAny<LogLevel>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<DateTime>()),
+                Times.Never);
+        }
+
+        [Theory]
+        [InlineData("Microsoft.Azure.WebJobs.Extensions.Storage.Common.Listeners.QueueListener", "HandlingStorageException", LogLevel.Debug)]
+        [InlineData("Microsoft.Azure.WebJobs.Extensions.Storage.Common.Listeners.QueueListener", "GetMessages", LogLevel.Information)]
+        [InlineData("Microsoft.Azure.WebJobs.Extensions.Storage.Blobs.Listeners.BlobListener", "BlobMessageEnqueued", LogLevel.Debug)]
+        [InlineData("Microsoft.Azure.WebJobs.EventHubs.Listeners.EventHubListener.PartitionProcessor", "", LogLevel.Debug)]
+        [InlineData("Host.Triggers.Kafka", "", LogLevel.Debug)]
+        [InlineData("Host.Executor", "", LogLevel.Information)]
+        [InlineData("Microsoft.Azure.WebJobs.EventHubs.EventHubProducerClientImpl", "", LogLevel.Error)]
+        public void Log_NonSuppressedEvent_EmitsEvent(string category, string eventName, LogLevel logLevel)
+        {
+            var localLogger = new SystemLogger(_hostInstanceId, category, _mockEventGenerator.Object, _environment, _debugStateProvider.Object, null, new LoggerExternalScopeProvider(), _appServiceOptions);
+
+            _mockEventGenerator.Setup(p => p.LogFunctionTraceEvent(
+                logLevel,
+                _subscriptionId,
+                _websiteName,
+                string.Empty,
+                eventName,
+                category,
+                string.Empty,
+                "TestMessage",
+                string.Empty,
+                string.Empty,
+                string.Empty,
+                _hostInstanceId,
+                string.Empty,
+                _runtimeSiteName,
+                _slotName,
+                It.IsAny<DateTime>()));
+
+            localLogger.Log(logLevel, new EventId(1, eventName), string.Empty, null, (state, exception) => "TestMessage");
+
+            _mockEventGenerator.VerifyAll();
+            _debugStateProvider.VerifyGet(p => p.InDiagnosticMode, Times.Never);
+        }
+
+        [Fact]
+        public void Log_SuppressedEventInDiagnosticMode_EmitsEvent()
+        {
+            const string category = "Microsoft.Azure.WebJobs.Extensions.Storage.Common.Listeners.QueueListener";
+            const string eventName = "GetMessages";
+            var localLogger = new SystemLogger(_hostInstanceId, category, _mockEventGenerator.Object, _environment, _debugStateProvider.Object, null, new LoggerExternalScopeProvider(), _appServiceOptions);
+            _inDiagnosticMode = true;
+
+            _mockEventGenerator.Setup(p => p.LogFunctionTraceEvent(
+                LogLevel.Debug,
+                _subscriptionId,
+                _websiteName,
+                string.Empty,
+                eventName,
+                category,
+                string.Empty,
+                "TestMessage",
+                string.Empty,
+                string.Empty,
+                string.Empty,
+                _hostInstanceId,
+                string.Empty,
+                _runtimeSiteName,
+                _slotName,
+                It.IsAny<DateTime>()));
+
+            localLogger.Log(LogLevel.Debug, new EventId(1, eventName), string.Empty, null, (state, exception) => "TestMessage");
+
+            _mockEventGenerator.VerifyAll();
+        }
+
+        [Fact]
+        public void Log_SuppressedCategoryInDiagnosticMode_EmitsEvent()
+        {
+            const string category = "Host.Executor";
+            var localLogger = new SystemLogger(_hostInstanceId, category, _mockEventGenerator.Object, _environment, _debugStateProvider.Object, null, new LoggerExternalScopeProvider(), _appServiceOptions);
+            _inDiagnosticMode = true;
+
+            _mockEventGenerator.Setup(p => p.LogFunctionTraceEvent(
+                LogLevel.Debug,
+                _subscriptionId,
+                _websiteName,
+                string.Empty,
+                string.Empty,
+                category,
+                string.Empty,
+                "TestMessage",
+                string.Empty,
+                string.Empty,
+                string.Empty,
+                _hostInstanceId,
+                string.Empty,
+                _runtimeSiteName,
+                _slotName,
+                It.IsAny<DateTime>()));
+
+            localLogger.LogDebug("TestMessage");
+
+            _mockEventGenerator.VerifyAll();
+        }
+
         [Fact]
         public void Log_Verbose_LogData_EmitsExpectedEvent()
         {
@@ -145,6 +438,22 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             _mockEventGenerator.Setup(p => p.LogFunctionTraceEvent(LogLevel.Error, _subscriptionId, _websiteName, _functionName, eventName, _category, ex.ToFormattedString(), message, ex.GetType().ToString(), ex.Message, functionInvocationId, _hostInstanceId, activityId, _runtimeSiteName, _slotName, It.IsAny<DateTime>()));
 
             _logger.LogError(ex, message);
+
+            _mockEventGenerator.VerifyAll();
+        }
+
+        [Theory]
+        [MemberData(nameof(FunctionExceptionDataProvider.TestCases), MemberType = typeof(FunctionExceptionDataProvider))]
+        public void Log_FunctionException_EmitsExpectedEvent(FunctionException functionException, string functionName)
+        {
+            string eventName = string.Empty;
+            string functionInvocationId = string.Empty;
+            string activityId = string.Empty;
+
+            _mockEventGenerator.Setup(p => p.LogFunctionTraceEvent(LogLevel.Error, _subscriptionId, _websiteName, functionName, eventName, string.Empty, functionException.ToFormattedString(), functionException.Message, functionException.InnerException.GetType().ToString(), functionException.InnerException.Message, functionInvocationId, _hostInstanceId, activityId, _runtimeSiteName, _slotName, It.IsAny<DateTime>()));
+
+            ILogger localLogger = new SystemLogger(_hostInstanceId, string.Empty, _mockEventGenerator.Object, _environment, _debugStateProvider.Object, null, new LoggerExternalScopeProvider(), _appServiceOptions);
+            localLogger.LogError(functionException, functionException.Message);
 
             _mockEventGenerator.VerifyAll();
         }
@@ -290,6 +599,109 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             Assert.Equal("updatedsub", evt.SubscriptionId);
             Assert.Equal("updatedslot", evt.SlotName);
             Assert.Equal("updatedruntimesitename", evt.RuntimeSiteName);
+        }
+
+        [Fact]
+        public void Log_RpcException()
+        {
+            const string emailAddress = "ol-bi@blackbirdco.com.br";
+            string secretString = "{ \"AzureWebJobsStorage\": \"DefaultEndpointsProtocol=https;AccountName=testAccount1;AccountKey=mykey1;EndpointSuffix=core.windows.net\", \"AnotherKey\": \"AnotherValue\" }";
+            string stackTrace = $"Traceback: ms.get_email_id('{emailAddress}')";
+            var innerException = new RpcException("result", secretString, stackTrace, "type");
+            var functionInvocationException = new FunctionInvocationException("Invocation failed", Guid.Empty, "Functions.TestFunction", innerException);
+            var formattedMessage = "Test log";
+            var hash = EncryptionHelper.GetSHA256Base64String(Encoding.UTF8.GetBytes(innerException.RemoteMessage));
+            var innerExceptionType = innerException.GetType().ToString();
+            var eventName = string.Empty;
+            var functionInvocationId = string.Empty;
+            var activityId = string.Empty;
+
+            _mockEventGenerator.Setup(p => p.LogFunctionTraceEvent(LogLevel.Error, _subscriptionId, _websiteName, _functionName, eventName, _category,
+                It.Is<string>(s => s.Contains(hash, StringComparison.Ordinal)
+                    && s.Contains(Sanitizer.EmailReplacement, StringComparison.Ordinal)
+                    && !s.Contains(emailAddress, StringComparison.Ordinal)),
+                formattedMessage, innerExceptionType,
+                It.Is<string>(s => s.Contains(hash, StringComparison.Ordinal)
+                    && s.Contains(Sanitizer.EmailReplacement, StringComparison.Ordinal)
+                    && !s.Contains(emailAddress, StringComparison.Ordinal)),
+                functionInvocationId, _hostInstanceId, activityId, _runtimeSiteName, _slotName, It.IsAny<DateTime>()));
+
+            _logger.LogError(functionInvocationException, formattedMessage);
+
+            _mockEventGenerator.VerifyAll();
+        }
+
+        [Theory]
+        [InlineData("alice@example.invalid")]
+        [InlineData("alice+tag@sub.example.invalid and bob@example.org")]
+        [InlineData("AccountKey=synthetic-secret' alice@example.invalid")]
+        public void Log_RpcException_RedactsRemoteMessageRepeatedInStack(string value)
+        {
+            const string customerMarker = "customer-record-12345";
+            string remoteMessage = $"{customerMarker}: {value}";
+            string stack = $"Error: {remoteMessage}\n    at execute (probe.js:42:7)";
+            var rpcException = new RpcException("Failure", remoteMessage, stack);
+            var exception = new FunctionInvocationException("Invocation failed", Guid.Empty, "Functions.TestFunction", rpcException);
+            string hash = EncryptionHelper.GetSHA256Base64String(Encoding.UTF8.GetBytes(rpcException.RemoteMessage));
+            const string formattedMessage = "Test log";
+
+            _mockEventGenerator.Setup(p => p.LogFunctionTraceEvent(LogLevel.Error, _subscriptionId, _websiteName, _functionName, string.Empty, _category,
+                It.Is<string>(s => s.Contains(hash, StringComparison.Ordinal)
+                    && !s.Contains(customerMarker, StringComparison.Ordinal)
+                    && !s.Contains(Sanitizer.EmailReplacement, StringComparison.Ordinal)),
+                formattedMessage, typeof(RpcException).ToString(),
+                It.Is<string>(s => s.Contains(hash, StringComparison.Ordinal)
+                    && !s.Contains(customerMarker, StringComparison.Ordinal)
+                    && !s.Contains(Sanitizer.EmailReplacement, StringComparison.Ordinal)),
+                string.Empty, _hostInstanceId, string.Empty, _runtimeSiteName, _slotName, It.IsAny<DateTime>()));
+
+            _logger.LogError(exception, formattedMessage);
+
+            _mockEventGenerator.VerifyAll();
+        }
+
+        [Fact]
+        public void Log_NonRpcException()
+        {
+            var secretReplacement = "[Hidden Credential]";
+            var secretString = "{ \"AzureWebJobsStorage\": \"DefaultEndpointsProtocol=https;AccountName=testAccount1;AccountKey=mykey1;EndpointSuffix=core.windows.net\", \"AnotherKey\": \"AnotherValue\" }";
+            var sanitizedString = $"{{ \"AzureWebJobsStorage\": \"{secretReplacement}\", \"AnotherKey\": \"AnotherValue\" }}";
+
+            var sanitizedDetails = "System.ArgumentNullException : Value cannot be null. (Parameter 'result')";
+            var sanitizedExceptionMessage = "Value cannot be null. (Parameter 'result')";
+
+            var eventName = string.Empty;
+            var functionInvocationId = string.Empty;
+            var activityId = string.Empty;
+
+            var ex = new ArgumentNullException("result");
+
+            _mockEventGenerator.Setup(p => p.LogFunctionTraceEvent(LogLevel.Error, _subscriptionId, _websiteName, _functionName, eventName, _category, sanitizedDetails, sanitizedString, ex.GetType().ToString(), sanitizedExceptionMessage, functionInvocationId, _hostInstanceId, activityId, _runtimeSiteName, _slotName, It.IsAny<DateTime>()));
+
+            _logger.LogError(ex, Sanitizer.Sanitize(secretString));
+
+            _mockEventGenerator.VerifyAll();
+        }
+
+        public class FunctionExceptionDataProvider
+        {
+            public static IEnumerable<object[]> TestCases
+            {
+                get
+                {
+                    yield return new object[] { new FunctionListenerException("Functions.TestFunction", new Exception("Kaboom")), "Functions.TestFunction" };
+                    yield return new object[] { new FunctionInvocationException("Invocation failed", Guid.Empty, "Functions.TestFunction", new Exception("Kaboom")), "Functions.TestFunction" };
+                    yield return new object[] { new FunctionTeapotException("Host.Functions.Teapot", new Exception("Super Kaboom")), "Teapot" };
+                }
+            }
+        }
+
+        private class FunctionTeapotException : FunctionException
+        {
+            public FunctionTeapotException(string methodName, Exception innerException)
+                : base($"Error 418. The function '{methodName}' is a teapot", methodName, innerException)
+            {
+            }
         }
     }
 }

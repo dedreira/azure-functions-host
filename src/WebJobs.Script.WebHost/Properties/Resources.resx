@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <root>
   <!-- 
     Microsoft ResX Schema 
@@ -125,19 +125,21 @@
   </data>
   <data name="ExecutedHttpRequest" xml:space="preserve">
     <value>Executed HTTP request: {{
-  requestId: "{mS_ActivityId}",
-  identities: "{identities}",
-  status: "{statusCode}",
-  duration: "{duration}"
+  "requestId": "{mS_ActivityId}",
+  "identities": "{identities}",
+  "status": "{statusCode}",
+  "duration": "{duration}",
+  "route": "{route}"
 }}</value>
   </data>
   <data name="ExecutingHttpRequest" xml:space="preserve">
     <value>Executing HTTP request: {{
-  requestId: "{mS_ActivityId}",
-  method: "{httpMethod}",
-  userAgent: "{userAgent}",
-  uri: "{uri}"
+  "requestId": "{mS_ActivityId}",
+  "method": "{httpMethod}"
 }}</value>
+  </data>
+  <data name="FailedToReadBlobSecretRepositoryTierSetToArchive" xml:space="preserve">
+    <value>Failed to read from Blob Storage Secret Repository because its access tier is set to archive.</value>
   </data>
   <data name="FunctionSecretsSchemaV0" xml:space="preserve">
     <value>{
@@ -280,6 +282,9 @@
   <data name="HostSpecializationTrace" xml:space="preserve">
     <value>Starting host specialization</value>
   </data>
+  <data name="NonHISSecret" xml:space="preserve">
+    <value>A non highly-identifiable secret has been loaded by the application: (KeyType:{0}, KeyName:{1}, FunctionName:{2}).</value>
+  </data>
   <data name="TraceAddOrUpdateFunctionSecret" xml:space="preserve">
     <value>{0} secret '{1}' for '{2}' {3}.</value>
   </data>
@@ -312,5 +317,8 @@
   </data>
   <data name="UnauthorizedArmExtensionResourceRequest" xml:space="preserve">
     <value>GET requests for this resource via the hostruntime extensions API are not authorized. Please use an alternate first class ARM API.</value>
+  </data>
+  <data name="ArmRequestNotAllowedForExtension" xml:space="preserve">
+    <value>Extension '{0}' does not support ARM webhook access.</value>
   </data>
 </root>

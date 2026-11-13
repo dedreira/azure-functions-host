@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
@@ -16,7 +16,7 @@ using Microsoft.Extensions.Logging;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests.Workers.Rpc
 {
-    public class TestRpcWorkerChannel : IRpcWorkerChannel, IDisposable
+    internal class TestRpcWorkerChannel : IRpcWorkerChannel, IDisposable
     {
         private readonly RpcWorkerConfig _workerConfig;
 
@@ -54,7 +54,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Workers.Rpc
 
         public RpcWorkerConfig WorkerConfig => _workerConfig;
 
-        public IDictionary<string, BufferBlock<ScriptInvocationContext>> FunctionInputBuffers => throw new NotImplementedException();
+        public IDictionary<string, BufferBlock<ScriptInvocationContext>> FunctionInputBuffers { get; set; }
 
         public List<Task> ExecutionContexts => _executionContexts;
 
@@ -74,10 +74,10 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Workers.Rpc
             _testLogger.LogInformation("RegisterFunctions called");
         }
 
-        public Task SendFunctionEnvironmentReloadRequest()
+        public Task<bool> SendFunctionEnvironmentReloadRequest()
         {
             _testLogger.LogInformation("SendFunctionEnvironmentReloadRequest called");
-            return Task.CompletedTask;
+            return Task.FromResult(true);
         }
 
         public void SendInvocationRequest(ScriptInvocationContext context)
@@ -150,11 +150,10 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Workers.Rpc
             return _executingInvocations.Contains(invocationId);
         }
 
-        public bool TryFailExecutions(Exception exception)
+        public void Shutdown(Exception exception)
         {
             // Executions are no longer executing
             _executingInvocations = new HashSet<string>();
-            return true;
         }
 
         public void SendWorkerMetadataRequest()

@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
@@ -9,11 +9,8 @@ using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.Azure.EventHubs;
-using Microsoft.Azure.Storage.Blob;
 using Microsoft.Azure.WebJobs.Logging;
 using Microsoft.Azure.WebJobs.Script.Config;
 using Microsoft.Azure.WebJobs.Script.Models;
@@ -39,62 +36,20 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
             _settingsManager = ScriptSettingsManager.Instance;
         }
 
-        [Fact(Skip = "Need to investigate .NET 6 failure")]
-        public async Task EventHubTrigger()
-        {
-            // write 3 events
-            List<EventData> events = new List<EventData>();
-            string[] ids = new string[3];
-            for (int i = 0; i < 3; i++)
-            {
-                ids[i] = Guid.NewGuid().ToString();
-                JObject jo = new JObject
-                {
-                    { "value", ids[i] }
-                };
-                var evt = new EventData(Encoding.UTF8.GetBytes(jo.ToString(Formatting.None)));
-                evt.Properties.Add("TestIndex", i);
-                events.Add(evt);
-            }
-
-            string connectionString = Environment.GetEnvironmentVariable("AzureWebJobsEventHubSender");
-            EventHubsConnectionStringBuilder builder = new EventHubsConnectionStringBuilder(connectionString);
-
-            if (string.IsNullOrWhiteSpace(builder.EntityPath))
-            {
-                string eventHubPath = ScriptSettingsManager.Instance.GetSetting("AzureWebJobsEventHubPath");
-                builder.EntityPath = eventHubPath;
-            }
-
-            EventHubClient eventHubClient = EventHubClient.CreateFromConnectionString(builder.ToString());
-
-            await eventHubClient.SendAsync(events);
-
-            string logs = null;
-            await TestHelpers.Await(() =>
-            {
-                // wait until all of the 3 of the unique IDs sent
-                // above have been processed
-                logs = _fixture.Host.GetLog();
-                return ids.All(p => logs.Contains(p));
-            }, userMessageCallback: _fixture.Host.GetLog);
-
-            Assert.True(logs.Contains("IsArray true"));
-        }
-
         [Fact]
         public async Task ManualTrigger_Invoke_Succeeds()
         {
-            CloudBlobContainer outputContainer = _fixture.BlobClient.GetContainerReference("samples-output");
+            var outputContainer = _fixture.BlobServiceClient.GetBlobContainerClient("samples-output");
+            await outputContainer.CreateIfNotExistsAsync();
             string inId = Guid.NewGuid().ToString();
             string outId = Guid.NewGuid().ToString();
-            CloudBlockBlob statusBlob = outputContainer.GetBlockBlobReference(inId);
+            var statusBlob = outputContainer.GetBlobClient(inId);
             JObject testData = new JObject()
             {
                 { "first", "Mathew" },
                 { "last", "Charles" }
             };
-            await statusBlob.UploadTextAsync(testData.ToString(Formatting.None));
+            await statusBlob.UploadAsync(BinaryData.FromString(testData.ToString(Formatting.None)));
 
             JObject input = new JObject()
             {
@@ -105,8 +60,10 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
             await _fixture.Host.BeginFunctionAsync("manualtrigger", input);
 
             // wait for completion
-            CloudBlockBlob outputBlob = outputContainer.GetBlockBlobReference(outId);
-            string result = await TestHelpers.WaitForBlobAndGetStringAsync(outputBlob);
+            var outputBlob = outputContainer.GetBlobClient(outId);
+            string result = await TestHelpers.WaitForBlobAndGetStringAsync(
+                outputBlob,
+                content => string.Equals("Mathew Charles", content, StringComparison.Ordinal));
             Assert.Equal("Mathew Charles", result);
         }
 
@@ -261,13 +218,17 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
             Assert.Equal(HttpStatusCode.Created, response.StatusCode);
 
             // wait for function to execute and produce its result blob
-            CloudBlobContainer outputContainer = _fixture.BlobClient.GetContainerReference("samples-output");
+            var outputContainer = _fixture.BlobServiceClient.GetBlobContainerClient("samples-output");
             string path = $"housewares/{id}";
-            CloudBlockBlob outputBlob = outputContainer.GetBlockBlobReference(path);
-            string result = await TestHelpers.WaitForBlobAndGetStringAsync(outputBlob);
+            var outputBlob = outputContainer.GetBlobClient(path);
+            string expectedName = (string)product["name"];
+            string result = await TestHelpers.WaitForBlobAndGetStringAsync(
+                outputBlob,
+                content => content.Contains(id, StringComparison.Ordinal)
+                    && content.Contains(expectedName, StringComparison.Ordinal));
             JObject resultProduct = JObject.Parse(Utility.RemoveUtf8ByteOrderMark(result));
             Assert.Equal(id, (string)resultProduct["id"]);
-            Assert.Equal((string)product["name"], (string)resultProduct["name"]);
+            Assert.Equal(expectedName, (string)resultProduct["name"]);
         }
 
         [Fact]
@@ -364,7 +325,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
 
             // Microsoft.Azure.WebJobs.Extensions.EventHubs
             public TestFixture()
-                : base(Path.Combine(Environment.CurrentDirectory, "..", "..", "..", "..", "..", "sample", "node"), "samples", RpcWorkerConstants.NodeLanguageWorkerName)
+                : base(Path.Combine(Environment.CurrentDirectory, "..", "..", "..", "..", "sample", "node"), "samples", RpcWorkerConstants.NodeLanguageWorkerName)
             {
                 ProxyEndToEndTests.EnableProxiesOnSystemEnvironment();
             }
@@ -399,6 +360,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
                     };
                 });
             }
+
         }
     }
 }

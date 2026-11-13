@@ -1,12 +1,14 @@
 ﻿// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
-using System;
 using System.IO;
-using System.Linq;
+using System.IO.Abstractions;
+using System.Text;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.WebHost.Extensions;
+using Moq;
+using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using Xunit;
 
@@ -112,6 +114,51 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Extensions
             Assert.Equal("httpTrigger", functionMetadata.Bindings[0].Raw["type"].Value<string>());
         }
 
+        [Theory]
+        [InlineData("httpTrigger", "http")]
+        [InlineData("orchestrationTrigger", "durable")]
+        [InlineData("activityTrigger", "durable")]
+        [InlineData("entityTrigger", "durable")]
+        [InlineData("timerTrigger", null)]
+        [InlineData("blobTrigger", null)]
+        [InlineData("queueTrigger", null)]
+        [InlineData("serviceBusTrigger", null)]
+        [InlineData("otherTrigger", null)]
+        public async Task ToFunctionTrigger_Grouping_ReturnsExpected(string trigger, string group)
+        {
+            var functionMetadata = new FunctionMetadata
+            {
+                Name = "TestFunction1",
+                Bindings =
+                {
+                    new BindingMetadata
+                    {
+                        Name = "input",
+                        Type = trigger,
+                        Direction = BindingDirection.In,
+                        Raw = new JObject()
+                        {
+                            ["name"] = "input",
+                            ["type"] = trigger,
+                            ["direction"] = "in",
+                        },
+                    }
+                }
+            };
+            var options = new ScriptJobHostOptions
+            {
+                RootScriptPath = _testRootScriptPath
+            };
+
+            group ??= $"function:{functionMetadata.Name}";
+            var result = await functionMetadata.ToFunctionTrigger(options, isFlexConsumption: true);
+            Assert.Equal("TestFunction1", result["functionName"].Value<string>());
+            Assert.Equal(trigger, result["type"].Value<string>());
+
+            Assert.True(result.TryGetValue("functionGroup", out JToken functionGroup));
+            Assert.Equal(group, functionGroup.Value<string>());
+        }
+
         [Fact]
         public async Task ToFunctionMetadataResponse_WithoutFiles_ReturnsExpected()
         {
@@ -133,6 +180,65 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Extensions
 
             var binding = result.Config["bindings"] as JArray;
             Assert.Equal("httpTrigger", binding[0]["type"].Value<string>());
+        }
+
+        [Fact]
+        public async Task ToFunctionMetadataResponse_DoesNotEmitTestDataProperties()
+        {
+            var functionName = "TestFunction1";
+            var functionMetadata = new FunctionMetadata
+            {
+                Name = functionName
+            };
+            var testDataFileName = $"{functionName}.dat";
+            var options = new ScriptJobHostOptions
+            {
+                RootScriptPath = _testRootScriptPath
+            };
+
+            IFileSystem fileSystem = FileUtility.Instance;
+
+            try
+            {
+                var testDataContent = @"
+                                    {
+                                        ""method"": ""POST"",
+                                        ""headers"": [],
+                                        ""body"": ""foo""
+                                    }";
+
+                var memoryStream = new MemoryStream(Encoding.UTF8.GetBytes(testDataContent))
+                {
+                    Position = 0
+                };
+
+                var mockFileSystem = new Mock<IFileSystem>();
+                var mockFile = new Mock<FileBase>();
+                mockFileSystem.Setup(f => f.Directory.Exists(It.IsAny<string>())).Returns(true);
+                mockFile.Setup(f => f.Exists(It.Is<string>(path => path.EndsWith(Path.Combine(functionName, "function.json"))))).Returns(true);
+                mockFile.Setup(f => f.Exists(It.Is<string>(path => path.EndsWith(testDataFileName)))).Returns(true);
+                mockFile.Setup(f => f.Open(It.Is<string>(path => path.EndsWith(testDataFileName)), It.IsAny<FileMode>(), It.IsAny<FileAccess>(), It.IsAny<FileShare>()))
+                        .Returns(memoryStream);
+                mockFileSystem.Setup(fs => fs.File).Returns(mockFile.Object);
+                FileUtility.Instance = mockFileSystem.Object;
+
+                AddSampleBindings(functionMetadata);
+                var result = await functionMetadata.ToFunctionMetadataResponse(options, string.Empty, null);
+
+                Assert.Equal(functionName, result.Name);
+
+                // The test_data / test_data_href keys must not appear in the serialized payload,
+                // even though a .dat file exists on disk.
+                var serialized = JObject.Parse(JsonConvert.SerializeObject(result));
+                Assert.False(serialized.ContainsKey("test_data"));
+                Assert.False(serialized.ContainsKey("test_data_href"));
+
+                mockFile.Verify(f => f.Open(It.Is<string>(path => path.EndsWith(testDataFileName)), It.IsAny<FileMode>(), It.IsAny<FileAccess>(), It.IsAny<FileShare>()), Times.Never());
+            }
+            finally
+            {
+                FileUtility.Instance = fileSystem;
+            }
         }
 
         [Fact]

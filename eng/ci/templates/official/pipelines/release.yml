@@ -1,0 +1,89 @@
+parameters:
+- name: downloadSteps
+  type: stepList
+- name: folder
+  type: string
+- name: packageName
+  type: string
+- name: public
+  type: boolean
+  default: false
+- name: packages
+  type: string
+  default: |
+    **/*.nupkg
+    !**/*.symbols.nupkg
+
+stages:
+- stage: Validate
+  jobs:
+  - job: Validate
+    templateContext:
+      type: validationJob
+
+    steps:
+    - pwsh: |
+        $source = "$(Build.SourceBranch)"
+        if (!($source -like "refs/tags/*-v*" || $source -like "refs/tags/v*" || $source -like "refs/heads/release/*" || $source -like "refs/heads/internal/release/*"))
+        {
+          Write-Host "##vso[task.logissue type=error]Invalid release branch. Branch must be a tag (v* or *-v*) or a release branch (release/*, internal/release/*)."
+          exit 1
+        }
+      displayName: Validate Source Branch
+
+- stage: Download
+  dependsOn: Validate
+  jobs:
+  - job: DownloadPackages
+    displayName: Download release packages
+
+    templateContext:
+      outputParentDirectory: $(Build.ArtifactStagingDirectory)
+      outputs:
+      - output: pipelineArtifact
+        displayName: Publish release packages
+        path: $(Build.ArtifactStagingDirectory)/packages
+        artifact: drop_packages
+
+    steps:
+    - ${{ each step in parameters.downloadSteps }}:
+      - ${{ step }}
+
+    - pwsh: |
+        $ErrorActionPreference = 'Stop'
+
+        $name = "${{ parameters.packageName }}".Trim()
+        Write-Host "Getting version for $name"
+        $package = Get-ChildItem -Path "$(Build.ArtifactStagingDirectory)/packages" -Recurse -Filter "$name.*.nupkg"
+
+        if ($package.Count -eq 0) {
+          Write-Host "##vso[task.logissue type=error;]Could not find package $name."
+          exit 1
+        }
+
+        if ($package.Count -gt 1) {
+          Write-Host "##vso[task.logissue type=error;]Too many packages matched $name."
+          exit 1
+        }
+
+        $version = $package.Name.Trim("$name.").Trim('.nupkg')
+        Write-Host "Package version: $version"
+        Write-Host "##vso[build.updatebuildnumber]$version"
+        Write-Host "##vso[build.addbuildtag]${{ parameters.packageName }}"
+        Write-Host "##vso[build.addbuildtag]$version"
+      displayName: Get package version
+
+- stage: Release
+  dependsOn: Download
+  jobs:
+  - template: /ci/release-nuget-package.yml@eng
+    parameters:
+      isProduction: true
+      approvers: '[internal]\Azure Functions Core'
+      artifact: drop_packages
+      stagingFeed: public/pre-release
+      packages: ${{ parameters.packages }}
+      ${{ if eq(parameters.public, true) }}:
+        partnerDrop:
+          serviceConnection: azure-sdk-partner-drops
+          targetFolder: azure-functions/dotnet/${{ parameters.folder }}/$(Build.BuildNumber)

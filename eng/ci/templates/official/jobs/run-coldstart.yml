@@ -1,0 +1,407 @@
+parameters:
+- name: description
+  type: string
+- name: functionAppName
+  type: string
+- name: instanceId
+  type: string
+- name: os
+  type: string
+  default: Windows
+  values:
+    - Windows
+    - Linux
+- name: appType
+  type: string
+  default: dotnet
+  values:
+    - dotnet
+    - node
+- name: collectPerfViewProfileOnWindows
+  type: boolean
+  default: false
+- name: perfViewCollectArguments
+  type: string
+  default: ''
+- name: collectNetTrace
+  type: boolean
+  default: false
+- name: netTraceCollectArguments
+  type: string
+- name: createJitTrace
+  type: boolean
+  default: false
+
+jobs:
+- job: ${{ parameters.functionAppName }}_${{ parameters.instanceId }}
+  displayName: ${{ parameters.description }} ${{ parameters.instanceId }}
+  pool:
+    name: 1es-pool-azfunc-benchmarking
+    ${{ if eq(parameters.os, 'Linux') }}:
+      os: linux
+      ${{ if and(eq(parameters.createJitTrace, true), eq(parameters.instanceId, '1')) }}:
+        image: 1es-ubuntu-22.04-mms-benchmark-coreclr-builder
+      ${{ else }}:
+        image: 1es-ubuntu-22.04-benchmark-runner-vanilla
+    ${{ else }}:
+      os: windows
+      ${{ if and(eq(parameters.createJitTrace, true), eq(parameters.instanceId, '1')) }}:
+        image: 1es-windows-2022-mms-benchmark-coreclr-builder
+      ${{ else }}:
+        image: 1es-windows-2022-benchmark-runner-vanilla
+
+  variables:
+    WEBSITE_USE_PLACEHOLDER_DOTNETISOLATED: 1
+    # Keep this stable across instances so blob-backed host key auth can find the seeded test key.
+    WEBSITE_SITE_NAME: PGO_${{ parameters.functionAppName }}_${{ parameters.os }}
+    WEBSITE_INSTANCE_ID: ${{ parameters.functionAppName }}_${{ parameters.os }}_${{ parameters.instanceId }} # Simulate App service.
+    HOME: $(Build.BinariesDirectory)/home
+    functionAppOutputPath: $(HOME)/site/wwwroot
+    hostOutputPath: $(Build.BinariesDirectory)/Published/HostRuntime
+    logsDirectory: $(Build.ArtifactStagingDirectory)/Logs
+    stdOutLogsFilePath: $(logsDirectory)/std_out_logs.txt
+    stdErrorLogsFilePath: $(logsDirectory)/std_error_logs.txt
+    # Ordinary runs stay anonymous; JIT generation retrieves the real function key.
+    functionKey: ''
+    ${{ if eq(parameters.appType, 'dotnet') }}:
+      FUNCTIONS_WORKER_RUNTIME: 'dotnet-isolated'
+      FUNCTIONS_WORKER_RUNTIME_VERSION: '9.0'
+    ${{ if eq(parameters.appType, 'node') }}:
+      FUNCTIONS_WORKER_RUNTIME: 'node'
+      WEBSITE_RUN_FROM_PACKAGE: '1' # Node app needs this to use placeholder channel.
+    perfViewPath: C:\.tools\perfview\perfview.exe 
+    traceDirectory: $(Build.ArtifactStagingDirectory)/out
+    netTraceDirectory: $(traceDirectory)/nettrace
+    traceFileNameWithoutExtension: PerfViewData_$(Build.BuildNumber)_${{ parameters.functionAppName }}
+    traceFileName: $(traceFileNameWithoutExtension).etl
+    traceFileZipName: $(traceFileName).zip
+    traceFilePath: $(traceDirectory)/$(traceFileName)
+    traceZipFilePath: $(traceDirectory)/$(traceFileZipName)
+    traceAnalysisResultMarkdownFilePath: $(traceDirectory)/results/$(traceFileNameWithoutExtension).md
+    traceLogPath: $(logsDirectory)/logs.log
+    ${{ if eq(parameters.os, 'Linux') }}:
+      WEBSITE_SKU: FlexConsumption
+    ${{ if eq(parameters.os, 'Windows') }}:
+      WEBSITE_SKU: Dynamic
+    ${{ if and(eq(parameters.collectNetTrace, true), eq(parameters.instanceId, '1')) }}:
+      netTraceFileNameWithoutExtension: azfunc_${{ parameters.functionAppName }}_${{ parameters.os }}_${{ parameters.instanceId }}
+      netTraceFileName: $(netTraceFileNameWithoutExtension).nettrace
+      netTraceFilePath: $(netTraceDirectory)/$(netTraceFileName)
+      netTraceAnalysisResultsMarkdownFilePath: $(netTraceDirectory)/results/$(netTraceFileNameWithoutExtension).md
+      # For JIT trace generation, ensure the trace is collected from an app with authentication enabled (as done by the SLA site).
+    ${{ if and(eq(parameters.createJitTrace, true), eq(parameters.instanceId, '1')) }}:
+      warmupApiUrl: http://localhost:5000  # For JIT trace generation case, we call the home page instead of the api/warmup endpoint to ensure the host is up and running.
+      ${{ if eq(parameters.os, 'Windows') }}:
+        functionInvocationUrl: http://localhost:5000/api/HelloAuth?forcespecialization
+      ${{ if eq(parameters.os, 'Linux') }}:
+        functionInvocationUrl: http://localhost:5000/api/HelloAuth
+    ${{ else }}:
+      warmupApiUrl: http://localhost:5000/api/warmup?restart=1
+      ${{ if eq(parameters.os, 'Windows') }}:
+        functionInvocationUrl: http://localhost:5000/api/Hello?forcespecialization
+      ${{ if eq(parameters.os, 'Linux') }}:
+        functionInvocationUrl: http://localhost:5000/api/Hello
+
+  ${{ if and(or(eq(parameters.collectPerfViewProfileOnWindows, true), eq(parameters.collectNetTrace, true)), eq(parameters.instanceId, '1')) }}:
+    templateContext:
+      outputParentDirectory: $(traceDirectory)
+      outputs:
+        - output: pipelineArtifact
+          displayName: Publish Trace artifacts
+          path: $(traceDirectory)
+          artifact: AzFunc_${{ parameters.os }}_${{ parameters.functionAppName }}
+          condition: always()
+
+  steps:
+
+  # ── Prerequisites & Build Artifacts ─────────────────────────────────────────
+
+  # Fetch secrets from Key Vault:
+  # - PGO-APP-AZURE-WEBJOBS-STORAGE: Storage account connection string for function key management.
+  #   Required for admin API authentication (master key validation) and auth-enabled function invocations.
+  # - PGO-APP-INSTANCE-ASSIGN-PAYLOAD-ENCRYPTION-KEY: AES encryption key (hex string) used to encrypt
+  #   the HostAssignmentContext payload for /admin/instance/assign on Linux. Must match the host's
+  #   WEBSITE_AUTH_ENCRYPTION_KEY so it can decrypt the payload (see EncryptionHelper.cs).
+  - task: AzureKeyVault@2
+    inputs:
+      azureSubscription: Azure-Functions-Host-CI-internal
+      KeyVaultName: azure-functions-perf
+      SecretsFilter: PGO-APP-AZURE-WEBJOBS-STORAGE,PGO-APP-INSTANCE-ASSIGN-PAYLOAD-ENCRYPTION-KEY
+      RunAsPreJob: false
+
+  - template: /eng/ci/templates/install-dotnet.yml@self
+
+  - script: dotnet --info
+    displayName: "Print .NET Environment Info"
+
+  - ${{ if and(eq(parameters.collectNetTrace, true), eq(parameters.instanceId, '1')) }}:
+    - pwsh: |
+        dotnet tool install --global dotnet-trace
+        if ($LASTEXITCODE -ne 0) { throw "Could not install dotnet-trace." }
+      displayName: Install dotnet-trace
+
+  - ${{ if eq(parameters.appType, 'node') }}:
+    - task: UseNode@1
+      displayName: Install Node.js
+      inputs:
+        version: '24.x'
+
+  - template: /eng/ci/templates/steps/acquire-coldstart-binaries.yml@self
+    parameters:
+      functionAppName: ${{ parameters.functionAppName }}
+      os: ${{ parameters.os }}
+
+  - pwsh: |
+      New-Item -ItemType Directory -Path $(logsDirectory) -Force
+      New-Item -ItemType Directory -Path $(traceDirectory) -Force
+    displayName: Create directories
+
+  # Microsoft.Azure.Web.DataProtection parses WEBSITE_AUTH_ENCRYPTION_KEY as hex to build the key
+  # ring used to encrypt generated function secrets; the Key Vault secret is base64, so generation
+  # fails. Both forms decode to the same bytes, so instance/assign is unaffected.
+  - pwsh: |
+      $key = $env:ENCRYPTION_KEY
+      if ($key -match '^[0-9a-fA-F]+$' -and $key.Length % 2 -eq 0) {
+          $hex = $key.ToUpperInvariant()
+      } else {
+          $hex = [System.Convert]::ToHexString([System.Convert]::FromBase64String($key))
+      }
+      Write-Host "Normalized encryption key to hex ($($hex.Length) chars, $($hex.Length / 2) bytes)"
+      Write-Host "##vso[task.setvariable variable=authEncryptionKeyHex;issecret=true]$hex"
+    displayName: Normalize auth encryption key
+    env:
+      ENCRYPTION_KEY: $(PGO-APP-INSTANCE-ASSIGN-PAYLOAD-ENCRYPTION-KEY)
+
+  # ── Function Key Retrieval (jittrace only) ──────────────────────────────────
+  # Start a temporary host instance to retrieve the actual function key from
+  # blob storage, then tear it down. The key is used for the cold start
+  # invocation so the auth code path matches production (function-level, not admin).
+
+  - ${{ if and(eq(parameters.createJitTrace, true), eq(parameters.instanceId, '1')) }}:
+    - ${{ if eq(parameters.os, 'Windows') }}:
+      - template: /eng/ci/templates/steps/configure-iis-site.yml@self
+        parameters:
+          createJitTrace: ${{ parameters.createJitTrace }}
+          instanceId: ${{ parameters.instanceId }}
+    - ${{ else }}:
+      - script: |
+          nohup $(hostOutputPath)/Microsoft.Azure.WebJobs.Script.WebHost > $(stdOutLogsFilePath) 2> $(stdErrorLogsFilePath) &
+          echo $! > $(Build.ArtifactStagingDirectory)/hostProcessId.txt
+        displayName: Start temporary host for key retrieval
+        env:
+          AzureWebJobsStorage: $(PGO-APP-AZURE-WEBJOBS-STORAGE)
+          WEBSITE_AUTH_ENCRYPTION_KEY: $(authEncryptionKeyHex)
+    - template: /eng/ci/templates/steps/wait-for-host.yml@self
+      parameters:
+        url: http://localhost:5000
+        displayName: Wait for temporary host
+    - pwsh: |
+        # Retrieve the default host function key from the admin API.
+        # Use /admin/host/functionkeys (not /admin/functions/{name}/keys which requires functions to be loaded).
+        $keysUrl = "http://localhost:5000/admin/host/functionkeys?code=test"
+        Write-Host "Retrieving host function keys from $keysUrl"
+        $response = Invoke-RestMethod -Uri $keysUrl -Method Get -ErrorAction Stop
+        $defaultKey = $response.keys | Where-Object { $_.name -eq "default" } | Select-Object -ExpandProperty value
+        if ($defaultKey) {
+            Write-Host "Retrieved default host function key (length: $($defaultKey.Length))"
+            Write-Host "##vso[task.setvariable variable=functionKey;issecret=true]$defaultKey"
+        } else {
+            throw "Default host function key not found."
+        }
+      displayName: Retrieve function key
+    - template: /eng/ci/templates/steps/stop-host.yml@self
+      parameters:
+        os: ${{ parameters.os }}
+        displayName: Stop temporary host
+
+  # ── Host Setup ────────────────────────────────────────────────────────────────
+  # Windows: IIS/ANCM hosting (production parity). Linux: direct process launch.
+
+  - ${{ if eq(parameters.os, 'Windows') }}:
+    - template: /eng/ci/templates/steps/configure-iis-site.yml@self
+      parameters:
+        createJitTrace: ${{ parameters.createJitTrace }}
+        instanceId: ${{ parameters.instanceId }}
+  - ${{ else }}:
+    - script: |
+        nohup $(hostOutputPath)/Microsoft.Azure.WebJobs.Script.WebHost > $(stdOutLogsFilePath) 2> $(stdErrorLogsFilePath) &
+        echo $! > $(Build.ArtifactStagingDirectory)/hostProcessId.txt
+      displayName: Start host in placeholder mode
+      env:
+        AzureWebJobsStorage: $(PGO-APP-AZURE-WEBJOBS-STORAGE)
+        # AES key for decrypting the EncryptedContext in /admin/instance/assign, and the key-ring
+        # key DataProtection uses to encrypt generated function secrets. Hex-normalized above.
+        WEBSITE_AUTH_ENCRYPTION_KEY: $(authEncryptionKeyHex)
+        # Expose precompiled and inlined methods and exercise telemetry during JIT trace generation.
+        ${{ if and(eq(parameters.createJitTrace, true), eq(parameters.instanceId, '1')) }}:
+          APPLICATIONINSIGHTS_CONNECTION_STRING: 'InstrumentationKey=unused'
+          DOTNET_ReadyToRun: '0'
+          DOTNET_JitNoInline: '1'
+
+  # ── Warmup & PID Capture ──────────────────────────────────────────────────────
+
+  - template: /eng/ci/templates/steps/wait-for-host.yml@self
+    parameters:
+      url: $(warmupApiUrl)
+      displayName: Wait until host is warmed up
+      # Allow extra startup time with ReadyToRun and inlining disabled.
+      ${{ if and(eq(parameters.createJitTrace, true), eq(parameters.instanceId, '1')) }}:
+        maxAttempts: 30
+
+  - ${{ if eq(parameters.os, 'Windows') }}:
+    - pwsh: |
+        # Resolve exactly one worker for this app pool; never attach by process name.
+        $workers = @(& "$env:SystemRoot\System32\inetsrv\appcmd.exe" list wp /apppool.name:FunctionsHostPool /text:WP.NAME)
+        $workerProcessId = 0
+        if ($LASTEXITCODE -ne 0 -or $workers.Count -ne 1 -or
+            -not [int]::TryParse($workers[0].Trim(), [ref]$workerProcessId) -or $workerProcessId -le 0) {
+            throw "Could not resolve exactly one w3wp PID for FunctionsHostPool."
+        }
+        Write-Host "w3wp PID for FunctionsHostPool: $workerProcessId"
+        Set-Content -LiteralPath "$(Build.ArtifactStagingDirectory)/hostProcessId.txt" -Value $workerProcessId -Encoding ascii
+      displayName: Capture w3wp process ID
+
+  # ── Trace Collection ──────────────────────────────────────────────────────────
+
+  - ${{ if and(eq(parameters.collectPerfViewProfileOnWindows, true), eq(parameters.instanceId, '1')) }}: # collect profile only on the first instance
+    - pwsh: |
+        if (Test-Path $(perfViewPath)) {
+            $collectArguments = ${env:COLLECT_ARGUMENTS}
+            Write-Host "PerfView.exe found. Executing with arguments '$collectArguments'"
+            $perfViewProcess = Start-Process -FilePath $(perfViewPath) -ArgumentList "collect $collectArguments /LogFile:$(traceLogPath) /DataFile:$(traceFilePath)" -NoNewWindow -PassThru
+            Write-Host "PerfView PID: $($perfViewProcess.Id)"
+            $perfViewProcess.Id | Out-File -FilePath "$(Build.ArtifactStagingDirectory)/perfViewProcessId.txt" -Encoding ascii
+        } else {
+            Write-Host "PerfView.exe not found in $(perfViewPath)"
+            exit 1
+        }
+      displayName: Start PerfView
+      env:
+        COLLECT_ARGUMENTS: ${{ parameters.perfViewCollectArguments }}
+
+  # ── Cold Start ────────────────────────────────────────────────────────────────
+  # Keep dotnet-trace and invocation in one PowerShell step so the collector can be
+  # awaited before host cleanup. Collection ends on duration, not an HTTP activity.
+
+  - template: /eng/ci/templates/steps/invoke-coldstart.yml@self
+    parameters:
+      os: ${{ parameters.os }}
+      collectNetTrace: ${{ and(eq(parameters.collectNetTrace, true), eq(parameters.instanceId, '1')) }}
+      netTraceCollectArguments: ${{ parameters.netTraceCollectArguments }}
+
+  # ── Post-Collection & Cleanup ───────────────────────────────────────────────
+
+  - ${{ if and(eq(parameters.collectPerfViewProfileOnWindows, true), eq(parameters.instanceId, '1')) }}:
+    - pwsh: |
+        Write-Host "Stopping PerfView..."
+        & $(perfViewPath) stop
+
+        # Wait for the zip file to be created
+        $maxAttempts = 20
+        $attempt = 0
+
+        while ($attempt -lt $maxAttempts) {
+            $files = Get-ChildItem -Path $(traceDirectory) -File
+            $fileCount = $files.Count
+
+            Write-Host "Found $fileCount file(s) in $(traceDirectory):"
+            foreach ($file in $files) {
+                Write-Host "  - $($file.Name)"
+            }
+            
+            if ($fileCount -eq 1 -and $files[0].Name -eq '$(traceFileZipName)') {
+                break
+            } else {
+                Write-Host "Expected zip file not found. Rechecking again in 15 seconds..."
+                Start-Sleep -Seconds 15
+                $attempt++
+            }
+        }
+
+        $perfViewPidFile = "$(Build.ArtifactStagingDirectory)/perfViewProcessId.txt"
+        if (Test-Path $perfViewPidFile) {
+            $perfViewPid = Get-Content $perfViewPidFile
+            $perfViewProcess = Get-Process -Id $perfViewPid -ErrorAction SilentlyContinue
+            if ($perfViewProcess) {
+                Write-Host "Stopping PerfView process with PID: $perfViewPid"
+                Stop-Process -Id $perfViewPid -Force
+            }
+        }
+
+        Write-Host "PerfView logs:"
+        Get-Content $(traceLogPath)
+      displayName: Stop PerfView
+
+    - pwsh: |
+        # Install the profile analyzer tool and run it on the trace file.
+        dotnet tool install -g Microsoft.Azure.Functions.ColdStartProfileAnalyzer --prerelease
+        func-cold-start-analyzer --file $(traceZipFilePath) --format markdown text
+
+        # Upload analysis result
+        Write-Host "##vso[task.addattachment type=Distributedtask.Core.Summary;name=$env:OS $env:FUNCTION_APP_NAME;]$(traceAnalysisResultMarkdownFilePath)"
+      displayName: Analyze profile
+      env:
+        FUNCTION_APP_NAME: ${{ parameters.functionAppName }}
+        OS: ${{ parameters.os }}
+
+  - template: /eng/ci/templates/steps/stop-host.yml@self
+    parameters:
+      os: ${{ parameters.os }}
+      displayName: Stop host process
+      condition: always()
+
+  - pwsh: |
+      $isWindowsOS = "${{ parameters.os }}" -eq "Windows"
+
+      if ($isWindowsOS) {
+          # On Windows/IIS, logs are written by ANCM to stdout log files
+          Write-Host "ANCM stdout logs:"
+          $stdoutLogs = Get-ChildItem "$(logsDirectory)/stdout*" -ErrorAction SilentlyContinue
+          if ($stdoutLogs) {
+              foreach ($log in $stdoutLogs) {
+                  Write-Host "--- $($log.Name) ---"
+                  Get-Content $log.FullName
+              }
+          } else {
+              Write-Host "No ANCM stdout log files found."
+          }
+      } else {
+          Write-Host "Logs:"
+          Get-Content $(stdOutLogsFilePath)
+          Write-Host "----"
+          Write-Host "Error logs:"
+          Get-Content $(stdErrorLogsFilePath)
+      }
+    displayName: Print logs
+    condition: always()
+
+  # ── Trace Analysis ────────────────────────────────────────────────────────────
+  # Record has already closed and finalized the trace. The external analyzer's own
+  # activity/window selection is unchanged; a complete capture does not widen that window.
+
+  - ${{ if and(eq(parameters.collectNetTrace, true), eq(parameters.instanceId, '1')) }}:
+    - pwsh: |
+        dotnet tool install -g Microsoft.Azure.Functions.ColdStartProfileAnalyzer --prerelease
+        $analyzerArgs = @($env:ANALYZER_ARGS -split '\s+' | Where-Object { $_ })
+        Write-Host "Invoking with arguments --file $(netTraceFilePath) --format markdown text $analyzerArgs"
+        func-cold-start-analyzer --file $(netTraceFilePath) --format markdown text @analyzerArgs
+      displayName: Generate JIT trace
+      ${{ if and(eq(parameters.createJitTrace, true), eq(parameters.instanceId, '1')) }}:
+        env:
+          ANALYZER_ARGS: --generate-jittrace
+
+    - pwsh: |
+        Get-ChildItem -Path "$(netTraceDirectory)"
+      displayName: List contents of netTraceDirectory
+
+    - pwsh: |
+        if (Test-Path $(netTraceAnalysisResultsMarkdownFilePath)) {
+            Write-Host "Analysis result file is present at $(netTraceAnalysisResultsMarkdownFilePath)"
+            Write-Host "##vso[task.addattachment type=Distributedtask.Core.Summary;name=$env:OS $env:FUNCTION_APP_NAME;]$(netTraceAnalysisResultsMarkdownFilePath)"
+        } else {
+            Write-Host "Analysis result file is not present at $(netTraceAnalysisResultsMarkdownFilePath)"
+        }
+      displayName: Upload analysis result
+      env:
+        FUNCTION_APP_NAME: ${{ parameters.functionAppName }}
+        OS: ${{ parameters.os }}

@@ -1,21 +1,19 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
-using System.Collections.Generic;
 using System.Linq;
 using System.Net.Http;
 using System.Text;
 using System.Threading.Tasks;
-using Microsoft.Azure.Storage;
-using Microsoft.Azure.Storage.File;
+using Azure.Storage.Files.Shares;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.WebHost.Configuration;
 using Microsoft.Azure.WebJobs.Script.WebHost.Management.LinuxSpecialization;
 using Microsoft.Azure.WebJobs.Script.WebHost.Models;
+using Microsoft.Azure.WebJobs.Script.Workers;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
-using Microsoft.IdentityModel.Tokens;
 using Newtonsoft.Json;
 
 namespace Microsoft.Azure.WebJobs.Script.WebHost.Management
@@ -33,11 +31,26 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management
         private readonly IOptionsFactory<ScriptApplicationHostOptions> _optionsFactory;
         private readonly HttpClient _client;
         private readonly IScriptWebHostEnvironment _webHostEnvironment;
+        private readonly IWorkerRuntimeResolver _workerRuntimeResolver;
 
-        public AtlasInstanceManager(IOptionsFactory<ScriptApplicationHostOptions> optionsFactory, IHttpClientFactory httpClientFactory, IScriptWebHostEnvironment webHostEnvironment,
-            IEnvironment environment, ILogger<AtlasInstanceManager> logger, IMetricsLogger metricsLogger, IMeshServiceClient meshServiceClient, IRunFromPackageHandler runFromPackageHandler,
-            IPackageDownloadHandler packageDownloadHandler) : base(httpClientFactory, webHostEnvironment,
-            environment, logger, metricsLogger, meshServiceClient)
+        public AtlasInstanceManager(
+            IOptionsFactory<ScriptApplicationHostOptions> optionsFactory,
+            IHttpClientFactory httpClientFactory,
+            IScriptWebHostEnvironment webHostEnvironment,
+            IEnvironment environment,
+            ILogger<AtlasInstanceManager> logger,
+            IMetricsLogger metricsLogger,
+            IMeshServiceClient meshServiceClient,
+            IRunFromPackageHandler runFromPackageHandler,
+            IPackageDownloadHandler packageDownloadHandler,
+            IWorkerRuntimeResolver workerRuntimeResolver)
+                : base(
+                      httpClientFactory,
+                      webHostEnvironment,
+                      environment,
+                      logger,
+                      metricsLogger,
+                      meshServiceClient)
         {
             _client = httpClientFactory?.CreateClient() ?? throw new ArgumentNullException(nameof(httpClientFactory));
             _webHostEnvironment = webHostEnvironment ?? throw new ArgumentNullException(nameof(webHostEnvironment));
@@ -48,6 +61,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management
             _packageDownloadHandler = packageDownloadHandler ?? throw new ArgumentNullException(nameof(packageDownloadHandler));
             _environment = environment ?? throw new ArgumentNullException(nameof(environment));
             _optionsFactory = optionsFactory ?? throw new ArgumentNullException(nameof(optionsFactory));
+            _workerRuntimeResolver = workerRuntimeResolver ?? throw new ArgumentNullException(nameof(workerRuntimeResolver));
         }
 
         public override async Task<string> SpecializeMSISidecar(HostAssignmentContext context)
@@ -96,6 +110,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management
                             Content = payload
                         };
 
+                        // CodeQL [SM03781] The address is constructed using the host and port from a trusted MSI endpoint, and a fixed path. Not an SSRF attack because this process is not multi-tenant and runs exclusively on customer-scoped compute. Any possibility of modifying those endpoints will require control of the entire environment already.
                         var response = await _client.SendAsync(requestMessage);
 
                         _logger.LogInformation($"Specialize MSI sidecar returned {response.StatusCode}");
@@ -194,6 +209,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management
                             using (_metricsLogger.LatencyEvent(eventName))
                             {
                                 var request = new HttpRequestMessage(HttpMethod.Head, blobUri);
+                                // CodeQL [SM03781] Not an SSRF attack because this process is not multi-tenant and runs exclusively on customer-scoped compute. Any possibility of modifying those endpoints will require control of the entire environment already. This is also only making a HEAD request to it to validate its existence and get the content length. We are not downloading or processing any content from the blobUri at this stage.
                                 response = await _client.SendAsync(request);
                                 response.EnsureSuccessStatusCode();
                                 if (response.Content != null && response.Content.Headers != null)
@@ -223,10 +239,12 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management
         {
             try
             {
-                var storageAccount = CloudStorageAccount.Parse(connectionString);
-                var fileClient = storageAccount.CreateCloudFileClient();
-                var share = fileClient.GetShareReference(contentShare);
-                await share.CreateIfNotExistsAsync();
+                // CodeQL [SM04255] Not an SSRF attack because this process is not multi-tenant and runs exclusively on customer-scoped compute. Any possibility of modifying those endpoints will require control of the entire environment already.
+                var shareServiceClient = new ShareServiceClient(connectionString);
+                var shareClient = shareServiceClient.GetShareClient(contentShare);
+
+                await shareClient.CreateIfNotExistsAsync();
+
                 return null;
             }
             catch (Exception e)
@@ -243,7 +261,8 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management
             var options = _optionsFactory.Create(ScriptApplicationHostOptionsSetup.SkipPlaceholder);
             RunFromPackageContext pkgContext = assignmentContext.GetRunFromPkgContext();
 
-            if (_environment.SupportsAzureFileShareMount() || pkgContext.IsRunFromLocalPackage())
+            var workerRuntime = _workerRuntimeResolver.GetWorkerRuntime();
+            if (Utility.IsAzureFileShareMountSupported(workerRuntime) || pkgContext.IsRunFromLocalPackage())
             {
                 var azureFilesMounted = false;
                 if (assignmentContext.IsAzureFilesContentShareConfigured(_logger))

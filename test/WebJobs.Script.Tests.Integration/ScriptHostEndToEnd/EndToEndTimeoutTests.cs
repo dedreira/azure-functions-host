@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
@@ -9,6 +9,7 @@ using System.Runtime.ExceptionServices;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Host;
 using Microsoft.Azure.WebJobs.Host.Timers;
+using Microsoft.Azure.WebJobs.Script.AppCapabilities;
 using Microsoft.Azure.WebJobs.Script.Config;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -18,6 +19,7 @@ using Xunit;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
 {
+    [Trait(TestTraits.Group, TestTraits.NonE2ETimeout)]
     public class EndToEndTimeoutTests
     {
         private static readonly ScriptSettingsManager SettingsManager = ScriptSettingsManager.Instance;
@@ -37,12 +39,12 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
         [Fact]
         public async Task TimeoutTest_UsingToken_CSharp()
         {
-            await RunTokenTest("useToken", async (logs) =>
+            await RunTokenTest("useToken", async () =>
              {
                  // The function should 'clean up' and write 'Done'
                  await TestHelpers.Await(() =>
                  {
-                     var doneLog = logs.SingleOrDefault(l => l.EndsWith("Done"));
+                     var doneLog = GetFormattedLogMessages().SingleOrDefault(l => l.EndsWith("Done"));
                      return doneLog != null;
                  });
              });
@@ -51,15 +53,17 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
         [Fact]
         public async Task TimeoutTest_IgnoringToken_CSharp()
         {
-            await RunTokenTest("ignoreToken", (logs) =>
+            await RunTokenTest("ignoreToken", () =>
              {
                  // We do not expect 'Done' to be written here.
+                 var logs = GetFormattedLogMessages();
                  Assert.NotEmpty(logs);
                  Assert.False(logs.Any(l => l.EndsWith("Done")));
+                 return Task.CompletedTask;
              });
         }
 
-        private async Task RunTokenTest(string scenario, Action<IEnumerable<string>> verify)
+        private async Task RunTokenTest(string scenario, Func<Task> verify)
         {
             string functionName = "TimeoutToken";
             TestHelpers.ClearFunctionLogs(functionName);
@@ -78,8 +82,15 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
                 var exception = GetExceptionHandler(host).TimeoutExceptionInfos.Single().SourceException;
                 Assert.IsType<FunctionTimeoutException>(exception);
 
-                verify(_loggerProvider.GetAllLogMessages().Where(t => t.FormattedMessage != null).Select(t => t.FormattedMessage));
+                await verify();
             }
+        }
+
+        private IEnumerable<string> GetFormattedLogMessages()
+        {
+            return _loggerProvider.GetAllLogMessages()
+                .Where(t => t.FormattedMessage != null)
+                .Select(t => t.FormattedMessage);
         }
 
         private async Task RunTimeoutTest(string scriptLang, string functionName)
@@ -137,6 +148,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
                .ConfigureServices(s =>
                {
                    s.AddSingleton<IWebJobsExceptionHandler, MockExceptionHandler>();
+                   s.AddSingleton<IAppCapabilitiesStore, DefaultAppCapabilitiesStore>();
                });
 
             return builder;

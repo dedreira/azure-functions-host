@@ -2,17 +2,14 @@
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
-using System.Collections.Generic;
-using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
-using System.Net.Http;
-using System.Net.Http.Headers;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Script.Config;
 using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.WebJobs.Script.Tests;
 using Xunit;
 
@@ -41,28 +38,26 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
         [Fact]
         public async Task JavaProcess_Different_AfterHostRestart()
         {
-            IEnumerable<int> javaProcessesBefore = Process.GetProcessesByName("java").Select(p => p.Id);
-            Assert.True(javaProcessesBefore.Count() > 0);
+            IJobHostRpcWorkerChannelManager manager = _fixture.Host.JobHostServices.GetService<IJobHostRpcWorkerChannelManager>();
+            var channels = manager.GetChannels("java").ToList();
+            Assert.Equal(1, channels.Count);
+            int processId = channels[0].WorkerProcess.Id;
+
             // Trigger a restart
             await _fixture.Host.RestartAsync(CancellationToken.None);
             await HttpTrigger_Java_Get_Succeeds();
-            IEnumerable<int> javaProcessesAfter = Process.GetProcessesByName("java").Select(p => p.Id);
-            Assert.True(javaProcessesAfter.Count() > 0);
-            // Verify number of java processes before and after restart are the same.
-            Assert.Equal(javaProcessesBefore.Count(), javaProcessesAfter.Count());
-            // Verify Java different java process is used after host restart
-            var result = javaProcessesBefore.Where(pId1 => javaProcessesAfter.Any(pId2 => pId2 == pId1));
-            Assert.Equal(0, result.Count());
+
+            // Verify after restart we have only 1 java channel still, and the process ID has changed.
+            manager = _fixture.Host.JobHostServices.GetService<IJobHostRpcWorkerChannelManager>();
+            channels = manager.GetChannels("java").ToList();
+            Assert.Equal(1, channels.Count);
+            Assert.NotEqual(processId, channels[0].WorkerProcess.Id);
         }
 
         public class TestFixture : EndToEndTestFixture
         {
-            static TestFixture()
-            {
-            }
-
             public TestFixture()
-                : base(Path.Combine(Environment.CurrentDirectory, "..", "..", "..", "..", "..", "sample", "java"), "samples", RpcWorkerConstants.JavaLanguageWorkerName)
+                : base(Path.Combine(Environment.CurrentDirectory, "..", "..", "..", "..", "sample", "java"), "samples", RpcWorkerConstants.JavaLanguageWorkerName)
             {
             }
 

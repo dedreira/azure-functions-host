@@ -286,7 +286,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Configuration
         [InlineData("never", FileLoggingMode.Never)]
         [InlineData("always", FileLoggingMode.Always)]
         [InlineData("debugOnly", FileLoggingMode.DebugOnly)]
-        public void ConfigureW_WithConfiguration_AppliesFileLoggingMode(string setting, FileLoggingMode expectedMode)
+        public void Configure_WithConfiguration_AppliesFileLoggingMode(string setting, FileLoggingMode expectedMode)
         {
             var settings = new Dictionary<string, string>
             {
@@ -296,6 +296,74 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Configuration
             var options = GetConfiguredOptions(settings);
 
             Assert.Equal(expectedMode, options.FileLoggingMode);
+        }
+
+        [Theory]
+        [InlineData(null, true)]
+        [InlineData("true", true)]
+        [InlineData("false", false)]
+        public void Configure_WithConfiguration_AppliesSendCanceledInvocationsToWorker(string setting, bool expected)
+        {
+            var settings = new Dictionary<string, string>();
+
+            if (setting != null)
+            {
+                settings.Add(ConfigurationPath.Combine(ConfigurationSectionNames.JobHost, "sendCanceledInvocationsToWorker"), setting);
+            }
+
+            var options = GetConfiguredOptions(settings);
+
+            Assert.Equal(expected, options.SendCanceledInvocationsToWorker);
+        }
+
+        [Theory]
+        [InlineData("openTelemetry", "OpenTelemetry")]
+        [InlineData("openTELemetry", "OpenTelemetry")]
+        [InlineData("applicationInsights", "ApplicationInsights")]
+        [InlineData("", "ApplicationInsights")]
+        [InlineData("junk", "ApplicationInsights")]
+        public void Configure_WithConfiguration_AppliesTelemetryMode(string setting, string expectedMode)
+        {
+            var settings = new Dictionary<string, string>
+            {
+                { ConfigurationPath.Combine(ConfigurationSectionNames.JobHost, ConfigurationSectionNames.TelemetryMode), setting }
+            };
+
+            var options = GetConfiguredOptions(settings);
+
+            Assert.Equal(expectedMode, options.TelemetryMode.ToString());
+        }
+
+        [Fact]
+        public void Configure_MetadataProviderTimeout_ValidateDefaultTimeoutValue()
+        {
+            var options = GetConfiguredOptions(new Dictionary<string, string>());
+
+            Assert.Equal(TimeSpan.FromSeconds(30), options.MetadataProviderTimeout);
+        }
+
+        [Fact]
+        public void Configure_MetadataProviderTimeout_IsLogicApp_SetTimeoutToInfinite()
+        {
+            var environment = new TestEnvironment();
+            environment.SetEnvironmentVariable(EnvironmentSettingNames.AppKind, "workflowapp");
+
+            var options = GetConfiguredOptions(new Dictionary<string, string>(), environment);
+
+            Assert.Equal(TimeSpan.FromMilliseconds(-1), options.MetadataProviderTimeout);
+        }
+
+        [Fact]
+        public void Configure_MetadataProviderTimeout_AppliesConfiguredTimeoutValue()
+        {
+            var settings = new Dictionary<string, string>
+            {
+                { ConfigurationPath.Combine(ConfigurationSectionNames.JobHost, "metadataProviderTimeout"), "00:00:43" }
+            };
+
+            var options = GetConfiguredOptions(settings);
+
+            Assert.Equal(TimeSpan.FromSeconds(43), options.MetadataProviderTimeout);
         }
 
         private ScriptJobHostOptions GetConfiguredOptions(Dictionary<string, string> settings, IEnvironment environment = null)

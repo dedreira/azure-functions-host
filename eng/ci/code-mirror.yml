@@ -1,0 +1,22 @@
+trigger:
+  branches:
+    include:
+    - dev
+    - in-proc
+    - release/*
+  tags:
+    include:
+    - '*'
+
+resources:
+  repositories:
+  - repository: eng
+    type: git
+    name: engineering
+    ref: refs/tags/release
+
+variables:
+  - template: ci/variables/cfs.yml@eng
+
+extends:
+  template: ci/code-mirror.yml@eng

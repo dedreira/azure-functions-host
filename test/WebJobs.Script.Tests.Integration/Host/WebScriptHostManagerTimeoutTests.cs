@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
@@ -12,9 +12,11 @@ using Microsoft.Azure.WebJobs.Host;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Xunit;
+using Microsoft.WebJobs.Script.Tests;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests.Host
 {
+    [Trait(TestTraits.Group, TestTraits.NonE2ESpecialization)]
     public class WebScriptHostManagerTimeoutTests
     {
         private TestDisposable _disposedService = new TestDisposable();
@@ -22,7 +24,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Host
         [Fact]
         public async Task OnTimeoutException_IgnoreToken_StopsManager()
         {
-            using (var host = await RunTimeoutExceptionTest(handleCancellation: false))
+            await using (var host = await RunTimeoutExceptionTest(handleCancellation: false))
             {
                 var jobHostManager = host.WebHostServices.GetService<IScriptHostManager>();
 
@@ -41,7 +43,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Host
         [Fact]
         public async Task OnTimeoutException_UsesToken_ManagerKeepsRunning()
         {
-            using (var host = await RunTimeoutExceptionTest(handleCancellation: true))
+            await using (var host = await RunTimeoutExceptionTest(handleCancellation: true))
             {
                 var jobHostManager = host.WebHostServices.GetService<IScriptHostManager>();
 
@@ -60,18 +62,25 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Host
         public async Task OnTimeoutException_OOP_HasExpectedLogs()
         {
             Environment.SetEnvironmentVariable(EnvironmentSettingNames.FunctionWorkerRuntime, "node");
-            using (var host = await RunTimeoutExceptionTest(handleCancellation: false, timeoutFunctionName: "TimeoutSync", path: @"TestScripts\Node"))
+            try
             {
-                var jobHostManager = host.WebHostServices.GetService<IScriptHostManager>();
+                await using (var host = await RunTimeoutExceptionTest(handleCancellation: false, timeoutFunctionName: "TimeoutSync", path: @"TestScripts\Node"))
+                {
+                    var jobHostManager = host.WebHostServices.GetService<IScriptHostManager>();
 
-                // wait a few seconds to make sure the manager doesn't die
-                await Assert.ThrowsAsync<ApplicationException>(() => TestHelpers.Await(() => !(jobHostManager.State == ScriptHostState.Running),
-                timeout: 3000, throwWhenDebugging: true, userMessageCallback: () => "Expected host manager not to die"));
+                    // wait a few seconds to make sure the manager doesn't die
+                    await Assert.ThrowsAsync<ApplicationException>(() => TestHelpers.Await(() => !(jobHostManager.State == ScriptHostState.Running),
+                    timeout: 3000, throwWhenDebugging: true, userMessageCallback: () => "Expected host manager not to die"));
 
-                var messages = host.GetScriptHostLogMessages().Where(t => t?.FormattedMessage != null);
-                Assert.Contains(messages, t => t.FormattedMessage.StartsWith("A function timeout has occurred. Restarting worker process executing invocationId "));
-                Assert.Contains(messages, t => t.FormattedMessage.StartsWith("Restarting channel"));
-                Assert.Contains(messages, t => t.FormattedMessage == "Restart of language worker process(es) completed.");
+                    var messages = host.GetScriptHostLogMessages().Where(t => t?.FormattedMessage != null);
+                    Assert.Contains(messages, t => t.FormattedMessage.StartsWith("A function timeout has occurred. Restarting worker process executing invocationId "));
+                    Assert.Contains(messages, t => t.FormattedMessage.StartsWith("Restarting channel"));
+                    Assert.Contains(messages, t => t.FormattedMessage == "Attempt to restart language worker process(es) completed.");
+                }
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable(EnvironmentSettingNames.FunctionWorkerRuntime, null);
             }
         }
 

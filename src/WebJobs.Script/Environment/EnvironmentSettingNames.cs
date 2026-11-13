@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 namespace Microsoft.Azure.WebJobs.Script
@@ -11,6 +11,7 @@ namespace Microsoft.Azure.WebJobs.Script
         public const string AzureWebsiteOwnerName = "WEBSITE_OWNER_NAME";
         public const string AzureWebsiteInstanceId = "WEBSITE_INSTANCE_ID";
         public const string AzureWebsiteSku = "WEBSITE_SKU";
+        public const string AzureWebsiteSkuName = "WEBSITE_SKU_NAME";
         public const string RemoteDebuggingPort = "REMOTEDEBUGGINGPORT";
         public const string AzureWebsitePlaceholderMode = "WEBSITE_PLACEHOLDER_MODE";
         public const string AzureWebsiteUsePlaceholderDotNetIsolated = "WEBSITE_USE_PLACEHOLDER_DOTNETISOLATED";
@@ -26,13 +27,20 @@ namespace Microsoft.Azure.WebJobs.Script
         public const string AzureWebJobsSecretStorage = "AzureWebJobsStorage";
         public const string AppInsightsInstrumentationKey = "APPINSIGHTS_INSTRUMENTATIONKEY";
         public const string AppInsightsConnectionString = "APPLICATIONINSIGHTS_CONNECTION_STRING";
+        public const string AppInsightsAuthenticationString = "APPLICATIONINSIGHTS_AUTHENTICATION_STRING";
+        public const string AppInsightsEventListenerLogLevel = "APPLICATIONINSIGHTS_EVENT_LISTENER_LOGLEVEL";
         public const string AppInsightsQuickPulseAuthApiKey = "APPINSIGHTS_QUICKPULSEAUTHAPIKEY";
+        public const string OtlpEndpoint = "OTEL_EXPORTER_OTLP_ENDPOINT";
+        public const string OpenTelemetryEventListenerLogLevel = "OTEL_EVENT_LISTENER_LOGLEVEL";
         public const string AppInsightsAgent = "APPLICATIONINSIGHTS_ENABLE_AGENT";
         public const string FunctionsExtensionVersion = "FUNCTIONS_EXTENSION_VERSION";
         public const string FunctionWorkerRuntime = "FUNCTIONS_WORKER_RUNTIME";
+        public const string FunctionsSiteUpdateId = "FUNCTIONS_SITE_UPDATE_ID";
+        public const string WorkerProbingPaths = "WORKER_PROBING_PATHS";
         public const string ContainerName = "CONTAINER_NAME";
         public const string WebsitePodName = "WEBSITE_POD_NAME";
         public const string LegionServiceHost = "LEGION_SERVICE_HOST";
+        public const string FunctionsNotifyPlatformOnSync = "FUNCTIONS_NOTIFY_PLATFORM_ON_SYNC";
         public const string WebSiteHomeStampName = "WEBSITE_HOME_STAMPNAME";
         public const string WebSiteStampDeploymentId = "WEBSITE_STAMP_DEPLOYMENT_ID";
         public const string WebSiteAuthEncryptionKey = "WEBSITE_AUTH_ENCRYPTION_KEY";
@@ -65,13 +73,22 @@ namespace Microsoft.Azure.WebJobs.Script
         public const string CloudName = "WEBSITE_CLOUD_NAME";
         public const string RoleInstanceId = "RoleInstanceId";
         public const string HealthPingEnabled = "WEBSITE_FUNCTIONS_HEALTH_PING_ENABLED";
-        public const string TestDataCapEnabled = "WEBSITE_FUNCTIONS_TESTDATA_CAP_ENABLED";
         public const string AzureMonitorCategories = "WEBSITE_FUNCTIONS_AZUREMONITOR_CATEGORIES";
         public const string FunctionsRequestBodySizeLimit = "FUNCTIONS_REQUEST_BODY_SIZE_LIMIT";
         public const string FunctionsHostIdCheckLevel = "FUNCTIONS_HOSTID_CHECK_LEVEL";
         public const string FunctionsPlatformConfigFilePath = "FUNCTIONS_PLATFORM_CONFIG_FILE_PATH";
+        public const string FunctionsHostingEnvironmentConfigFilePath = "FUNCTIONS_HOSTING_ENVIRONMENT_CONFIG_FILE_PATH";
         public const string TargetBaseScalingEnabled = "TARGET_BASED_SCALING_ENABLED";
         public const string WebsiteNodeDefaultVersion = "WEBSITE_NODE_DEFAULT_VERSION";
+        public const string FunctionsMetricsPublishPath = "FUNCTIONS_METRICS_PUBLISH_PATH";
+        public const string FunctionsAlwaysReadyInstance = "FUNCTIONS_ALWAYSREADY_INSTANCE";
+        public const string FunctionsTimeZone = "TZ";
+        public const string FunctionsWebsiteTimeZone = "WEBSITE_TIME_ZONE";
+        public const string FunctionsTargetGroup = "FUNCTIONS_TARGET_GROUP";
+        public const string WebsiteArmResourceId = "WEBSITE_ARM_RESOURCE_ID";
+        public const string FunctionsDisableInProc = "FUNCTIONS_DISABLE_INPROC";
+        public const string ResourceGroup = "WEBSITE_RESOURCE_GROUP";
+        public const string WebsiteOwnerName = "WEBSITE_OWNER_NAME";
 
         //Function in Kubernetes
         public const string PodNamespace = "POD_NAMESPACE";
@@ -108,6 +125,7 @@ namespace Microsoft.Azure.WebJobs.Script
         public const string LinuxAzureAppServiceStorage = "WEBSITES_ENABLE_APP_SERVICE_STORAGE";
         public const string CoreToolsEnvironment = "FUNCTIONS_CORETOOLS_ENVIRONMENT";
         public const string RunningInContainer = "DOTNET_RUNNING_IN_CONTAINER";
+        public const string EnableCorsConfiguration = "FUNCTIONS_ENABLE_CORS_CONFIGURATION";
 
         public const string ExtensionBundleSourceUri = "FUNCTIONS_EXTENSIONBUNDLE_SOURCE_URI";
 
@@ -118,7 +136,6 @@ namespace Microsoft.Azure.WebJobs.Script
         public const string KubernetesServiceHttpsPort = "KUBERNETES_SERVICE_PORT_HTTPS";
         public const string FunctionsLogPath = "FUNCTIONS_LOG_PATH";
         public const string FunctionsSecretsPath = "FUNCTIONS_SECRETS_PATH";
-        public const string FunctionsTestDataPath = "FUNCTIONS_TEST_DATA_PATH";
         public const string MeshInitURI = "MESH_INIT_URI";
 
         // CORS settings
@@ -133,10 +150,15 @@ namespace Microsoft.Azure.WebJobs.Script
         public const string AntaresPlatformVersionWindows = "WEBSITE_PLATFORM_VERSION";
         public const string AntaresPlatformVersionLinux = "PLATFORM_VERSION";
 
+        // Antares Release Channel / RU Feed Settings
+        public const string AntaresPlatformReleaseChannel = "WEBSITE_PlatformReleaseChannel";
+
         // Machine identifier
         public const string AntaresComputerName = "COMPUTERNAME";
 
         public const string AppKind = "APP_KIND";
+
+        public const string LogicAppCodefulModeEnabled = "WORKFLOW_CODEFUL_ENABLED";
 
         public const string DrainOnApplicationStopping = "FUNCTIONS_ENABLE_DRAIN_ON_APP_STOPPING";
     }

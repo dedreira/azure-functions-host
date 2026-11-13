@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
@@ -9,14 +9,17 @@ using System.Net;
 using System.Net.Http;
 using System.Text;
 using System.Threading.Tasks;
+using Microsoft.Azure.WebJobs.Script.Tests.Integration.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.WebHost;
 using Microsoft.Azure.WebJobs.Script.WebHost.Authentication;
+using Microsoft.Azure.WebJobs.Script.WebHost.Metrics;
 using Microsoft.Azure.WebJobs.Script.WebHost.Models;
 using Microsoft.Azure.WebJobs.Script.WebHost.Security;
 using Microsoft.Azure.WebJobs.Script.Workers;
 using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Microsoft.WebJobs.Script.Tests;
 using Newtonsoft.Json;
@@ -30,7 +33,47 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
     public class StandbyManagerE2ETests_Linux : StandbyManagerE2ETestBase
     {
         [Fact]
-        public async Task StandbyModeE2E_LinuxContainer()
+        public async Task StandbyModeE2E_LinuxConsumptionOnLegion()
+        {
+            var vars = new Dictionary<string, string>
+            {
+                { EnvironmentSettingNames.AzureWebsitePlaceholderMode, "1" },
+                { EnvironmentSettingNames.ContainerName, "testContainer" },
+                { EnvironmentSettingNames.AzureWebsiteHostName, "testapp.azurewebsites.net" },
+                { EnvironmentSettingNames.AzureWebsiteName, "TestApp" },
+                { EnvironmentSettingNames.ContainerEncryptionKey, Convert.ToBase64String(TestHelpers.GenerateKeyBytes()) },
+                { EnvironmentSettingNames.AzureWebsiteContainerReady, null },
+                { EnvironmentSettingNames.AzureWebsiteSku, "Dynamic" },
+                { EnvironmentSettingNames.AzureWebsiteZipDeployment, null },
+                { EnvironmentSettingNames.AzureWebJobsFeatureFlags, ScriptConstants.FeatureFlagEnableProxies },
+                { "AzureWebEncryptionKey", "0F75CA46E7EBDD39E4CA6B074D1F9A5972B849A55F91A248" },
+                { EnvironmentSettingNames.FunctionsTimeZone, "Europe/Berlin" },
+                { EnvironmentSettingNames.FunctionWorkerRuntime, "dotnet-isolated" },
+                { EnvironmentSettingNames.LegionServiceHost, "1"}
+            };
+
+            var environment = new TestEnvironment(vars);
+
+            Assert.True(environment.IsLinuxConsumptionOnLegion());
+            Assert.False(environment.IsFlexConsumptionSku());
+            Assert.True(environment.IsAnyLinuxConsumption());
+
+            var webHost = await InitializeTestHostAsync("Linux", environment);
+
+            // verify the expected startup logs
+            var logEntries = _loggerProvider.GetAllLogMessages().Where(p => p.FormattedMessage != null).ToList();
+            Assert.True(logEntries.Any(m => m.Category == "Host.Startup" && m.FormattedMessage.Contains("Host is in standby mode")));
+            Assert.True(logEntries.Any(cat => cat.Category == "Microsoft.Azure.WebJobs.Script.WebHost.StandbyManager"));
+            Assert.True(logEntries.Any(cat => cat.Category == "Host.Triggers.Warmup"));
+
+            // verify that the expected (legion specific) implementations are resolved
+            Assert.Equal(typeof(LinuxContainerLegionMetricsPublisher), webHost.Services.GetRequiredService<IMetricsPublisher>().GetType());
+        }
+
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+        public async Task StandbyModeE2E_LinuxContainer(bool useEncryptedPayload)
         {
             byte[] bytes = TestHelpers.GenerateKeyBytes();
             var encryptionKey = Convert.ToBase64String(bytes);
@@ -59,7 +102,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             await InitializeTestHostAsync("Linux", environment);
 
             // Check that the filesystem is not read-only before specialization.
-            var options = _httpServer.Host.Services.GetService<IOptionsMonitor<ScriptApplicationHostOptions>>();
+            var options = _webHost.Services.GetService<IOptionsMonitor<ScriptApplicationHostOptions>>();
             Assert.False(options.CurrentValue.IsFileSystemReadOnly);
 
             // verify only the Warmup function is present
@@ -73,7 +116,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             await VerifyWarmupSucceeds(restart: true);
 
             // now specialize the site
-            await Assign(encryptionKey);
+            await Assign(encryptionKey, useEncryptedPayload);
 
             // immediately call a function - expect the call to block until
             // the host is fully specialized
@@ -86,8 +129,8 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             // now that the host is initialized, send a valid key
             // and expect success
-            var secretManager = _httpServer.Host.Services.GetService<ISecretManagerProvider>().Current;
-            var fd = _httpServer.Host.Services.GetService<IFunctionInvocationDispatcherFactory>();
+            var secretManager = _webHost.Services.GetService<ISecretManagerProvider>().Current;
+            var fd = _webHost.Services.GetService<IFunctionInvocationDispatcherFactory>();
             var keys = await secretManager.GetFunctionSecretsAsync("HttpTrigger");
             string key = keys.First().Value;
             request = new HttpRequestMessage(HttpMethod.Get, $"api/httptrigger?code={key}");
@@ -138,6 +181,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             Assert.Equal(2, logLines.Count(p => p.Contains($"1 proxies loaded")));
             Assert.Equal(1, logLines.Count(p => p.Contains($"0 proxies loaded")));
             Assert.Contains("Node.js HttpTrigger function invoked.", logLines);
+            Assert.Equal(3, logLines.Count(p => p.Contains($"Unable to load the functions payload since the app was not provisioned with valid {EnvironmentSettingNames.AzureWebJobsSecretStorage} connection string.")));
 
             // verify cold start log entry
             var coldStartLog = _loggerProvider.GetAllLogMessages().FirstOrDefault(p => p.Category == ScriptConstants.LogCategoryHostMetrics);
@@ -152,7 +196,53 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             Assert.NotSame(GetCachedTimeZoneInfo(), _originalTimeZoneInfoCache);
         }
 
-        private async Task Assign(string encryptionKey)
+        [Fact]
+        public async Task LinuxContainer_TimeZoneEnvVariableE2E()
+        {
+            byte[] bytes = TestHelpers.GenerateKeyBytes();
+            var encryptionKey = Convert.ToBase64String(bytes);
+            var containerName = "testContainer";
+
+            var vars = new Dictionary<string, string>
+            {
+                { EnvironmentSettingNames.AzureWebsitePlaceholderMode, "1" },
+                { EnvironmentSettingNames.ContainerName, containerName },
+                { EnvironmentSettingNames.AzureWebsiteHostName, "testapp.azurewebsites.net" },
+                { EnvironmentSettingNames.AzureWebsiteName, "TestApp" },
+                { EnvironmentSettingNames.ContainerEncryptionKey, encryptionKey },
+                { EnvironmentSettingNames.AzureWebsiteContainerReady, null },
+                { EnvironmentSettingNames.AzureWebsiteSku, "Dynamic" },
+                { EnvironmentSettingNames.AzureWebsiteZipDeployment, null },
+                { EnvironmentSettingNames.AzureWebJobsFeatureFlags, ScriptConstants.FeatureFlagEnableProxies },
+                { "AzureWebEncryptionKey", "0F75CA46E7EBDD39E4CA6B074D1F9A5972B849A55F91A248" },
+                { EnvironmentSettingNames.FunctionsTimeZone, "Europe/Berlin" }
+            };
+
+            var environment = new TestEnvironment(vars);
+
+            Assert.True(environment.IsLinuxConsumptionOnAtlas());
+            Assert.False(environment.IsFlexConsumptionSku());
+            Assert.True(environment.IsAnyLinuxConsumption());
+
+            await InitializeTestHostAsync("Linux", environment);
+
+            var expectedTraceMessage = "The environment variables 'WEBSITE_TIME_ZONE' and 'TZ' are not supported on this platform. For more information, see https://go.microsoft.com/fwlink/?linkid=2250165.";
+
+            // verify the expected logs
+            var logLines = _loggerProvider.GetAllLogMessages().Where(p => p.FormattedMessage != null).Select(p => p.FormattedMessage).ToArray();
+            Assert.Equal(2, logLines.Count(p => p.Contains(expectedTraceMessage)));
+
+            DiagnosticEventTestUtils.ValidateThatTheExpectedDiagnosticEventIsPresent(
+            _loggerProvider,
+                expectedTraceMessage,
+                LogLevel.Error,
+                DiagnosticEventConstants.LinuxConsumptionTimeZoneErrorHelpLink,
+                DiagnosticEventConstants.LinuxConsumptionTimeZoneErrorCode
+            );
+
+        }
+
+        private async Task Assign(string encryptionKey, bool useEncryptedPayload)
         {
             // create a zip package
             var testFunctionPath = Path.Combine("TestScripts", "Node", "HttpTrigger");
@@ -162,42 +252,46 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             await TestHelpers.CreateContentZip(contentRoot, zipFilePath, testFunctionPath);
 
             // upload the blob and get a SAS uri
-            var configuration = _httpServer.Host.Services.GetService<IConfiguration>();
+            var configuration = _webHost.Services.GetService<IConfiguration>();
             string connectionString = configuration.GetWebJobsConnectionString(ConnectionStringNames.Storage);
             var sasUri = await TestHelpers.CreateBlobSas(connectionString, zipFilePath, "azure-functions-test", "appcontents.zip");
 
             // Now specialize the host by invoking assign
-            var secretManager = _httpServer.Host.Services.GetService<ISecretManagerProvider>().Current;
+            var secretManager = _webHost.Services.GetService<ISecretManagerProvider>().Current;
             var masterKey = (await secretManager.GetHostSecretsAsync()).MasterKey;
             string uri = "admin/instance/assign";
             var request = new HttpRequestMessage(HttpMethod.Post, uri);
             var environment = new Dictionary<string, string>()
-                {
-                    { EnvironmentSettingNames.AzureWebsiteZipDeployment, sasUri.ToString() },
-                    { RpcWorkerConstants.FunctionWorkerRuntimeVersionSettingName, "~2" },
-                    { RpcWorkerConstants.FunctionWorkerRuntimeSettingName, "node" }
-                };
+            {
+                { EnvironmentSettingNames.AzureWebsiteZipDeployment, sasUri.ToString() },
+                { RpcWorkerConstants.FunctionWorkerRuntimeVersionSettingName, "~2" },
+                { EnvironmentSettingNames.FunctionWorkerRuntime, "node" }
+            };
             var assignmentContext = new HostAssignmentContext
             {
                 SiteId = 1234,
                 SiteName = "TestApp",
                 Environment = environment
             };
-            var encryptedAssignmentContext = CreateEncryptedContext(assignmentContext, encryptionKey);
-            string json = JsonConvert.SerializeObject(encryptedAssignmentContext);
+            var hostAssignmentRequest = CreateHostAssignmentRequest(assignmentContext, encryptionKey, useEncryptedPayload);
+            string json = JsonConvert.SerializeObject(hostAssignmentRequest);
             request.Content = new StringContent(json, Encoding.UTF8, "application/json");
             request.Headers.Add(AuthenticationLevelHandler.FunctionsKeyHeaderName, masterKey);
             var response = await _httpClient.SendAsync(request);
             Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
         }
 
-        private static EncryptedHostAssignmentContext CreateEncryptedContext(HostAssignmentContext context, string key)
+        private static HostAssignmentRequest CreateHostAssignmentRequest(HostAssignmentContext context, string key, bool useEncryptedPayload)
         {
+            if (!useEncryptedPayload)
+            {
+                return new HostAssignmentRequest { AssignmentContext = context };
+            }
+
             string json = JsonConvert.SerializeObject(context);
             var encryptionKey = Convert.FromBase64String(key);
-            string encrypted = SimpleWebTokenHelper.Encrypt(json, encryptionKey);
-
-            return new EncryptedHostAssignmentContext { EncryptedContext = encrypted };
+            string encrypted = EncryptionHelper.Encrypt(json, encryptionKey);
+            return new HostAssignmentRequest { EncryptedContext = encrypted };
         }
     }
 }

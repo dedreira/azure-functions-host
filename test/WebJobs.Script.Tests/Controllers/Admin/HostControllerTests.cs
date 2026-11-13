@@ -1,22 +1,26 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
 using System.IO;
 using System.Net;
+using System.Security.Claims;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Azure.WebJobs.Extensions.Http;
 using Microsoft.Azure.WebJobs.Host;
 using Microsoft.Azure.WebJobs.Host.Executors;
 using Microsoft.Azure.WebJobs.Host.Scale;
+using Microsoft.Azure.WebJobs.Logging;
 using Microsoft.Azure.WebJobs.Script.ExtensionBundle;
 using Microsoft.Azure.WebJobs.Script.Models;
 using Microsoft.Azure.WebJobs.Script.Scale;
 using Microsoft.Azure.WebJobs.Script.WebHost.Controllers;
 using Microsoft.Azure.WebJobs.Script.WebHost.Management;
 using Microsoft.Azure.WebJobs.Script.WebHost.Models;
+using Microsoft.Azure.WebJobs.Script.WebHost.Security.Authentication;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Microsoft.WebJobs.Script.Tests;
@@ -39,6 +43,8 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         private readonly ScriptApplicationHostOptions _applicationHostOptions;
         private readonly Mock<IScaleStatusProvider> _scaleStatusProvider;
         private readonly LoggerFactory _loggerFactory;
+        private readonly TestMetricsLogger _testMetricsLogger;
+        private ScriptHostState _scriptHostState;
 
         public HostControllerTests()
         {
@@ -53,7 +59,8 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             _mockEnvironment = new Mock<IEnvironment>(MockBehavior.Strict);
             _mockEnvironment.Setup(p => p.GetEnvironmentVariable(It.IsAny<string>())).Returns<string>(null);
             _mockScriptHostManager = new Mock<IScriptHostManager>(MockBehavior.Strict);
-            _mockScriptHostManager.SetupGet(p => p.State).Returns(ScriptHostState.Running);
+            _scriptHostState = ScriptHostState.Running;
+            _mockScriptHostManager.SetupGet(p => p.State).Returns(() => _scriptHostState);
             _functionsSyncManager = new Mock<IFunctionsSyncManager>(MockBehavior.Strict);
             _extensionBundleManager = new Mock<IExtensionBundleManager>(MockBehavior.Strict);
 
@@ -61,7 +68,8 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             _hostHealthMonitorOptions = new HostHealthMonitorOptions();
             var wrappedHealthMonitorOptions = new OptionsWrapper<HostHealthMonitorOptions>(_hostHealthMonitorOptions);
             _mockHostPerformanceManager = new Mock<HostPerformanceManager>(_mockEnvironment.Object, wrappedHealthMonitorOptions, mockServiceProvider.Object);
-            _hostController = new HostController(optionsWrapper, _loggerFactory, _mockEnvironment.Object, _mockScriptHostManager.Object, _functionsSyncManager.Object, _mockHostPerformanceManager.Object);
+            _testMetricsLogger = new TestMetricsLogger();
+            _hostController = new HostController(optionsWrapper, _loggerFactory, _mockEnvironment.Object, _mockScriptHostManager.Object, _functionsSyncManager.Object, _mockHostPerformanceManager.Object, _testMetricsLogger);
 
             _appOfflineFilePath = Path.Combine(_scriptPath, ScriptConstants.AppOfflineFileName);
             if (File.Exists(_appOfflineFilePath))
@@ -108,6 +116,28 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             var result = (OkObjectResult)(await _hostController.GetHostStatus(_mockScriptHostManager.Object, mockHostIdProvider.Object, mockserviceProvider.Object));
             var status = (HostStatus)result.Value;
             Assert.Equal(status.FunctionAppContentEditingState, isFunctionAppContentEditable);
+        }
+
+        [Fact]
+        public async Task GetHostStatus_SanitizesLastError()
+        {
+            const string secret = "test-storage-account-key";
+            var lastError = new InvalidOperationException("Host startup failed.", new InvalidOperationException($"AccountKey={secret}"));
+            _mockScriptHostManager.SetupGet(p => p.LastError).Returns(lastError);
+
+            var mockHostIdProvider = new Mock<IHostIdProvider>(MockBehavior.Strict);
+            mockHostIdProvider.Setup(p => p.GetHostIdAsync(CancellationToken.None)).ReturnsAsync("test123");
+
+            var mockServiceProvider = new Mock<IServiceProvider>(MockBehavior.Strict);
+            mockServiceProvider.Setup(p => p.GetService(typeof(IExtensionBundleManager))).Returns(null);
+
+            var result = Assert.IsType<OkObjectResult>(
+                await _hostController.GetHostStatus(_mockScriptHostManager.Object, mockHostIdProvider.Object, mockServiceProvider.Object));
+            var status = Assert.IsType<HostStatus>(result.Value);
+            string error = Assert.Single(status.Errors);
+
+            Assert.Contains(Sanitizer.SecretReplacement, error);
+            Assert.DoesNotContain(secret, error);
         }
 
         [Theory]
@@ -272,11 +302,40 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         }
 
         [Fact]
+        public async Task GetDrain_HostRunning_BeginsDrain()
+        {
+            var scriptHostManagerMock = new Mock<IScriptHostManager>(MockBehavior.Strict);
+            var drainModeManager = new Mock<IDrainModeManager>(MockBehavior.Strict);
+            drainModeManager.Setup(m => m.EnableDrainModeAsync(default)).Returns(Task.CompletedTask);
+            var serviceProviderMock = scriptHostManagerMock.As<IServiceProvider>();
+            serviceProviderMock.Setup(x => x.GetService(typeof(IDrainModeManager))).Returns(drainModeManager.Object);
+
+            var result = (AcceptedResult)await _hostController.Drain(scriptHostManagerMock.Object, default);
+            Assert.Equal(StatusCodes.Status202Accepted, result.StatusCode);
+            drainModeManager.Verify(x => x.EnableDrainModeAsync(default), Times.Once());
+        }
+
+        [Fact]
+        public async Task GetDrain_HostRunning_ClientDisconnect_DoesNotDrain()
+        {
+            var scriptHostManagerMock = new Mock<IScriptHostManager>(MockBehavior.Strict);
+            var drainModeManager = new Mock<IDrainModeManager>(MockBehavior.Strict);
+            var serviceProviderMock = scriptHostManagerMock.As<IServiceProvider>();
+            serviceProviderMock.Setup(x => x.GetService(typeof(IDrainModeManager))).Returns(drainModeManager.Object);
+
+            using var cts = new CancellationTokenSource();
+            cts.Cancel();
+
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => _hostController.Drain(scriptHostManagerMock.Object, cts.Token));
+            drainModeManager.Verify(x => x.EnableDrainModeAsync(default), Times.Never);
+        }
+
+        [Fact]
         public async Task GetDrain_HostNotRunning_ReturnsServiceUnavailable()
         {
             var scriptHostManagerMock = new Mock<IScriptHostManager>(MockBehavior.Strict);
 
-            var result = (StatusCodeResult)await _hostController.Drain(scriptHostManagerMock.Object);
+            var result = (StatusCodeResult)await _hostController.Drain(scriptHostManagerMock.Object, default);
             Assert.Equal(StatusCodes.Status503ServiceUnavailable, result.StatusCode);
         }
 
@@ -314,9 +373,9 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             scriptHostManagerMock.SetupGet(p => p.State).Returns(hostStatus);
             drainModeManager.Setup(x => x.IsDrainModeEnabled).Returns(drainModeEnabled);
 
-            var result = (StatusCodeResult)await _hostController.Resume(scriptHostManagerMock.Object);
+            var result = (StatusCodeResult)await _hostController.Resume(scriptHostManagerMock.Object, default);
             Assert.Equal(expectedCode, result.StatusCode);
-            scriptHostManagerMock.Verify(p => p.RestartHostAsync(It.IsAny<CancellationToken>()), Times.Never());
+            scriptHostManagerMock.Verify(p => p.RestartHostAsync("test", It.IsAny<CancellationToken>()), Times.Never());
         }
 
         [Fact]
@@ -325,18 +384,19 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             var scriptHostManagerMock = new Mock<IScriptHostManager>(MockBehavior.Strict);
             var serviceProviderMock = scriptHostManagerMock.As<IServiceProvider>();
             var drainModeManager = new Mock<IDrainModeManager>(MockBehavior.Strict);
+            var restartReason = "Resuming from drain mode.";
 
             serviceProviderMock.Setup(x => x.GetService(typeof(IDrainModeManager))).Returns(drainModeManager.Object);
             scriptHostManagerMock.SetupGet(p => p.State).Returns(ScriptHostState.Running);
-            scriptHostManagerMock.Setup(p => p.RestartHostAsync(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+            scriptHostManagerMock.Setup(p => p.RestartHostAsync(restartReason, It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
             drainModeManager.Setup(x => x.IsDrainModeEnabled).Returns(true);
 
             var expectedBody = new ResumeStatus { State = ScriptHostState.Running };
-            var result = (OkObjectResult)await _hostController.Resume(scriptHostManagerMock.Object);
+            var result = (OkObjectResult)await _hostController.Resume(scriptHostManagerMock.Object, default);
 
             Assert.Equal(StatusCodes.Status200OK, result.StatusCode);
             Assert.Equal(expectedBody.State, (result.Value as ResumeStatus).State);
-            scriptHostManagerMock.Verify(p => p.RestartHostAsync(It.IsAny<CancellationToken>()), Times.Once());
+            scriptHostManagerMock.Verify(p => p.RestartHostAsync(restartReason, It.IsAny<CancellationToken>()), Times.Once());
         }
 
         [Fact]
@@ -351,11 +411,76 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             drainModeManager.Setup(x => x.IsDrainModeEnabled).Returns(false);
 
             var expectedBody = new ResumeStatus { State = ScriptHostState.Running };
-            var result = (OkObjectResult)await _hostController.Resume(scriptHostManagerMock.Object);
+            var result = (OkObjectResult)await _hostController.Resume(scriptHostManagerMock.Object, default);
 
             Assert.Equal(StatusCodes.Status200OK, result.StatusCode);
             Assert.Equal(expectedBody.State, (result.Value as ResumeStatus).State);
-            scriptHostManagerMock.Verify(p => p.RestartHostAsync(It.IsAny<CancellationToken>()), Times.Never());
+            scriptHostManagerMock.Verify(p => p.RestartHostAsync("test", It.IsAny<CancellationToken>()), Times.Never());
+        }
+
+        [Fact]
+        public async Task ResumeHost_HostRunning_ClientDisconnect_DoesNotStartNewHost()
+        {
+            var scriptHostManagerMock = new Mock<IScriptHostManager>(MockBehavior.Strict);
+            using var cts = new CancellationTokenSource();
+            cts.Cancel();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => _hostController.Resume(scriptHostManagerMock.Object, cts.Token));
+            scriptHostManagerMock.Verify(p => p.RestartHostAsync("test", It.IsAny<CancellationToken>()), Times.Never());
+        }
+
+        [Fact]
+        public async Task GetTriggers_WithFuncPlatformClaim_ReturnsOk()
+        {
+            var expectedResult = new TriggersResult { Success = true, Content = "{}" };
+            _functionsSyncManager.Setup(p => p.GetTriggersAsync()).ReturnsAsync(expectedResult);
+
+            var httpContext = new DefaultHttpContext
+            {
+                User = new ClaimsPrincipal(new ClaimsIdentity(
+                [
+                    new Claim(SecurityConstants.FuncPlatformClaimType, "true")
+                ]))
+            };
+            _hostController.ControllerContext.HttpContext = httpContext;
+
+            var result = await _hostController.GetTriggers();
+
+            var okResult = Assert.IsType<OkObjectResult>(result);
+            var triggersResult = Assert.IsType<TriggersResult>(okResult.Value);
+            Assert.True(triggersResult.Success);
+        }
+
+        [Fact]
+        public async Task GetTriggers_WithoutFuncPlatformClaim_ReturnsForbid()
+        {
+            var httpContext = new DefaultHttpContext
+            {
+                User = new ClaimsPrincipal(new ClaimsIdentity())
+            };
+
+            _hostController.ControllerContext.HttpContext = httpContext;
+
+            var result = await _hostController.GetTriggers();
+
+            Assert.IsType<ForbidResult>(result);
+        }
+
+        [Fact]
+        public async Task GetTriggers_WithAuthClaimOnly_ReturnsForbid()
+        {
+            var httpContext = new DefaultHttpContext
+            {
+                User = new ClaimsPrincipal(new ClaimsIdentity(
+                [
+                    new Claim(SecurityConstants.AuthLevelClaimType, AuthorizationLevel.Admin.ToString())
+                ]))
+            };
+
+            _hostController.ControllerContext.HttpContext = httpContext;
+
+            var result = await _hostController.GetTriggers();
+
+            Assert.IsType<ForbidResult>(result);
         }
     }
 }

@@ -1,12 +1,14 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
-using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
 using System.Threading.Tasks;
+using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
+using Microsoft.WebJobs.Script.Tests;
 using Xunit;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests.CosmosDB
 {
+    [Trait(TestTraits.Group, TestTraits.NonE2EStorage)]
     public class CosmosDBNodeEndToEndTests :
         CosmosDBEndToEndTestsBase<CosmosDBNodeEndToEndTests.TestFixture>
     {
@@ -26,7 +28,13 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.CosmosDB
             return CosmosDBTest();
         }
 
-        public class TestFixture : CosmosDBTestFixture
+        [Fact]
+        public Task CosmosDBMultipleItems()
+        {
+            return CosmosDBMultipleItemsTest();
+        }
+
+        public class TestFixture : CosmosDBEndToEndTestFixture
         {
             private const string ScriptRoot = @"TestScripts\Node";
 

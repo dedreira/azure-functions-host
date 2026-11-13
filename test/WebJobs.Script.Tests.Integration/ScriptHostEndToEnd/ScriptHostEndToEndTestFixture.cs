@@ -1,38 +1,41 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
 using System.Collections.Generic;
-using System.Linq;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Web.Http;
+using Azure;
+using Azure.Data.Tables;
+using Azure.Storage.Blobs;
+using Azure.Storage.Queues;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.Azure.WebJobs.Script.AppCapabilities;
 using Microsoft.Azure.WebJobs.Script.Config;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Eventing;
+using Microsoft.Azure.WebJobs.Script.Grpc;
+using Microsoft.Azure.WebJobs.Script.Metrics;
+using Microsoft.Azure.WebJobs.Script.Tests.Integration.Fixtures;
+using Microsoft.Azure.WebJobs.Script.WebHost.Helpers;
+using Microsoft.Azure.WebJobs.Script.Workers;
 using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
-using Microsoft.Extensions.Configuration;
+using Microsoft.Azure.WebJobs.Script.Workers.SharedMemoryDataTransfer;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using Microsoft.WebJobs.Script.Tests;
-using Microsoft.Azure.Storage;
-using Microsoft.Azure.Storage.Blob;
-using Microsoft.Azure.Storage.Queue;
-using Microsoft.Azure.Cosmos.Table;
 using Moq;
 using Xunit;
-using CloudStorageAccount = Microsoft.Azure.Storage.CloudStorageAccount;
-using TableStorageAccount = Microsoft.Azure.Cosmos.Table.CloudStorageAccount;
-using IApplicationLifetime = Microsoft.AspNetCore.Hosting.IApplicationLifetime;
-using Microsoft.Azure.WebJobs.Script.Workers.SharedMemoryDataTransfer;
-using System.Runtime.InteropServices;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests
 {
     public abstract class ScriptHostEndToEndTestFixture : IAsyncLifetime
     {
+        private readonly AzuriteFixture _azurite = new();
         private readonly ScriptSettingsManager _settingsManager;
         private readonly ManualResetEventSlim _hostStartedEvent = new ManualResetEventSlim();
         private readonly string _rootPath;
@@ -50,7 +53,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             FixtureId = testId;
             RequestConfiguration = new HttpConfiguration();
             EventManager = new ScriptEventManager();
-            MockApplicationLifetime = new Mock<IApplicationLifetime>();
+            MockApplicationLifetime = new Mock<IHostApplicationLifetime>();
             LoggerProvider = new TestLoggerProvider();
 
             _rootPath = rootPath;
@@ -64,23 +67,23 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
         public TestLoggerProvider LoggerProvider { get; }
 
-        public Mock<IApplicationLifetime> MockApplicationLifetime { get; }
+        public Mock<IHostApplicationLifetime> MockApplicationLifetime { get; }
 
-        public CloudBlobContainer TestInputContainer { get; private set; }
+        public BlobContainerClient TestInputContainer { get; private set; }
 
-        public CloudBlobContainer TestOutputContainer { get; private set; }
+        public BlobContainerClient TestOutputContainer { get; private set; }
 
-        public CloudQueueClient QueueClient { get; private set; }
+        public QueueServiceClient QueueServiceClient { get; private set; }
 
-        public CloudTableClient TableClient { get; private set; }
+        public TableServiceClient TableServiceClient { get; private set; }
 
-        public CloudBlobClient BlobClient { get; private set; }
+        public BlobServiceClient BlobServiceClient { get; private set; }
 
-        public CloudQueue TestQueue { get; private set; }
+        public QueueClient TestQueue { get; private set; }
 
-        public CloudQueue MobileTablesQueue { get; private set; }
+        public QueueClient MobileTablesQueue { get; private set; }
 
-        public CloudTable TestTable { get; private set; }
+        public TableClient TestTable { get; private set; }
 
         public ScriptHost JobHost { get; private set; }
 
@@ -90,26 +93,27 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
         public HttpConfiguration RequestConfiguration { get; }
 
-        public IScriptEventManager EventManager { get; set;  }
+        public IScriptEventManager EventManager { get; set; }
 
         public async Task InitializeAsync()
         {
+            await _azurite.InitializeAsync();
             if (!string.IsNullOrEmpty(_functionsWorkerLanguage))
             {
-                Environment.SetEnvironmentVariable(RpcWorkerConstants.FunctionWorkerRuntimeSettingName, _functionsWorkerLanguage);
+                Environment.SetEnvironmentVariable(EnvironmentSettingNames.FunctionWorkerRuntime, _functionsWorkerLanguage);
             }
             if (_addWorkerConcurrency)
             {
                 Environment.SetEnvironmentVariable(RpcWorkerConstants.FunctionsWorkerDynamicConcurrencyEnabled, "true");
             }
-            IConfiguration configuration = TestHelpers.GetTestConfiguration();
-            string connectionString = configuration.GetWebJobsConnectionString(ConnectionStringNames.Storage);
-            CloudStorageAccount storageAccount = CloudStorageAccount.Parse(connectionString);
-            QueueClient = storageAccount.CreateCloudQueueClient();
-            BlobClient = storageAccount.CreateCloudBlobClient();
 
-            TableStorageAccount tableStorageAccount = TableStorageAccount.Parse(connectionString);
-            TableClient = tableStorageAccount.CreateCloudTableClient();
+            string connectionString = _azurite.GetConnectionString();
+            QueueServiceClient = QueueServiceClient = new QueueServiceClient(connectionString, new QueueClientOptions
+            {
+                MessageEncoding = QueueMessageEncoding.Base64
+            });
+            BlobServiceClient = new BlobServiceClient(connectionString);
+            TableServiceClient = new TableServiceClient(connectionString);
 
             await CreateTestStorageEntities();
 
@@ -123,59 +127,66 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             TestHelpers.ClearFunctionLogs("ListenerStartupException");
 
             Host = new HostBuilder()
-               .ConfigureDefaultTestWebScriptHost(webjobsBuilder =>
-               {
-                   webjobsBuilder.AddAzureStorage();
+                .ConfigureDefaultTestWebScriptHost(webjobsBuilder =>
+                {
+                    webjobsBuilder.AddAzureStorageCoreServices();
+                    webjobsBuilder.AddAzureStorageQueues();
+                    webjobsBuilder.AddAzureStorageBlobs();
 
-                   // This needs to added manually at the ScriptHost level, as although FunctionMetadataManager is available through WebHost,
-                   // it needs to change the services during its lifetime.
-                   webjobsBuilder.Services.AddSingleton<IFunctionMetadataManager, FunctionMetadataManager>();
-               },
-               o =>
-               {
-                   o.ScriptPath = _rootPath;
-                   o.LogPath = TestHelpers.GetHostLogFileDirectory().Parent.FullName;
-               },
-               runStartupHostedServices: true)
-               .ConfigureServices(services =>
-               {
-                   services.Configure<ScriptJobHostOptions>(o =>
-                   {
-                       o.FileLoggingMode = FileLoggingMode.Always;
+                    // This needs to added manually at the ScriptHost level, as although FunctionMetadataManager is available through WebHost,
+                    // it needs to change the services during its lifetime.
+                    webjobsBuilder.Services.AddSingleton<IFunctionMetadataManager, FunctionMetadataManager>();
+                },
+                o =>
+                {
+                    o.ScriptPath = _rootPath;
+                    o.LogPath = TestHelpers.GetHostLogFileDirectory().Parent.FullName;
+                },
+                runStartupHostedServices: true)
+                .ConfigureServices(services =>
+                {
+                    services.Configure<ScriptJobHostOptions>(o =>
+                    {
+                        o.FileLoggingMode = FileLoggingMode.Always;
 
-                       if (_functions != null)
-                       {
-                           o.Functions = _functions;
-                       }
-                   });
+                        if (_functions != null)
+                        {
+                            o.Functions = _functions;
+                        }
+                    });
 
-                   if (_proxyClient != null)
-                   {
-                       services.AddSingleton<ProxyClientExecutor>(_proxyClient);
-                   }
+                    if (_proxyClient != null)
+                    {
+                        services.AddSingleton<ProxyClientExecutor>(_proxyClient);
+                    }
 
-                   // Shared memory data transfer
-                   if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-                   {
-                       services.AddSingleton<IMemoryMappedFileAccessor, MemoryMappedFileAccessorWindows>();
-                   }
-                   else
-                   {
-                       services.AddSingleton<IMemoryMappedFileAccessor, MemoryMappedFileAccessorUnix>();
-                   }
-                   services.AddSingleton<ISharedMemoryManager, SharedMemoryManager>();
-                   if (_addWorkerConcurrency && _addWorkerDelay > TimeSpan.Zero)
-                   {
-                       services.AddSingleton<IScriptEventManager>(new WorkerConcurrencyManagerEndToEndTests.TestScriptEventManager(_addWorkerDelay.Value));
-                   }
+                    // Shared memory data transfer
+                    if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                    {
+                        services.AddSingleton<IMemoryMappedFileAccessor, MemoryMappedFileAccessorWindows>();
+                    }
+                    else
+                    {
+                        services.AddSingleton<IMemoryMappedFileAccessor, MemoryMappedFileAccessorUnix>();
+                    }
+                    services.AddSingleton<ISharedMemoryManager, SharedMemoryManager>();
+                    if (_addWorkerConcurrency && _addWorkerDelay > TimeSpan.Zero)
+                    {
+                        services.AddSingleton<IScriptEventManager>(new WorkerConcurrencyManagerEndToEndTests.TestScriptEventManager());
+                        services.AddSingleton<ServerDuplexChannelRegistry>(
+                            new WorkerConcurrencyManagerEndToEndTests.TestServerDuplexChannelRegistry(_addWorkerDelay.Value));
+                    }
 
-                   ConfigureServices(services);
-               })
-               .ConfigureLogging(b =>
-               {
-                   b.AddProvider(LoggerProvider);
-               })
-               .Build();
+                    services.AddSingleton<IHostMetrics, HostMetrics>();
+                    services.AddSingleton<IWorkerRuntimeResolver>((s) => new TestWorkerRuntimeResolver(_functionsWorkerLanguage));
+
+                    ConfigureServices(services);
+                })
+                .ConfigureLogging(b =>
+                {
+                    b.AddProvider(LoggerProvider);
+                })
+                .Build();
 
             JobHost = Host.GetScriptHost();
 
@@ -187,84 +198,93 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             }
         }
 
-        public async Task<CloudQueue> GetNewQueue(string queueName)
+        public async Task<QueueClient> GetNewQueue(string queueName)
         {
-            var queue = QueueClient.GetQueueReference(string.Format("{0}-{1}", queueName, FixtureId));
+            var queue = QueueServiceClient.GetQueueClient(string.Format("{0}-{1}", queueName, FixtureId));
             await queue.CreateIfNotExistsAsync();
-            await queue.ClearAsync();
+            await queue.ClearMessagesAsync();
             return queue;
         }
 
         protected virtual async Task CreateTestStorageEntities()
         {
-            TestQueue = QueueClient.GetQueueReference(string.Format("test-input-{0}", FixtureId));
+            TestQueue = QueueServiceClient.GetQueueClient(string.Format("test-input-{0}", FixtureId));
             await TestQueue.CreateIfNotExistsAsync();
-            await TestQueue.ClearAsync();
+            await TestQueue.ClearMessagesAsync();
 
             // This queue name should really be suffixed by -fsharp, -csharp, -node etc.
-            MobileTablesQueue = QueueClient.GetQueueReference("mobiletables-input");
+            MobileTablesQueue = QueueServiceClient.GetQueueClient("mobiletables-input");
             await MobileTablesQueue.CreateIfNotExistsAsync(); // do not clear this queue since it is currently shared between fixtures
 
-            TestInputContainer = BlobClient.GetContainerReference(string.Format("test-input-{0}", FixtureId));
+            TestInputContainer = BlobServiceClient.GetBlobContainerClient(string.Format("test-input-{0}", FixtureId));
             await TestInputContainer.CreateIfNotExistsAsync();
 
             // Processing a large number of blobs on startup can take a while,
             // so let's start with an empty container.
             await TestHelpers.ClearContainerAsync(TestInputContainer);
 
-            TestOutputContainer = BlobClient.GetContainerReference(string.Format("test-output-{0}", FixtureId));
+            TestOutputContainer = BlobServiceClient.GetBlobContainerClient(string.Format("test-output-{0}", FixtureId));
             await TestOutputContainer.CreateIfNotExistsAsync();
             await TestHelpers.ClearContainerAsync(TestOutputContainer);
 
-            TestTable = TableClient.GetTableReference("test");
+            TestTable = TableServiceClient.GetTableClient("test");
             await TestTable.CreateIfNotExistsAsync();
 
-            await DeleteEntities(TestTable, "AAA");
-            await DeleteEntities(TestTable, "BBB");
+            await DeleteEntities(TestTable, TableServiceClient, "AAA");
+            await DeleteEntities(TestTable, TableServiceClient, "BBB");
 
-            var batch = new TableBatchOperation();
-            batch.Insert(new TestEntity { PartitionKey = "AAA", RowKey = "001", Region = "West", Name = "Test Entity 1", Status = 0 });
-            batch.Insert(new TestEntity { PartitionKey = "AAA", RowKey = "002", Region = "East", Name = "Test Entity 2", Status = 1 });
-            batch.Insert(new TestEntity { PartitionKey = "AAA", RowKey = "003", Region = "West", Name = "Test Entity 3", Status = 1 });
-            batch.Insert(new TestEntity { PartitionKey = "AAA", RowKey = "004", Region = "West", Name = "Test Entity 4", Status = 1 });
-            batch.Insert(new TestEntity { PartitionKey = "AAA", RowKey = "005", Region = "East", Name = "Test Entity 5", Status = 0 });
-            await TestTable.ExecuteBatchAsync(batch);
+            var batch = new List<TableTransactionAction>
+            {
+                new TableTransactionAction(TableTransactionActionType.Add, new TestEntity { PartitionKey = "AAA", RowKey = "001", Region = "West", Name = "Test Entity 1", Status = 0 }),
+                new TableTransactionAction(TableTransactionActionType.Add, new TestEntity { PartitionKey = "AAA", RowKey = "002", Region = "East", Name = "Test Entity 2", Status = 1 }),
+                new TableTransactionAction (TableTransactionActionType.Add, new TestEntity { PartitionKey = "AAA", RowKey = "003", Region = "West", Name = "Test Entity 3", Status = 1 }),
+                new TableTransactionAction (TableTransactionActionType.Add, new TestEntity { PartitionKey = "AAA", RowKey = "004", Region = "West", Name = "Test Entity 4", Status = 1 }),
+                new TableTransactionAction (TableTransactionActionType.Add, new TestEntity { PartitionKey = "AAA", RowKey = "005", Region = "East", Name = "Test Entity 5", Status = 0 })
+            };
+            await TestTable.SubmitTransactionAsync(batch);
 
-            batch = new TableBatchOperation();
-            batch.Insert(new TestEntity { PartitionKey = "BBB", RowKey = "001", Region = "South", Name = "Test Entity 1", Status = 0 });
-            batch.Insert(new TestEntity { PartitionKey = "BBB", RowKey = "002", Region = "West", Name = "Test Entity 2", Status = 1 });
-            batch.Insert(new TestEntity { PartitionKey = "BBB", RowKey = "003", Region = "West", Name = "Test Entity 3", Status = 0 });
-            await TestTable.ExecuteBatchAsync(batch);
+            batch =
+            [
+                new TableTransactionAction(TableTransactionActionType.Add, new TestEntity { PartitionKey = "BBB", RowKey = "001", Region = "South", Name = "Test Entity 1", Status = 0 }),
+                new TableTransactionAction(TableTransactionActionType.Add, new TestEntity { PartitionKey = "BBB", RowKey = "002", Region = "West", Name = "Test Entity 2", Status = 1 }),
+                new TableTransactionAction(TableTransactionActionType.Add, new TestEntity { PartitionKey = "BBB", RowKey = "003", Region = "West", Name = "Test Entity 3", Status = 0 }),
+            ];
+            await TestTable.SubmitTransactionAsync(batch);
         }
 
-        public async Task DeleteEntities(CloudTable table, string partition = null)
+        public async Task DeleteEntities(TableClient table, TableServiceClient tableServiceClient, string partition = null)
         {
-            if (!await table.ExistsAsync())
+            if (!await TableStorageHelpers.TableExistAsync(table, tableServiceClient))
             {
                 return;
             }
 
-            TableQuery query = new TableQuery();
+            string query = string.Empty;
             if (partition != null)
             {
-                query.FilterString = string.Format("PartitionKey eq '{0}'", partition);
+                query = TableClient.CreateQueryFilter($"PartitionKey eq {partition}");
             }
 
-            var entities = await table.ExecuteQuerySegmentedAsync(query, null);
+            var entities = table.QueryAsync<TableEntity>(query, null);
 
-            if (entities.Any())
+
+            var batch = new List<TableTransactionAction>();
+            await foreach (var entity in entities)
             {
-                var batch = new TableBatchOperation();
-                foreach (var entity in entities)
-                {
-                    batch.Delete(entity);
-                }
-                await table.ExecuteBatchAsync(batch);
+                batch.Add(new TableTransactionAction(TableTransactionActionType.Delete, entity));
+            }
+
+            if (batch.Count != 0)
+            {
+                await table.SubmitTransactionAsync(batch);
             }
         }
 
         public virtual void ConfigureServices(IServiceCollection services)
         {
+            // This is registered by WebHost typically, but is needed for tests that run without WebHost, so adding it here at the ScriptHost level.
+            services.AddSingleton<IAppCapabilitiesStore, DefaultAppCapabilitiesStore>();
+            services.AddSingleton<IOptionsChangeTokenSource<AppCapabilitiesOptions>, AppCapabilitiesChangeTokenSource>();
         }
 
         public virtual async Task DisposeAsync()
@@ -276,16 +296,28 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 JobHost.Dispose();
                 Host.Dispose();
             }
-            Environment.SetEnvironmentVariable(RpcWorkerConstants.FunctionWorkerRuntimeSettingName, string.Empty);
+
+            Environment.SetEnvironmentVariable(EnvironmentSettingNames.FunctionWorkerRuntime, null);
+            Environment.SetEnvironmentVariable(RpcWorkerConstants.FunctionsWorkerDynamicConcurrencyEnabled, null);
+
+            await _azurite.DisposeAsync();
         }
 
-        private class TestEntity : TableEntity
+        private class TestEntity : ITableEntity
         {
             public string Name { get; set; }
 
             public string Region { get; set; }
 
             public int Status { get; set; }
+
+            public string PartitionKey { get; set; }
+
+            public string RowKey { get; set; }
+
+            public DateTimeOffset? Timestamp { get; set; }
+
+            public ETag ETag { get; set; }
         }
     }
 }

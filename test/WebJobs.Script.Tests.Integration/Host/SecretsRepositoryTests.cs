@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
@@ -10,8 +10,8 @@ using System.Threading.Tasks;
 using Azure;
 using Azure.Identity;
 using Azure.Security.KeyVault.Secrets;
-using Microsoft.Azure.Storage;
-using Microsoft.Azure.Storage.Blob;
+using Azure.Storage.Blobs;
+using Azure.Storage.Blobs.Models;
 using Microsoft.Azure.WebJobs.Host.Storage;
 using Microsoft.Azure.WebJobs.Script.WebHost;
 using Microsoft.Extensions.Configuration;
@@ -93,49 +93,47 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         [InlineData(SecretsRepositoryType.KeyVault, ScriptSecretsType.Function)]
         public async Task ReadAsync_ReadsExpectedFile(SecretsRepositoryType repositoryType, ScriptSecretsType secretsType)
         {
-            using (var directory = new TempDirectory())
+            using var directory = new TempDirectory();
+
+            await _fixture.TestInitialize(repositoryType, directory.Path);
+            ScriptSecrets testSecrets = null;
+            if (secretsType == ScriptSecretsType.Host)
             {
-                await _fixture.TestInitialize(repositoryType, directory.Path);
-                ScriptSecrets testSecrets = null;
-                if (secretsType == ScriptSecretsType.Host)
+                testSecrets = new HostSecrets()
                 {
-                    testSecrets = new HostSecrets()
-                    {
-                        MasterKey = new Key("master", "test"),
-                        FunctionKeys = new List<Key>() { new Key(KeyName, "test") },
-                        SystemKeys = new List<Key>() { new Key(KeyName, "test") }
-                    };
-                }
-                else
+                    MasterKey = new("master", "test"),
+                    FunctionKeys = [new(KeyName, "test")],
+                    SystemKeys = [new(KeyName, "test")]
+                };
+            }
+            else
+            {
+                testSecrets = new FunctionSecrets()
                 {
-                    testSecrets = new FunctionSecrets()
-                    {
-                        Keys = new List<Key>() { new Key(KeyName, "test") }
-                    };
-                }
-                string testFunctionName = secretsType == ScriptSecretsType.Host ? "host" : functionName;
+                    Keys = [new(KeyName, "test")]
+                };
+            }
+            string testFunctionName = secretsType == ScriptSecretsType.Host ? "host" : functionName;
 
-                await _fixture.WriteSecret(testFunctionName, testSecrets);
+            await _fixture.WriteSecret(testFunctionName, testSecrets);
 
-                var target = _fixture.GetNewSecretRepository();
+            var target = _fixture.GetNewSecretRepository();
 
-                ScriptSecrets secretsContent = await target.ReadAsync(secretsType, testFunctionName);
+            ScriptSecrets secretsContent = await target.ReadAsync(secretsType, testFunctionName);
 
-                if (secretsType == ScriptSecretsType.Host)
-                {
-                    Assert.Equal((secretsContent as HostSecrets).MasterKey.Name, "master");
-                    Assert.Equal((secretsContent as HostSecrets).MasterKey.Value, "test");
-                    Assert.Equal((secretsContent as HostSecrets).FunctionKeys[0].Name, KeyName);
-                    Assert.Equal((secretsContent as HostSecrets).FunctionKeys[0].Value, "test");
-                    Assert.Equal((secretsContent as HostSecrets).SystemKeys[0].Name, KeyName);
-                    Assert.Equal((secretsContent as HostSecrets).SystemKeys[0].Value, "test");
-                }
-                else
-                {
-                    Assert.Equal((secretsContent as FunctionSecrets).Keys[0].Name, KeyName);
-                    Assert.Equal((secretsContent as FunctionSecrets).Keys[0].Value, "test");
-                }
-
+            if (secretsType == ScriptSecretsType.Host)
+            {
+                Assert.Equal((secretsContent as HostSecrets).MasterKey.Name, "master");
+                Assert.Equal((secretsContent as HostSecrets).MasterKey.Value, "test");
+                Assert.Equal((secretsContent as HostSecrets).FunctionKeys[0].Name, KeyName);
+                Assert.Equal((secretsContent as HostSecrets).FunctionKeys[0].Value, "test");
+                Assert.Equal((secretsContent as HostSecrets).SystemKeys[0].Name, KeyName);
+                Assert.Equal((secretsContent as HostSecrets).SystemKeys[0].Value, "test");
+            }
+            else
+            {
+                Assert.Equal((secretsContent as FunctionSecrets).Keys[0].Name, KeyName);
+                Assert.Equal((secretsContent as FunctionSecrets).Keys[0].Value, "test");
             }
         }
 
@@ -243,6 +241,13 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                     };
                 }
                 string testFunctionName = secretsType == ScriptSecretsType.Host ? null : functionName;
+
+                // Ensure secrets are in an active state (not soft-deleted from a previous test run)
+                // before calling WriteAsync.
+                if (repositoryType == SecretsRepositoryType.KeyVault)
+                {
+                    await _fixture.WriteSecret(testFunctionName ?? "host", secrets);
+                }
 
                 var target = _fixture.GetNewSecretRepository();
                 await target.WriteAsync(secretsType, testFunctionName, secrets);
@@ -524,8 +529,10 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             }
         }
 
-        public class Fixture : IDisposable
+        public class Fixture : IAsyncLifetime
         {
+            private readonly DefaultAzureCredentialOptions _azureCredentialOptions;
+
             public Fixture()
             {
                 TestSiteName = "Test_test";
@@ -534,17 +541,15 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 var configuration = TestHelpers.GetTestConfiguration();
                 BlobConnectionString = configuration.GetWebJobsConnectionString(ConnectionStringNames.Storage);
                 KeyVaultUri = configuration.GetWebJobsConnectionString(EnvironmentSettingNames.AzureWebJobsSecretStorageKeyVaultUri);
-                KeyVaultClientId = configuration.GetWebJobsConnectionString(EnvironmentSettingNames.AzureWebJobsSecretStorageKeyVaultClientId);
-                KeyVaultClientSecret = configuration.GetWebJobsConnectionString(EnvironmentSettingNames.AzureWebJobsSecretStorageKeyVaultClientSecret);
-                KeyVaultTenantId = configuration.GetWebJobsConnectionString(EnvironmentSettingNames.AzureWebJobsSecretStorageKeyVaultTenantId);
 
-                if (KeyVaultTenantId is not null && KeyVaultClientId is not null &&
-                    KeyVaultClientSecret is not null && KeyVaultUri is not null)
+                // Exclude managed identity for the test to avoid using the
+                // credential setup in the test environment.
+                _azureCredentialOptions = new DefaultAzureCredentialOptions
                 {
-                    // These will fail later if required; but sometimes when testing locally you don't care about KeyVault
-                    var credential = new ClientSecretCredential(KeyVaultTenantId, KeyVaultClientId, KeyVaultClientSecret);
-                    SecretClient = new SecretClient(new Uri(KeyVaultUri), credential);
-                }
+                    ExcludeManagedIdentityCredential = true,
+                };
+
+                SecretClient = new SecretClient(new Uri(KeyVaultUri), new DefaultAzureCredential(_azureCredentialOptions));
 
                 AzureBlobStorageProvider = TestHelpers.GetAzureBlobStorageProvider(configuration);
             }
@@ -559,17 +564,11 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             public Uri BlobSasConnectionUri { get; private set; }
 
-            public CloudBlobContainer BlobContainer { get; private set; }
+            public BlobContainerClient BlobContainer { get; private set; }
 
             public SecretClient SecretClient { get; private set; }
 
             public string KeyVaultUri { get; private set; }
-
-            public string KeyVaultClientId { get; private set; }
-
-            public string KeyVaultClientSecret { get; private set; }
-
-            public string KeyVaultTenantId { get; private set; }
 
             public SecretsRepositoryType RepositoryType { get; private set; }
 
@@ -589,11 +588,12 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 if (RepositoryType == SecretsRepositoryType.BlobStorageSas)
                 {
                     BlobSasConnectionUri = await TestHelpers.CreateBlobContainerSas(BlobConnectionString, "azure-webjobs-secrets-sas");
-                    BlobContainer = new CloudBlobContainer(BlobSasConnectionUri);
+                    BlobContainer = new BlobContainerClient(BlobSasConnectionUri);
                 }
                 else
                 {
-                    BlobContainer = CloudStorageAccount.Parse(BlobConnectionString).CreateCloudBlobClient().GetContainerReference("azure-webjobs-secrets");
+                    var blobServiceClient = new BlobServiceClient(BlobConnectionString);
+                    BlobContainer = blobServiceClient.GetBlobContainerClient("azure-webjobs-secrets");
                 }
 
                 await ClearAllBlobSecrets();
@@ -612,32 +612,29 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             public ISecretsRepository GetNewSecretRepository()
             {
                 var logger = LoggerProvider.CreateLogger("Test");
-                if (RepositoryType == SecretsRepositoryType.BlobStorage)
+
+                return RepositoryType switch
                 {
-                    return new BlobStorageSecretsRepository(SecretsDirectory, ConnectionStringNames.Storage, TestSiteName, logger, Environment, AzureBlobStorageProvider);
-                }
-                else if (RepositoryType == SecretsRepositoryType.BlobStorageSas)
-                {
-                    return new BlobStorageSasSecretsRepository(SecretsDirectory, BlobSasConnectionUri.ToString(), TestSiteName, logger, Environment, AzureBlobStorageProvider);
-                }
-                else if (RepositoryType == SecretsRepositoryType.FileSystem)
-                {
-                    return new FileSystemSecretsRepository(SecretsDirectory, logger, Environment);
-                }
-                else
-                {
-                    return new KeyVaultSecretsRepository(SecretsDirectory, KeyVaultUri, KeyVaultClientId, KeyVaultClientSecret, KeyVaultTenantId, logger, Environment);
-                }
+                    SecretsRepositoryType.BlobStorage => new BlobStorageSecretsRepository(SecretsDirectory, ConnectionStringNames.Storage, TestSiteName, logger, Environment, AzureBlobStorageProvider),
+                    SecretsRepositoryType.BlobStorageSas => new BlobStorageSasSecretsRepository(SecretsDirectory, BlobSasConnectionUri.ToString(), TestSiteName, logger, Environment, AzureBlobStorageProvider),
+                    SecretsRepositoryType.FileSystem => new FileSystemSecretsRepository(SecretsDirectory, logger, Environment),
+                    _ => new KeyVaultSecretsRepository(SecretsDirectory, KeyVaultUri, logger, Environment, new DefaultAzureCredential(_azureCredentialOptions))
+                };
             }
 
-            public void Dispose()
+            public Task InitializeAsync()
+            {
+                return Task.CompletedTask;
+            }
+
+            public async Task DisposeAsync()
             {
                 try
                 {
                     // delete blob files
-                    ClearAllBlobSecrets().ContinueWith(t => { });
+                    await ClearAllBlobSecrets();
                     ClearAllFileSecrets();
-                    ClearAllKeyVaultSecrets().ContinueWith(t => { });
+                    await ClearAllKeyVaultSecrets();
                 }
                 catch
                 {
@@ -652,10 +649,8 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             private string SecretsFileOrSentinelPath(string functionNameOrHost)
             {
-                string secretFilePath = null;
                 string fileName = string.Format(CultureInfo.InvariantCulture, "{0}.json", functionNameOrHost);
-                secretFilePath = Path.Combine(SecretsDirectory, fileName);
-                return secretFilePath;
+                return Path.Combine(SecretsDirectory, fileName);
             }
 
             public async Task WriteSecret(string functionNameOrHost, ScriptSecrets scriptSecret)
@@ -685,11 +680,15 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             private async Task WriteSecretsBlobAndUpdateSentinelFile(string functionNameOrHost, string fileText, bool createSentinelFile = true)
             {
                 string blobPath = RelativeBlobPath(functionNameOrHost);
-                CloudBlockBlob secretBlob = BlobContainer.GetBlockBlobReference(blobPath);
+                BlobClient secretBlob = BlobContainer.GetBlobClient(blobPath);
 
-                using (StreamWriter writer = new StreamWriter(await secretBlob.OpenWriteAsync()))
+                using (var stream = new MemoryStream())
+                using (var writer = new StreamWriter(stream))
                 {
                     writer.Write(fileText);
+                    writer.Flush();
+                    stream.Position = 0;
+                    await secretBlob.UploadAsync(stream, overwrite: true);
                 }
 
                 if (createSentinelFile)
@@ -703,7 +702,28 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 Dictionary<string, string> dictionary = KeyVaultSecretsRepository.GetDictionaryFromScriptSecrets(secrets, functionNameOrHost);
                 foreach (string key in dictionary.Keys)
                 {
-                    await SecretClient.SetSecretAsync(key, dictionary[key]);
+                    await Utility.InvokeWithRetriesWhenAsync(async () =>
+                    {
+                        try
+                        {
+                            await SecretClient.SetSecretAsync(key, dictionary[key]);
+                        }
+                        catch (RequestFailedException ex) when (ex.Status == 409)
+                        {
+                            // Secret is soft-deleted from a previous test run. Purge it (best-effort) and retry.
+                            try
+                            {
+                                await SecretClient.PurgeDeletedSecretAsync(key);
+                            }
+                            catch (RequestFailedException)
+                            {
+                            }
+                            
+                            // Allow purge to propagate before retrying
+                            await Task.Delay(TimeSpan.FromSeconds(1));
+                            throw;
+                        }
+                    }, 4, TimeSpan.FromSeconds(1), ex => ex is RequestFailedException rfex && rfex.Status == 409);
                 }
             }
 
@@ -733,9 +753,11 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             {
                 string blobText = null;
                 string blobPath = RelativeBlobPath(functionNameOrHost);
-                if (await BlobContainer.GetBlockBlobReference(blobPath).ExistsAsync())
+                BlobClient blobClient = BlobContainer.GetBlobClient(blobPath);
+                if (await blobClient.ExistsAsync())
                 {
-                    blobText = await BlobContainer.GetBlockBlobReference(blobPath).DownloadTextAsync();
+                    var response = await blobClient.DownloadContentAsync();
+                    blobText = response.Value.Content.ToString();
                 }
                 return ScriptSecretSerializer.DeserializeSecrets(type, blobText);
             }
@@ -810,24 +832,34 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                     await BlobContainer.CreateIfNotExistsAsync();
                 }
 
-                var blobs = await BlobContainer.ListBlobsSegmentedAsync(prefix: TestSiteName.ToLowerInvariant(), useFlatBlobListing: true,
-                    blobListingDetails: BlobListingDetails.None, maxResults: 100, currentToken: null, options: null, operationContext: null);
-                foreach (IListBlobItem blob in blobs.Results)
+                await foreach (BlobItem blobItem in BlobContainer.GetBlobsAsync(prefix: TestSiteName.ToLowerInvariant()))
                 {
-                    await BlobContainer.GetBlockBlobReference(((CloudBlockBlob)blob).Name).DeleteIfExistsAsync();
+                    await BlobContainer.GetBlobClient(blobItem.Name).DeleteIfExistsAsync();
+                }
+            }
+
+            private async Task DeleteKeyVaultSecret(SecretProperties secret)
+            {
+                var result = await SecretClient.StartDeleteSecretAsync(secret.Name);
+                await result.WaitForCompletionAsync();
+
+                if (result.HasCompleted && secret.RecoveryLevel.Contains("purgeable", StringComparison.OrdinalIgnoreCase))
+                {
+                    await SecretClient.PurgeDeletedSecretAsync(secret.Name);
                 }
             }
 
             private async Task ClearAllKeyVaultSecrets()
             {
-                var secretsPages = KeyVaultSecretsRepository.GetKeyVaultSecretsPagesAsync(SecretClient).AsPages();
-                await foreach (Page<SecretProperties> page in secretsPages)
+                var pages = SecretClient.GetPropertiesOfSecretsAsync();
+
+                var secretOperations = new List<Task>();
+                await foreach (var item in pages)
                 {
-                    foreach (SecretProperties item in page.Values)
-                    {
-                        await SecretClient.StartDeleteSecretAsync(item.Name);
-                    }
+                    secretOperations.Add(DeleteKeyVaultSecret(item));
                 }
+
+                await Task.WhenAll(secretOperations);
             }
         }
     }

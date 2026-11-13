@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
@@ -18,11 +18,15 @@ using Microsoft.Azure.WebJobs.Script.Configuration;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.Eventing;
+using Microsoft.Azure.WebJobs.Script.WebHost;
+using Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics;
+using Microsoft.Azure.WebJobs.Script.Workers;
 using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using Microsoft.WebJobs.Script.Tests;
 using Moq;
 using Newtonsoft.Json.Linq;
@@ -32,7 +36,7 @@ using FunctionMetadata = Microsoft.Azure.WebJobs.Script.Description.FunctionMeta
 
 namespace Microsoft.Azure.WebJobs.Script.Tests
 {
-    public class ScriptHostTests : IClassFixture<ScriptHostTests.TestFixture>
+    public class ScriptHostTests : IClassFixture<ScriptHostTests.TestFixture>, IDisposable
     {
         private const string ID = "5a709861cab44e68bfed5d2c2fe7fc0c";
         private readonly TestFixture _fixture;
@@ -44,6 +48,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
         public ScriptHostTests(TestFixture fixture)
         {
+            EnvironmentExtensions.ClearCache();
             Utility.ColdStartDelayMS = 50;
             _fixture = fixture;
             _settingsManager = ScriptSettingsManager.Instance;
@@ -450,7 +455,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         [InlineData("node", "~3", "~8", "node-~8")]
         [InlineData("node", "~2", "~8", "node-~8")]
         [InlineData("powershell", "~2", "", "powershell")]
-        [InlineData("powershell", "~2", "~7", "powershell-~7")]
+        [InlineData("powershell", "~2", "7.4", "powershell-7.4")]
         [InlineData("java", "~3", "", "java")]
         public async Task Initialize_WithRuntimeAndWorkerVersion_ReportRuntimeToMetricsTable(
             string functionsWorkerRuntime,
@@ -468,7 +473,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                     var environment = new TestEnvironment();
 
                     environment.SetEnvironmentVariable(
-                        RpcWorkerConstants.FunctionWorkerRuntimeSettingName, functionsWorkerRuntime);
+                        EnvironmentSettingNames.FunctionWorkerRuntime, functionsWorkerRuntime);
                     environment.SetEnvironmentVariable(
                         EnvironmentSettingNames.FunctionsExtensionVersion, functionsExtensionVersion);
                     environment.SetEnvironmentVariable(
@@ -489,6 +494,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                         s =>
                         {
                             s.AddSingleton<IMetricsLogger>(metricsLogger);
+                            s.AddSingleton<IEnvironment>(environment);
                         })
                         .Build();
                     var scriptHost = host.GetScriptHost();
@@ -499,6 +505,48 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             finally
             {
                 EnvironmentExtensions.BaseDirectory = null;
+            }
+        }
+
+        [Theory]
+        [InlineData("FunctionAppLogs", true)]
+        [InlineData(null, false)]
+        public async Task Initialize_ReportsAzureMonitorUsage_OnlyWhenExplicitlySubscribed(string azureMonitorCategories, bool expectedLogged)
+        {
+            using (var tempDirectory = new TempDirectory())
+            {
+                using var logDirectory = new TempDirectory();
+                string rootPath = Path.Combine(tempDirectory.Path, Guid.NewGuid().ToString());
+                Directory.CreateDirectory(rootPath);
+                var metricsLogger = new TestMetricsLogger();
+                var environment = new TestEnvironment();
+
+                if (azureMonitorCategories is not null)
+                {
+                    environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureMonitorCategories, azureMonitorCategories);
+                }
+
+                using IHost host = new HostBuilder()
+                    .ConfigureServices(s => s.AddSingleton<IEnvironment>(environment))
+                    .ConfigureDefaultTestWebScriptHost(
+                        null,
+                        o =>
+                        {
+                            o.ScriptPath = rootPath;
+                            o.LogPath = logDirectory.Path;
+                        },
+                        false,
+                        s =>
+                        {
+                            s.AddSingleton<IMetricsLogger>(metricsLogger);
+                            s.AddSingleton<IEnvironment>(environment);
+                        })
+                    .Build();
+
+                var scriptHost = host.GetScriptHost();
+                await scriptHost.InitializeAsync();
+
+                Assert.Equal(expectedLogged, metricsLogger.LoggedEvents.Contains(MetricEventNames.AzureMonitorEnabled));
             }
         }
 
@@ -1176,7 +1224,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         [InlineData(true, true)]
         [InlineData(true, false)]
         [InlineData(false, false)]
-        public void VerifyFunctionsMatchSpecifiedLanguage_NoThrow_For_HttpWorkerOrPlaceholderModeOrInitTaskCancelled(bool placeholderMode, bool httpWorker)
+        public void VerifyFunctionsMatchSpecifiedLanguage_NoThrow_For_DisabledValidationOrPlaceholderModeOrInitTaskCancelled(bool placeholderMode, bool shouldValidateRuntime)
         {
             FunctionMetadata funcJS1 = new FunctionMetadata()
             {
@@ -1187,14 +1235,14 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 funcJS1
             };
             CancellationTokenSource cts = new CancellationTokenSource();
-            if (!placeholderMode && !httpWorker)
+            if (!placeholderMode && !shouldValidateRuntime)
             {
                 cts.Cancel();
-                Assert.Throws<OperationCanceledException>(() => Utility.VerifyFunctionsMatchSpecifiedLanguage(functionsList, string.Empty, placeholderMode, httpWorker, cts.Token));
+                Assert.Throws<OperationCanceledException>(() => Utility.VerifyFunctionsMatchSpecifiedLanguage(functionsList, string.Empty, placeholderMode, shouldValidateRuntime, cts.Token));
             }
             else
             {
-                Utility.VerifyFunctionsMatchSpecifiedLanguage(functionsList, string.Empty, placeholderMode, httpWorker, cts.Token);
+                Utility.VerifyFunctionsMatchSpecifiedLanguage(functionsList, string.Empty, placeholderMode, shouldValidateRuntime, cts.Token);
             }
         }
 
@@ -1217,7 +1265,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             };
 
             HostInitializationException ex = Assert.Throws<HostInitializationException>(() => Utility.VerifyFunctionsMatchSpecifiedLanguage(functionsList, string.Empty, false, false, CancellationToken.None));
-            Assert.Equal($"Found functions with more than one language. Select a language for your function app by specifying {RpcWorkerConstants.FunctionWorkerRuntimeSettingName} AppSetting", ex.Message);
+            Assert.Equal($"Found functions with more than one language. Select a language for your function app by specifying {EnvironmentSettingNames.FunctionWorkerRuntime} AppSetting", ex.Message);
         }
 
         [Fact]
@@ -1453,6 +1501,39 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         }
 
         [Fact]
+        public void ValidateFunction_DoesntThrowForHttpTrigger_OnFlexConsumption()
+        {
+            var httpFunctions = new Dictionary<string, HttpTriggerAttribute>();
+            var name = "test";
+
+            BindingMetadata httpTriggerMetadata = BindingMetadata.Create(JObject.Parse("{\"type\": \"httpTrigger\",\"name\": \"req\",\"direction\": \"in\"}"));
+
+            var metadata = new FunctionMetadata();
+            metadata.Bindings.Add(httpTriggerMetadata);
+            var function = new Mock<FunctionDescriptor>(MockBehavior.Strict, name, null, metadata, null, null, null, null);
+            function.SetupGet(p => p.HttpTriggerAttribute).Returns(() => null);
+
+            TestEnvironment testEnvironment = new TestEnvironment();
+            testEnvironment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteSku, ScriptConstants.FlexConsumptionSku);
+
+            var exception = Record.Exception(() =>
+            {
+                ScriptHost.ValidateFunction(function.Object, httpFunctions, testEnvironment);
+            });
+            Assert.Null(exception);
+
+            metadata.Bindings.Clear();
+
+            exception = Record.Exception(() =>
+            {
+                ScriptHost.ValidateFunction(function.Object, httpFunctions, testEnvironment);
+            });
+            Assert.Null(exception);
+
+            ScriptHost.ValidateFunction(function.Object, httpFunctions, testEnvironment);
+        }
+
+        [Fact]
         public async Task IsFunction_ReturnsExpectedResult()
         {
             var host = TestHelpers.GetDefaultHost(o =>
@@ -1564,11 +1645,12 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
         [Theory]
         [InlineData("python", "main.py", "python", "python")]
-        [InlineData("dotnet-isolated", "app.dll", "dotnet-isolated", "dotnet-isolated")]
         [InlineData("dotnet", "app.dll", "dotnet", DotNetScriptTypes.DotNetAssembly)]
         [InlineData(null, "app.dll", "dotnet", DotNetScriptTypes.DotNetAssembly)] // if FUNCTIONS_WORKER_RUNTIME is missing, assume dotnet
         public async Task Initialize_MissingWorkerRuntime_SetsCorrectRuntimeFromFunctionMetadata(string functionsWorkerRuntime, string scriptFile, string expectedMetricLanguage, string expectedMetadataLanguage)
         {
+            string workersDirPath = Path.Combine(AppContext.BaseDirectory, RpcWorkerConstants.DefaultWorkersDirectoryName);
+
             IFileSystem CreateFileSystem(string rootPath)
             {
                 var fullFileSystem = new FileSystem();
@@ -1594,6 +1676,19 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                     {
                         Path.Combine(rootPath, "function1"),
                     });
+
+                dirBase.Setup(d => d.Exists(workersDirPath)).Returns(true);
+
+                if (functionsWorkerRuntime is not null)
+                {
+                    dirBase.Setup(d => d.EnumerateDirectories(workersDirPath))
+                    .Returns(new[]
+                    {
+                        Path.Combine(workersDirPath, functionsWorkerRuntime),
+                    });
+
+                    fileBase.Setup(f => f.Exists(Path.Combine(workersDirPath, functionsWorkerRuntime, RpcWorkerConstants.WorkerConfigFileName))).Returns(true);
+                }
 
                 var function1 = $$"""
                     {
@@ -1677,6 +1772,58 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 FileUtility.Instance = null;
                 EnvironmentExtensions.BaseDirectory = null;
             }
+        }
+
+        [Theory]
+        [InlineData(null)]
+        [InlineData("node")]
+        public void Missing_FunctionsWorkerRuntime_LogsWarning(string functionsWorkerRuntime)
+        {
+            var environment = new TestEnvironment();
+            var diagnosticEventRepository = new TestDiagnosticEventRepository();
+            var diagnosticEventRepositoryFactory = new TestDiagnosticEventRepositoryFactory(diagnosticEventRepository);
+            var standbyOptions = new StandbyOptions { InStandbyMode = false };
+            var mockStandbyOptionsMonitor = new Mock<IOptionsMonitor<StandbyOptions>>();
+            mockStandbyOptionsMonitor
+                .SetupGet(m => m.CurrentValue)
+                .Returns(standbyOptions);
+            var diagnosticEventLogger = new DiagnosticEventLoggerProvider(diagnosticEventRepositoryFactory, environment, mockStandbyOptionsMonitor.Object);
+
+            var loggerFactory = new LoggerFactory();
+            loggerFactory.AddTestLoggerProvider(out TestLoggerProvider testLoggerProvider);
+            loggerFactory.AddProvider(diagnosticEventLogger);
+
+            var configOptions = new OptionsWrapper<FunctionsHostingConfigOptions>(new FunctionsHostingConfigOptions());
+
+            var workerRuntimeResolverMock = new Mock<IWorkerRuntimeResolver>(MockBehavior.Strict);
+            workerRuntimeResolverMock.Setup(r => r.GetWorkerRuntime(It.IsAny<string>()))
+                .Returns(functionsWorkerRuntime);
+
+            var workerRuntimeResolver = workerRuntimeResolverMock.Object;
+
+            ScriptHost.ValidateFunctionsWorkerRuntime(workerRuntimeResolver, configOptions, loggerFactory.CreateLogger<ScriptHost>());
+
+            if (string.IsNullOrEmpty(functionsWorkerRuntime))
+            {
+                var diagnosticEvent = diagnosticEventRepository.Events.Single();
+                Assert.Equal(diagnosticEvent.LogLevel, LogLevel.Warning);
+                Assert.NotNull(diagnosticEvent.Message);
+                Assert.NotNull(diagnosticEvent.HelpLink);
+
+                // Ensure it goes to App Insights as well
+                var log = testLoggerProvider.GetAllLogMessages().Single(m => m.Level == LogLevel.Warning);
+                Assert.Contains(DiagnosticEventConstants.MissingFunctionsWorkerRuntimeHelpLink, log.FormattedMessage);
+            }
+            else
+            {
+                Assert.Empty(diagnosticEventRepository.Events);
+                Assert.Empty(testLoggerProvider.GetAllLogMessages().Where(m => m.Level == LogLevel.Warning));
+            }
+        }
+
+        public void Dispose()
+        {
+            EnvironmentExtensions.ClearCache();
         }
 
         public class AssemblyMock : Assembly

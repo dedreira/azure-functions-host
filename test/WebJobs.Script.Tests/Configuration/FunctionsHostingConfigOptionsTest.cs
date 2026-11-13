@@ -1,14 +1,17 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
+using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Linq;
+using System.Reflection;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Script.Config;
+using Microsoft.Azure.WebJobs.Script.WebHost;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
-using Microsoft.WebJobs.Script.Tests;
-
 using WebJobs.Script.Tests;
 using Xunit;
 
@@ -16,115 +19,220 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Configuration
 {
     public class FunctionsHostingConfigOptionsTest
     {
+        public static IEnumerable<PropertyInfo> AllProperties => typeof(FunctionsHostingConfigOptions)
+            .GetProperties(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            .Where(p => p.Name != nameof(FunctionsHostingConfigOptions.Features));
+
+        public static IEnumerable<object[]> AllPropertiesInput => AllProperties.Select(x => new object[] { x });
+
+        public static IEnumerable<object[]> PropertyValues
+        {
+            get
+            {
+                // Note: For legacy purposes (we used to call Configuration.Bind() on this object), some properties whose ScmHostingConfig key and
+                //       property name match exactly need to support "True/False".
+                //       It is recommended that new properties only look at "1/0" for their setting.
+#pragma warning disable SA1010 // Opening square brackets should be spaced correctly
+#pragma warning disable SA1011 // Closing square brackets should be spaced correctly
+                yield return [nameof(FunctionsHostingConfigOptions.DisableLinuxAppServiceExecutionDetails), "DisableLinuxExecutionDetails=1", true];
+                yield return [nameof(FunctionsHostingConfigOptions.DisableLinuxAppServiceLogBackoff), "DisableLinuxLogBackoff=1", true];
+
+                // Supports True/False/1/0
+                yield return [nameof(FunctionsHostingConfigOptions.EnableOrderedInvocationMessages), "EnableOrderedInvocationMessages=True", true];
+                yield return [nameof(FunctionsHostingConfigOptions.EnableOrderedInvocationMessages), "EnableOrderedInvocationMessages=1", true];
+                yield return [nameof(FunctionsHostingConfigOptions.EnableOrderedInvocationMessages), "EnableOrderedInvocationMessages=unparseable", true]; // default
+                yield return [nameof(FunctionsHostingConfigOptions.EnableOrderedInvocationMessages), string.Empty, true]; // default
+
+                yield return [nameof(FunctionsHostingConfigOptions.FunctionsWorkerDynamicConcurrencyEnabled), "FUNCTIONS_WORKER_DYNAMIC_CONCURRENCY_ENABLED=1", true];
+                yield return [nameof(FunctionsHostingConfigOptions.MaximumBundleV3Version), "FunctionRuntimeV4MaxBundleV3Version=teststring", "teststring"];
+                yield return [nameof(FunctionsHostingConfigOptions.MaximumBundleV4Version), "FunctionRuntimeV4MaxBundleV4Version=teststring", "teststring"];
+                yield return [nameof(FunctionsHostingConfigOptions.RevertWorkerShutdownBehavior), "REVERT_WORKER_SHUTDOWN_BEHAVIOR=1", true];
+
+                // Supports True/False/1/0
+                yield return [nameof(FunctionsHostingConfigOptions.ShutdownWebhostWorkerChannelsOnHostShutdown), "ShutdownWebhostWorkerChannelsOnHostShutdown=False", false];
+                yield return [nameof(FunctionsHostingConfigOptions.ShutdownWebhostWorkerChannelsOnHostShutdown), "ShutdownWebhostWorkerChannelsOnHostShutdown=True", true];
+                yield return [nameof(FunctionsHostingConfigOptions.ShutdownWebhostWorkerChannelsOnHostShutdown), "ShutdownWebhostWorkerChannelsOnHostShutdown=1", true];
+                yield return [nameof(FunctionsHostingConfigOptions.ShutdownWebhostWorkerChannelsOnHostShutdown), "ShutdownWebhostWorkerChannelsOnHostShutdown=unparseable", true]; // default
+                yield return [nameof(FunctionsHostingConfigOptions.ShutdownWebhostWorkerChannelsOnHostShutdown), string.Empty, true]; // default
+
+                yield return [nameof(FunctionsHostingConfigOptions.ThrowOnMissingFunctionsWorkerRuntime), "THROW_ON_MISSING_FUNCTIONS_WORKER_RUNTIME=1", true];
+                yield return [nameof(FunctionsHostingConfigOptions.WorkerIndexingDisabledApps), "WORKER_INDEXING_DISABLED_APPS=teststring", "teststring"];
+                yield return [nameof(FunctionsHostingConfigOptions.WorkerIndexingEnabled), "WORKER_INDEXING_ENABLED=1", true];
+                yield return [nameof(FunctionsHostingConfigOptions.WorkerRuntimeStrictValidationEnabled), "WORKER_RUNTIME_STRICT_VALIDATION_ENABLED=1", true];
+
+                yield return [nameof(FunctionsHostingConfigOptions.IsDotNetInProcDisabled), "DotNetInProcDisabled=False", false];
+                yield return [nameof(FunctionsHostingConfigOptions.IsDotNetInProcDisabled), "DotNetInProcDisabled=True", true];
+                yield return [nameof(FunctionsHostingConfigOptions.IsDotNetInProcDisabled), "DotNetInProcDisabled=1", true];
+                yield return [nameof(FunctionsHostingConfigOptions.IsDotNetInProcDisabled), "DotNetInProcDisabled=0", false];
+
+                yield return [nameof(FunctionsHostingConfigOptions.WorkersAvailableForDynamicResolution), "WORKERS_AVAILABLE_FOR_DYNAMIC_RESOLUTION=java|node", "java|node"];
+                yield return [nameof(FunctionsHostingConfigOptions.WorkersAvailableForDynamicResolution), "WORKERS_AVAILABLE_FOR_DYNAMIC_RESOLUTION=java", "java"];
+                yield return [nameof(FunctionsHostingConfigOptions.WorkersAvailableForDynamicResolution), "WORKERS_AVAILABLE_FOR_DYNAMIC_RESOLUTION=java|dotnet-isolated|node", "java|dotnet-isolated|node"];
+                yield return [nameof(FunctionsHostingConfigOptions.WorkersAvailableForDynamicResolution), "WORKERS_AVAILABLE_FOR_DYNAMIC_RESOLUTION=", string.Empty];
+
+                yield return [nameof(FunctionsHostingConfigOptions.IgnoredWorkerVersions), "IGNORED_WORKER_VERSIONS=java:2.0.0|node:2.1.0", "java:2.0.0|node:2.1.0"];
+                yield return [nameof(FunctionsHostingConfigOptions.IgnoredWorkerVersions), "IGNORED_WORKER_VERSIONS=java", "java"];
+                yield return [nameof(FunctionsHostingConfigOptions.IgnoredWorkerVersions), "IGNORED_WORKER_VERSIONS=java:2.0.0|dotnet-isolated:2.1.0", "java:2.0.0|dotnet-isolated:2.1.0"];
+                yield return [nameof(FunctionsHostingConfigOptions.IgnoredWorkerVersions), "IGNORED_WORKER_VERSIONS=", string.Empty];
+                yield return [nameof(FunctionsHostingConfigOptions.IgnoredWorkerVersions), "IGNORED_WORKER_VERSIONS=:|:", ":|:"];
+
+                yield return [nameof(FunctionsHostingConfigOptions.ArmWebhookOptInEnforcement), "ArmWebhookOptInEnforcement=|", "|"];
+                yield return [nameof(FunctionsHostingConfigOptions.ArmWebhookOptInEnforcement), "ArmWebhookOptInEnforcement=foo|bar", "foo|bar"];
+                yield return [nameof(FunctionsHostingConfigOptions.ArmWebhookOptInEnforcement), string.Empty, "workflow"]; // default when not configured
+
+#pragma warning restore SA1011 // Closing square brackets should be spaced correctly
+#pragma warning restore SA1010 // Opening square brackets should be spaced correctly
+            }
+        }
+
         [Theory]
         [InlineData("FEATURE1", "value1")]
         [InlineData("FeAtUrE1", "value1")]
         [InlineData("feature1", "value1")]
         [InlineData("featuree1", null)]
-        public async Task Case_Insensitive(string key, string expectedValue)
+        public void Case_Insensitive(string key, string expectedValue)
         {
-            using (TempDirectory tempDir = new TempDirectory())
-            {
-                IHost host = GetScriptHostBuilder(Path.Combine(tempDir.Path, "settings.txt"), $"feature1=value1,feature2=value2").Build();
-                var testService = host.Services.GetService<TestService>();
-
-                _ = Task.Run(async () =>
-                {
-                    await TestHelpers.Await(() =>
-                    {
-                        return testService.Options.Value.GetFeature(key) == expectedValue;
-                    });
-                    await host.StopAsync();
-                });
-
-                await host.RunAsync();
-                Assert.Equal(testService.Options.Value.GetFeature(key), expectedValue);
-            }
+            using TempDirectory tempDir = new();
+            IHost host = GetScriptHostBuilder(Path.Combine(tempDir.Path, "settings.txt"), $"feature1=value1,feature2=value2").Build();
+            var testService = host.Services.GetService<TestService>();
+            Assert.Equal(testService.Options.Value.GetFeature(key), expectedValue);
         }
 
         [Fact]
-        public async Task Inject_Succeded()
+        public void Inject_Succeeded()
         {
-            using (TempDirectory tempDir = new TempDirectory())
+            using TempDirectory tempDir = new();
+            IHost host = GetScriptHostBuilder(Path.Combine(tempDir.Path, "settings.txt"), $"feature1=value1,feature2=value2").Build();
+            var testService = host.Services.GetService<TestService>();
+            Assert.Equal(testService.Options.Value.GetFeature("feature1"), "value1");
+        }
+
+        [Theory]
+        [InlineData("True", false, true)]
+        [InlineData("False", true, false)]
+        [InlineData("tRuE", false, true)]
+        [InlineData(" true ", false, true)]
+        [InlineData("1", false, true)]
+        [InlineData("0", true, false)]
+        [InlineData("-2", false, true)] // any non-zero int is true
+        [InlineData("unparseable", false, false)]
+        [InlineData(null, true, true)]
+        public void GetFeatureAsBooleanOrDefault(string featureValue, bool defaultValue, bool expected)
+        {
+            string feature = "TestFeature";
+            var options = new FunctionsHostingConfigOptions();
+
+            if (featureValue != null)
             {
-                IHost host = GetScriptHostBuilder(Path.Combine(tempDir.Path, "settings.txt"), $"feature1=value1,feature2=value2").Build();
-                var testService = host.Services.GetService<TestService>();
+                options.Features.Add(feature, featureValue);
+            }
 
-                _ = Task.Run(async () =>
-                {
-                    await TestHelpers.Await(() =>
-                    {
-                        return testService.Options.Value.GetFeature("feature1") == "value1";
-                    });
-                    await host.StopAsync();
-                });
+            Assert.Equal(expected, options.GetFeatureAsBooleanOrDefault(feature, defaultValue));
+        }
 
-                await host.RunAsync();
-                Assert.Equal(testService.Options.Value.GetFeature("feature1"), "value1");
+        [Theory]
+        [MemberData(nameof(AllPropertiesInput))]
+        public void Property_ValidateAccess(PropertyInfo prop)
+        {
+            // make sure all props are internal to prevent inadvertent binding in the future
+            Assert.False(
+                prop.GetGetMethod() is not null || prop.GetSetMethod() is not null,
+                $"{prop.Name} is public. All properties on this object should be internal.");
+
+            Assert.True(PropertyValues.Any(x => x[0] as string == prop.Name), $"The property {prop.Name} is not set up to be validated. Please add at least one case in this test.");
+        }
+
+        [Theory]
+        [MemberData(nameof(PropertyValues))]
+        public void Property_Validation(string propertyName, string configValue, object expected)
+        {
+            using TempDirectory tempDir = new();
+
+            IHost host = GetScriptHostBuilder(Path.Combine(tempDir.Path, "settings.txt"), configValue).Build();
+            var testService = host.Services.GetService<TestService>();
+
+            var prop = AllProperties.Single(p => string.Equals(p.Name, propertyName, StringComparison.Ordinal));
+            var actual = prop.GetValue(testService.Options.Value);
+            try
+            {
+                Assert.Equal(expected, actual);
+            }
+            catch (Exception)
+            {
+                // provide a better failure message
+                Assert.True(false, $"{prop.Name} failure ('{configValue}'). Expected: {expected}. Actual: {actual}.");
             }
         }
 
         [Fact]
         public async Task OnChange_Fires_OnFileChange()
         {
-            using (TempDirectory tempDir = new TempDirectory())
+            using TempDirectory tempDir = new();
+            string fileName = Path.Combine(tempDir.Path, "settings.txt");
+            IHost host = GetScriptHostBuilder(fileName, $"feature1=value1,feature2=value2").Build();
+            var testService = host.Services.GetService<TestService>();
+
+            File.WriteAllText(fileName, $"feature1=value1_updated");
+            await TestHelpers.Await(() =>
             {
-                string fileName = Path.Combine(tempDir.Path, "settings.txt");
-                IHost host = GetScriptHostBuilder(fileName, $"feature1=value1,feature2=value2").Build();
-                var testService = host.Services.GetService<TestService>();
-
-                await host.StartAsync();
-
-                await Task.Delay(1000);
-                File.WriteAllText(fileName, $"feature1=value1_updated");
-                await TestHelpers.Await(() =>
-                {
-                    return testService.Monitor.CurrentValue.GetFeature("feature1") == "value1_updated";
-                });
-            }
+                return testService.Monitor.CurrentValue.GetFeature("feature1") == "value1_updated";
+            });
         }
 
         [Fact]
         public async Task OnChange_Fires_OnFileDelete()
         {
-            using (TempDirectory tempDir = new TempDirectory())
+            using TempDirectory tempDir = new();
+            string fileName = Path.Combine(tempDir.Path, "settings.txt");
+            IHost host = GetScriptHostBuilder(fileName, $"feature1=value1,feature2=value2").Build();
+            var testService = host.Services.GetService<TestService>();
+
+            File.Delete(fileName);
+            await TestHelpers.Await(() =>
             {
-                string fileName = Path.Combine(tempDir.Path, "settings.txt");
-                IHost host = GetScriptHostBuilder(fileName, $"feature1=value1,feature2=value2").Build();
-                var testService = host.Services.GetService<TestService>();
-
-                await host.StartAsync();
-
-                await Task.Delay(1000);
-                File.Delete(fileName);
-
-                await TestHelpers.Await(() =>
-                {
-                    return testService.Monitor.CurrentValue.GetFeature("feature1") == null;
-                });
-                await host.StopAsync();
-            }
+                return testService.Monitor.CurrentValue.GetFeature("feature1") == null;
+            });
         }
 
         [Fact]
         public async Task OnChange_Fires_OnFileCreate()
         {
-            using (TempDirectory tempDir = new TempDirectory())
+            using TempDirectory tempDir = new();
+            string fileName = Path.Combine(tempDir.Path, "settings.txt");
+            IHost host = GetScriptHostBuilder(fileName, string.Empty).Build();
+            var testService = host.Services.GetService<TestService>();
+
+            File.WriteAllText(fileName, $"feature1=value1_updated");
+            await TestHelpers.Await(() =>
             {
-                string fileName = Path.Combine(tempDir.Path, "settings.txt");
-                IHost host = GetScriptHostBuilder(fileName, string.Empty).Build();
-                var testService = host.Services.GetService<TestService>();
+                return testService.Monitor.CurrentValue.GetFeature("feature1") == "value1_updated";
+            });
+        }
 
-                await host.StartAsync();
-                await Task.Delay(1000);
+        [Fact]
+        public void ArmWebhookOptInEnforcement_NotConfigured_ReturnsDefault()
+        {
+            // When the key is absent, the getter returns the default value.
+            // This enables enforcement with the default exemption list.
+            var options = new FunctionsHostingConfigOptions();
+            options.Features[ScriptConstants.HostingConfigArmWebhookOptInEnforcement] = "custom";
+            Assert.Equal("custom", options.ArmWebhookOptInEnforcement);
 
-                File.WriteAllText(fileName, $"feature1=value1_updated");
+            options.Features.Remove(ScriptConstants.HostingConfigArmWebhookOptInEnforcement);
+            Assert.Equal(ScriptConstants.DefaultArmWebhookOptInExemptExtensions, options.ArmWebhookOptInEnforcement);
+        }
 
-                await TestHelpers.Await(() =>
-                {
-                    return testService.Monitor.CurrentValue.GetFeature("feature1") == "value1_updated";
-                });
-            }
+        [Fact]
+        public void ArmWebhookOptInEnforcement_ConfiguredEmpty_ReturnsEmpty()
+        {
+            // When the key is present but empty, enforcement is disabled.
+            // This is different from the default (which enables enforcement).
+            var options = new FunctionsHostingConfigOptions();
+            options.Features[ScriptConstants.HostingConfigArmWebhookOptInEnforcement] = "custom";
+            Assert.Equal("custom", options.ArmWebhookOptInEnforcement);
+
+            options.Features[ScriptConstants.HostingConfigArmWebhookOptInEnforcement] = string.Empty;
+            Assert.Equal(string.Empty, options.ArmWebhookOptInEnforcement);
         }
 
         internal static IHostBuilder GetScriptHostBuilder(string fileName, string fileContent)
@@ -134,35 +242,26 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Configuration
                 File.WriteAllText(fileName, fileContent);
             }
 
-            TestEnvironment environment = new TestEnvironment();
+            TestEnvironment environment = new();
             environment.SetEnvironmentVariable(EnvironmentSettingNames.FunctionsPlatformConfigFilePath, fileName);
 
-            IHost webHost = new HostBuilder()
+            IHostBuilder builder = new HostBuilder()
                 .ConfigureAppConfiguration((builderContext, config) =>
                 {
                     config.Add(new FunctionsHostingConfigSource(environment));
                 })
                 .ConfigureServices((context, services) =>
                 {
-                    services.ConfigureOptions<FunctionsHostingConfigOptionsSetup>();
-                    services.Configure<FunctionsHostingConfigOptions>(context.Configuration.GetSection(ScriptConstants.FunctionsHostingConfigSectionName));
-                }).Build();
-
-            return new HostBuilder()
-                .ConfigureServices((context, services) =>
-                {
+                    WebHostServiceCollectionExtensions.AddHostingConfigOptions(services, context.Configuration);
                     services.AddSingleton<TestService>();
-                })
-                .ConfigureDefaultTestWebScriptHost(null, configureRootServices: (services) =>
-                {
-                    services.AddSingleton(webHost.Services.GetService<IOptions<FunctionsHostingConfigOptions>>());
-                    services.AddSingleton(webHost.Services.GetService<IOptionsMonitor<FunctionsHostingConfigOptions>>());
                 });
+
+            return builder;
         }
 
         public class TestService
         {
-            public TestService(IOptions<Config.FunctionsHostingConfigOptions> options, IOptionsMonitor<Config.FunctionsHostingConfigOptions> monitor)
+            public TestService(IOptions<FunctionsHostingConfigOptions> options, IOptionsMonitor<FunctionsHostingConfigOptions> monitor)
             {
                 Options = options;
                 Monitor = monitor;
@@ -172,9 +271,9 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Configuration
                 });
             }
 
-            public IOptions<Config.FunctionsHostingConfigOptions> Options { get; set; }
+            public IOptions<FunctionsHostingConfigOptions> Options { get; set; }
 
-            public IOptionsMonitor<Config.FunctionsHostingConfigOptions> Monitor { get; set; }
+            public IOptionsMonitor<FunctionsHostingConfigOptions> Monitor { get; set; }
         }
     }
 }

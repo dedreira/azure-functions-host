@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
@@ -13,6 +13,7 @@ using Microsoft.Azure.WebJobs.Script.Configuration;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.Diagnostics.Extensions;
+using Microsoft.Azure.WebJobs.Script.Workers;
 using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -22,34 +23,38 @@ namespace Microsoft.Azure.WebJobs.Script
 {
     internal class HostFunctionMetadataProvider : IHostFunctionMetadataProvider
     {
+        private const string _metadataProviderName = "Host";
         private readonly IOptionsMonitor<ScriptApplicationHostOptions> _applicationHostOptions;
         private readonly IMetricsLogger _metricsLogger;
         private readonly Dictionary<string, ICollection<string>> _functionErrors = new Dictionary<string, ICollection<string>>();
         private readonly ILogger _logger;
-        private readonly IEnvironment _environment;
+        private readonly IWorkerRuntimeResolver _workerRuntimeResolver;
         private ImmutableArray<FunctionMetadata> _functions;
 
-        public HostFunctionMetadataProvider(IOptionsMonitor<ScriptApplicationHostOptions> applicationHostOptions, ILogger<HostFunctionMetadataProvider> logger,
-            IMetricsLogger metricsLogger, IEnvironment environment)
+        public HostFunctionMetadataProvider(
+            IOptionsMonitor<ScriptApplicationHostOptions> applicationHostOptions,
+            ILogger<HostFunctionMetadataProvider> logger,
+            IMetricsLogger metricsLogger,
+            IWorkerRuntimeResolver workerRuntimeResolver)
         {
             _applicationHostOptions = applicationHostOptions;
             _metricsLogger = metricsLogger;
             _logger = logger;
-            _environment = environment;
+            _workerRuntimeResolver = workerRuntimeResolver ?? throw new ArgumentNullException(nameof(workerRuntimeResolver));
         }
 
         public ImmutableDictionary<string, ImmutableArray<string>> FunctionErrors
            => _functionErrors.ToImmutableDictionary(kvp => kvp.Key, kvp => kvp.Value.ToImmutableArray());
 
-        public async Task<ImmutableArray<FunctionMetadata>> GetFunctionMetadataAsync(IEnumerable<RpcWorkerConfig> workerConfigs, IEnvironment environment, bool forceRefresh)
+        public async Task<ImmutableArray<FunctionMetadata>> GetFunctionMetadataAsync(IEnumerable<RpcWorkerConfig> workerConfigs, bool forceRefresh)
         {
             _functions = default(ImmutableArray<FunctionMetadata>);
 
             if (_functions.IsDefaultOrEmpty || forceRefresh)
             {
-                _logger.FunctionMetadataProviderParsingFunctions();
+                _logger.ReadingFunctionMetadataFromProvider(_metadataProviderName);
                 Collection<FunctionMetadata> functionMetadata = ReadFunctionsMetadata(workerConfigs);
-                _logger.FunctionMetadataProviderFunctionFound(functionMetadata.Count);
+                _logger.FunctionsReturnedByProvider(functionMetadata.Count, _metadataProviderName);
                 _functions = functionMetadata.ToImmutableArray();
             }
 
@@ -104,7 +109,7 @@ namespace Microsoft.Azure.WebJobs.Script
                     JObject functionConfig = JObject.Parse(json);
 
                     return ParseFunctionMetadata(functionName, functionConfig, functionDirectory, fileSystem,
-                        workerConfigs, _environment.GetEnvironmentVariable(EnvironmentSettingNames.FunctionWorkerRuntime));
+                        workerConfigs, _workerRuntimeResolver.GetWorkerRuntime());
                 }
                 catch (Exception ex)
                 {
@@ -112,14 +117,6 @@ namespace Microsoft.Azure.WebJobs.Script
                     Utility.AddFunctionError(_functionErrors, functionName, Utility.FlattenException(ex, includeSource: false), isFunctionShortName: true);
                 }
                 return null;
-            }
-        }
-
-        internal void ValidateName(string name, bool isProxy = false)
-        {
-            if (!Utility.IsValidFunctionName(name))
-            {
-                throw new InvalidOperationException(string.Format("'{0}' is not a valid {1} name.", name, isProxy ? "proxy" : "function"));
             }
         }
 
@@ -142,7 +139,9 @@ namespace Microsoft.Azure.WebJobs.Script
             {
                 foreach (JObject binding in bindingArray)
                 {
-                    BindingMetadata bindingMetadata = BindingMetadata.Create(binding);
+                    var sanitizedJObject = MetadataJsonHelper.SanitizeProperties(binding, ScriptConstants.SensitiveMetadataBindingPropertyNames);
+
+                    BindingMetadata bindingMetadata = BindingMetadata.Create(sanitizedJObject);
                     functionMetadata.Bindings.Add(bindingMetadata);
                 }
             }

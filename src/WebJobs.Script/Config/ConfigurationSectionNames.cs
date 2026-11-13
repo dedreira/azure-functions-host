@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 namespace Microsoft.Azure.WebJobs.Script.Configuration
@@ -23,5 +23,9 @@ namespace Microsoft.Azure.WebJobs.Script.Configuration
         public const string EasyAuth = "easyauth";
         public const string Retry = "retry";
         public const string SequentialJobHostRestart = JobHost + ":sequentialRestart";
+        public const string SendCanceledInvocationsToWorker = "sendCanceledInvocationsToWorker";
+        public const string TelemetryMode = "telemetryMode";
+        public const string MetadataProviderTimeout = "metadataProviderTimeout";
+        public const string AppCapabilities = JobHost + ":appCapabilities";
     }
 }

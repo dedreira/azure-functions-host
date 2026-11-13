@@ -1,17 +1,20 @@
 ﻿// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
+using Microsoft.Azure.WebJobs.Script.WebHost.Models;
+using Newtonsoft.Json.Linq;
 using System;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.Azure.WebJobs.Script.WebHost.Models;
-using Newtonsoft.Json.Linq;
+using Microsoft.WebJobs.Script.Tests;
 using Xunit;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.WebHostEndToEnd
 {
-    public class HostConfigurationExceptionTests : IDisposable
+    [Trait(TestTraits.Group, TestTraits.NonE2EWebHost)]
+    public class HostConfigurationExceptionTests : IAsyncLifetime
     {
         private readonly string _hostPath;
         private TestFunctionHost _host;
@@ -36,7 +39,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.WebHostEndToEnd
             await File.WriteAllTextAsync(hostJsonPath, hostConfig.ToString());
 
             string logPath = Path.Combine(Path.GetTempPath(), @"Functions");
-            _host = new TestFunctionHost(_hostPath, logPath, _ => { });
+            _host = new TestFunctionHost(_hostPath, logPath, configureWebHostServices: _ => { });
 
             // Ping the status endpoint to ensure we see the exception
             HostStatus status = await _host.GetHostStatusAsync();
@@ -47,7 +50,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.WebHostEndToEnd
             // we have a host running and watching for file changes.
             await TestHelpers.Await(() =>
             {
-                return _host.GetLog().Contains("[Microsoft.Extensions.Hosting.Internal.Host] Hosting started");
+                return _host.GetLog().Contains("File event source initialized.");
             });
 
             // Now update the file and make sure it auto-restarts.
@@ -63,16 +66,31 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.WebHostEndToEnd
             Assert.Null(status.Errors);
         }
 
-        public void Dispose()
+        public Task InitializeAsync() => Task.CompletedTask;
+
+        public async Task DisposeAsync()
         {
             try
             {
-                _host.Dispose();
-                Directory.Delete(_hostPath, true);
+                if (_host is not null)
+                {
+                    await _host.DisposeAsync();
+                }
             }
             catch (Exception ex)
             {
                 Console.WriteLine(ex.Message);
+            }
+            finally
+            {
+                try
+                {
+                    Directory.Delete(_hostPath, true);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine(ex.Message);
+                }
             }
         }
     }

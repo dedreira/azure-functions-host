@@ -4,6 +4,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Formatting;
@@ -11,14 +12,15 @@ using System.Net.Security;
 using System.Security.Cryptography.X509Certificates;
 using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.Azure.WebJobs.Script.WebHost.Models;
+using Microsoft.Azure.Functions.Platform.Metrics.LinuxConsumption;
+using Microsoft.Azure.WebJobs.Script.Config;
 using Microsoft.Azure.WebJobs.Script.WebHost.Security;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace Microsoft.Azure.WebJobs.Script.WebHost.Metrics
 {
-    public class LinuxContainerMetricsPublisher : IMetricsPublisher
+    public sealed class LinuxContainerMetricsPublisher : IMetricsPublisher, IDisposable
     {
         public const string PublishMemoryActivityPath = "/memoryactivity";
         public const string PublishFunctionActivityPath = "/functionactivity";
@@ -35,9 +37,10 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Metrics
         private readonly TimeSpan _metricPublishInterval = TimeSpan.FromMilliseconds(30 * 1000);
         private readonly TimeSpan _timerStartDelay = TimeSpan.FromSeconds(2);
         private readonly IOptionsMonitor<StandbyOptions> _standbyOptions;
-        private readonly IDisposable _standbyOptionsOnChangeSubscription;
+        private readonly IDisposable _standbyOptionsOnChangeListener;
         private readonly string _requestUri;
         private readonly IEnvironment _environment;
+        private readonly IOptionsMonitor<FunctionsHostingConfigOptions> _hostingConfigOptions;
 
         // Buffer for all memory activities for this container.
         private BlockingCollection<MemoryActivity> _memoryActivities;
@@ -63,7 +66,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Metrics
         private string _stampName;
         private bool _initialized = false;
 
-        public LinuxContainerMetricsPublisher(IEnvironment environment, IOptionsMonitor<StandbyOptions> standbyOptions, ILogger<LinuxContainerMetricsPublisher> logger, HostNameProvider hostNameProvider, HttpClient httpClient = null)
+        public LinuxContainerMetricsPublisher(IEnvironment environment, IOptionsMonitor<StandbyOptions> standbyOptions, ILogger<LinuxContainerMetricsPublisher> logger, HostNameProvider hostNameProvider, IOptionsMonitor<FunctionsHostingConfigOptions> functionsHostingConfigOptions, HttpClient httpClient = null)
         {
             _standbyOptions = standbyOptions ?? throw new ArgumentNullException(nameof(standbyOptions));
             _environment = environment ?? throw new ArgumentNullException(nameof(environment));
@@ -71,6 +74,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Metrics
             _hostNameProvider = hostNameProvider ?? throw new ArgumentNullException(nameof(hostNameProvider));
             _memoryActivities = new BlockingCollection<MemoryActivity>(new ConcurrentQueue<MemoryActivity>(), boundedCapacity: _maxBufferSize);
             _functionActivities = new BlockingCollection<FunctionActivity>(new ConcurrentQueue<FunctionActivity>(), boundedCapacity: _maxBufferSize);
+            _hostingConfigOptions = functionsHostingConfigOptions;
 
             _currentMemoryActivities = new ConcurrentQueue<MemoryActivity>();
             _currentFunctionActivities = new ConcurrentQueue<FunctionActivity>();
@@ -83,7 +87,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Metrics
             _httpClient = (httpClient != null) ? httpClient : CreateMetricsPublisherHttpClient();
             if (_standbyOptions.CurrentValue.InStandbyMode)
             {
-                _standbyOptionsOnChangeSubscription = _standbyOptions.OnChange(o => OnStandbyOptionsChange());
+                _standbyOptionsOnChangeListener = _standbyOptions.OnChange(o => OnStandbyOptionsChange());
             }
             else
             {
@@ -231,13 +235,12 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Metrics
             try
             {
                 var request = BuildRequest(HttpMethod.Post, publishPath, activitiesToPublish.ToArray());
-
                 HttpResponseMessage response = await _httpClient.SendAsync(request);
                 response.EnsureSuccessStatusCode();
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, $"Failed to publish status to {publishPath}");
+                _logger.LogDebug(ex, $"Failed to publish status to {publishPath}");
             }
         }
 
@@ -262,11 +265,11 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Metrics
         {
             try
             {
-                _process.Refresh();
-                var commitSizeBytes = _process.WorkingSet64;
-                if (commitSizeBytes != 0)
+                long memoryUsageInBytes = CgroupMemoryUsageHelper.GetMemoryUsageInBytes(_logger);
+
+                if (memoryUsageInBytes != 0)
                 {
-                    AddMemoryActivity(DateTime.UtcNow, commitSizeBytes);
+                    AddMemoryActivity(DateTime.UtcNow, memoryUsageInBytes);
                 }
             }
             catch (Exception e)
@@ -284,17 +287,35 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Metrics
                 Content = new ObjectContent<TContent>(content, new JsonMediaTypeFormatter())
             };
 
-            string swtToken = SimpleWebTokenHelper.CreateToken(DateTime.UtcNow.AddMinutes(5));
-            string jwtToken = JwtTokenHelper.CreateToken(DateTime.UtcNow.AddMinutes(5));
-
             // add the required authentication headers
             request.Headers.Add(ContainerNameHeader, _containerName);
             request.Headers.Add(HostNameHeader, _hostNameProvider.Value);
-            request.Headers.Add(ScriptConstants.SiteRestrictedTokenHeaderName, swtToken);
-            request.Headers.Add(ScriptConstants.SiteTokenHeaderName, jwtToken);
             request.Headers.Add(StampNameHeader, _stampName);
 
+            string jwtToken = JwtTokenHelper.CreateToken(DateTime.UtcNow.AddMinutes(5));
+            request.Headers.Add(ScriptConstants.SiteTokenHeaderName, jwtToken);
+
             return request;
+        }
+
+        public void OnFunctionStarted(string functionName, string invocationId)
+        {
+            // nothing to do
+        }
+
+        public void OnFunctionCompleted(string functionName, string invocationId)
+        {
+            // nothing to do
+        }
+
+        public void Dispose()
+        {
+            _standbyOptionsOnChangeListener?.Dispose();
+            _processMonitorTimer?.Dispose();
+            _metricsPublisherTimer?.Dispose();
+            _httpClient?.Dispose();
+            _memoryActivities?.Dispose();
+            _functionActivities?.Dispose();
         }
     }
 }

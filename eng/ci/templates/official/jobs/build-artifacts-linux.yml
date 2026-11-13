@@ -1,0 +1,58 @@
+jobs:
+- job: BuildArtifactsLinux
+  displayName: Build Linux Artifacts
+
+  variables:
+    project: src/WebJobs.Script.WebHost/WebJobs.Script.WebHost.csproj
+    configuration: release
+    runtime: linux-x64
+    drop_path: $(Build.ArtifactStagingDirectory)
+    linux_drop_path: $(drop_path)/linux
+    build_args: '-v m -c $(configuration) -r $(runtime)'
+
+  templateContext:
+    outputParentDirectory: $(drop_path)
+    outputs:
+    # TODO: onboard to Azure Artifacts Drops to allow accessing this from docker linux pipeline in msazure
+    # https://eng.ms/docs/cloud-ai-platform/devdiv/one-engineering-system-1es/1es-docs/azure-artifacts/artifact-services-onboarding
+    - output: pipelineArtifact
+      displayName: Publish linux artifacts
+      path: $(linux_drop_path)
+      artifact: drop_linux
+
+  pool:
+    name: 1es-pool-azfunc
+    image: 1es-ubuntu-24.04-min
+    os: linux
+
+  steps:
+  - template: /eng/ci/templates/install-dotnet.yml@self
+
+  - template: /eng/ci/templates/steps/publish-linux-artifact.yml@self
+    parameters:
+      project: $(project)
+      publishDir: $(Agent.TempDirectory)/linux_host
+      archiveFile: $(linux_drop_path)/host.linux-x64.tar.gz
+      restoreArguments: '-v m -r $(runtime) -p:PublishReadyToRun=true' # https://github.com/dotnet/sdk/issues/20701
+      buildArguments: '$(build_args) --no-restore'
+      publishArguments: '$(build_args) --no-build'
+
+  - template: /eng/ci/templates/steps/publish-linux-artifact.yml@self
+    parameters:
+      project: src/Functions.Host/Functions.Host.csproj
+      publishDir: $(Agent.TempDirectory)/functions-host/host
+      archiveFile: $(linux_drop_path)/functions-host.linux-x64.tar.gz
+      restoreArguments: '-v m -r $(runtime) -p:SelfContained=false -p:PublishReadyToRun=true'
+      buildArguments: '$(build_args) --self-contained false --no-restore'
+      publishArguments: '$(build_args) --self-contained false --no-build -p:PublishWorkers=false'
+      createWorkersDirectory: true
+
+  - script: sudo apt-get update && sudo apt-get install --yes clang zlib1g-dev
+    displayName: Install Native AOT prerequisites
+
+  - template: /eng/ci/templates/steps/publish-linux-artifact.yml@self
+    parameters:
+      project: src/Functions.WorkerProxy/Functions.WorkerProxy.csproj
+      publishDir: $(Agent.TempDirectory)/functions-host/worker-proxy
+      archiveFile: $(linux_drop_path)/worker-proxy.linux-x64.tar.gz
+      publishArguments: '$(build_args) --self-contained true -p:CopyOutputSymbolsToPublishDirectory=false -p:StaticWebAssetsEnabled=false'

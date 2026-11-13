@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
@@ -19,8 +19,6 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 {
     public class StartupContextProviderTests
     {
-        private const string TestEncryptionKey = "/a/vXvWJ3Hzgx4PFxlDUJJhQm5QVyGiu0NNLFm/ZMMg=";
-
         private readonly FunctionAppSecrets _secrets;
         private readonly StartupContextProvider _startupContextProvider;
         private readonly TestEnvironment _environment;
@@ -70,7 +68,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             _loggerProvider = new TestLoggerProvider();
             loggerFactory.AddProvider(_loggerProvider);
 
-            _environment.SetEnvironmentVariable(EnvironmentSettingNames.WebSiteAuthEncryptionKey, TestEncryptionKey);
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.WebSiteAuthEncryptionKey, TestHelpers.EncryptionKey);
 
             _startupContextProvider = new StartupContextProvider(_environment, loggerFactory.CreateLogger<StartupContextProvider>());
         }
@@ -189,10 +187,10 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 Secrets = _secrets
             };
             string json = JsonConvert.SerializeObject(context);
-            string encrypted = SimpleWebTokenHelper.Encrypt(json, environment: _environment);
-            var encryptedContext = new EncryptedHostAssignmentContext { EncryptedContext = encrypted };
+            string encrypted = EncryptionHelper.Encrypt(json, environment: _environment);
+            var hostAssignmentRequest = new HostAssignmentRequest { EncryptedContext = encrypted };
 
-            var result = _startupContextProvider.SetContext(encryptedContext);
+            var result = _startupContextProvider.SetContext(hostAssignmentRequest);
             Assert.Equal(context.SiteName, result.SiteName);
             Assert.Equal(_secrets.Host.Master, result.Secrets.Host.Master);
 
@@ -213,10 +211,10 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 IsWarmupRequest = true
             };
             string json = JsonConvert.SerializeObject(context);
-            string encrypted = SimpleWebTokenHelper.Encrypt(json, environment: _environment);
-            var encryptedContext = new EncryptedHostAssignmentContext { EncryptedContext = encrypted };
+            string encrypted = EncryptionHelper.Encrypt(json, environment: _environment);
+            var hostAssignmentRequest = new HostAssignmentRequest { EncryptedContext = encrypted };
 
-            var result = _startupContextProvider.SetContext(encryptedContext);
+            var result = _startupContextProvider.SetContext(hostAssignmentRequest);
             Assert.Equal(context.SiteName, result.SiteName);
             Assert.Equal(_secrets.Host.Master, result.Secrets.Host.Master);
 
@@ -239,7 +237,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 context = JsonConvert.SerializeObject(content);
             }
 
-            var encrypted = SimpleWebTokenHelper.Encrypt(context, environment: _environment);
+            var encrypted = EncryptionHelper.Encrypt(context, environment: _environment);
 
             File.WriteAllText(path, encrypted);
 

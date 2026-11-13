@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
@@ -14,15 +14,13 @@ using System.Threading.Tasks;
 using Azure.Storage.Blobs;
 using Microsoft.Azure.WebJobs.Host.Executors;
 using Microsoft.Azure.WebJobs.Host.Storage;
+using Microsoft.Azure.WebJobs.Logging;
 using Microsoft.Azure.WebJobs.Script.Config;
-using Microsoft.Azure.WebJobs.Script.DependencyInjection;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Models;
 using Microsoft.Azure.WebJobs.Script.WebHost.Extensions;
 using Microsoft.Azure.WebJobs.Script.WebHost.Models;
 using Microsoft.Azure.WebJobs.Script.WebHost.Security;
-using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Newtonsoft.Json;
@@ -58,7 +56,6 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management
         private readonly ILogger _logger;
         private readonly HttpClient _httpClient;
         private readonly ISecretManagerProvider _secretManagerProvider;
-        private readonly IConfiguration _configuration;
         private readonly IHostIdProvider _hostIdProvider;
         private readonly IScriptWebHostEnvironment _webHostEnvironment;
         private readonly IEnvironment _environment;
@@ -66,22 +63,27 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management
         private readonly IFunctionMetadataManager _functionMetadataManager;
         private readonly SemaphoreSlim _syncSemaphore = new SemaphoreSlim(1, 1);
         private readonly IAzureBlobStorageProvider _azureBlobStorageProvider;
+        private readonly IScriptHostManager _scriptHostManager;
+        private readonly IMeshServiceClient _meshServiceClient;
+        private readonly bool _notifyPlatformOnSync;
 
         private BlobClient _hashBlobClient;
 
-        public FunctionsSyncManager(IConfiguration configuration, IHostIdProvider hostIdProvider, IOptionsMonitor<ScriptApplicationHostOptions> applicationHostOptions, ILogger<FunctionsSyncManager> logger, IHttpClientFactory httpClientFactory, ISecretManagerProvider secretManagerProvider, IScriptWebHostEnvironment webHostEnvironment, IEnvironment environment, HostNameProvider hostNameProvider, IFunctionMetadataManager functionMetadataManager, IAzureBlobStorageProvider azureBlobStorageProvider)
+        public FunctionsSyncManager(IHostIdProvider hostIdProvider, IOptionsMonitor<ScriptApplicationHostOptions> applicationHostOptions, ILogger<FunctionsSyncManager> logger, IHttpClientFactory httpClientFactory, ISecretManagerProvider secretManagerProvider, IScriptWebHostEnvironment webHostEnvironment, IEnvironment environment, HostNameProvider hostNameProvider, IFunctionMetadataManager functionMetadataManager, IAzureBlobStorageProvider azureBlobStorageProvider, IScriptHostManager scriptHostManager, IMeshServiceClient meshServiceClient = null)
         {
             _applicationHostOptions = applicationHostOptions;
             _logger = logger;
             _httpClient = httpClientFactory.CreateClient();
             _secretManagerProvider = secretManagerProvider;
-            _configuration = configuration;
             _hostIdProvider = hostIdProvider;
             _webHostEnvironment = webHostEnvironment;
             _environment = environment;
             _hostNameProvider = hostNameProvider;
             _functionMetadataManager = functionMetadataManager;
             _azureBlobStorageProvider = azureBlobStorageProvider;
+            _scriptHostManager = scriptHostManager;
+            _meshServiceClient = meshServiceClient ?? NullMeshServiceClient.Instance;
+            _notifyPlatformOnSync = environment?.ShouldNotifyPlatformOnSync() ?? false;
         }
 
         internal bool ArmCacheEnabled
@@ -92,9 +94,9 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management
             }
         }
 
-        public async Task<SyncTriggersResult> TrySyncTriggersAsync(bool isBackgroundSync = false)
+        public async Task<TriggersOperationResult> TrySyncTriggersAsync(bool isBackgroundSync = false)
         {
-            var result = new SyncTriggersResult
+            var result = new TriggersOperationResult
             {
                 Success = true
             };
@@ -107,14 +109,24 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management
                 return result;
             }
 
+            // The active host may still be the placeholder/standby host (e.g. mid-specialization,
+            // after placeholder mode has been cleared but before RestartHostAsync swaps in the
+            // specialized host).
+            if (Utility.TryGetHostService(_scriptHostManager, out IOptions<ScriptJobHostOptions> jobHostOptions)
+                && jobHostOptions.Value.IsStandbyConfiguration)
+            {
+                result.Success = false;
+                result.Error = "Active host is in standby configuration. Skipping SyncTriggers to avoid publishing placeholder triggers.";
+                _logger.LogWarning(result.Error);
+                return result;
+            }
+
             try
             {
                 await _syncSemaphore.WaitAsync();
 
-                PrepareSyncTriggers();
-
                 var hashBlobClient = await GetHashBlobAsync();
-                if (isBackgroundSync && hashBlobClient == null && !_environment.IsKubernetesManagedHosting())
+                if (isBackgroundSync && hashBlobClient == null && !_environment.IsAnyKubernetesEnvironment())
                 {
                     // short circuit before doing any work in background sync
                     // cases where we need to check/update hash but don't have
@@ -135,7 +147,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management
 
                 bool shouldSyncTriggers = true;
                 string newHash = null;
-                if (isBackgroundSync && !_environment.IsKubernetesManagedHosting())
+                if (isBackgroundSync && hashBlobClient != null)
                 {
                     newHash = await CheckHashAsync(hashBlobClient, payload.Content);
                     shouldSyncTriggers = newHash != null;
@@ -147,6 +159,10 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management
                     if (success && newHash != null)
                     {
                         await UpdateHashAsync(hashBlobClient, newHash);
+                    }
+                    if (success)
+                    {
+                        await NotifyPlatformIfEnabledAsync();
                     }
                     result.Success = success;
                     result.Error = error;
@@ -227,7 +243,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management
             return true;
         }
 
-        internal async Task<string> CheckHashAsync(BlobClient hashBlobClient, string content)
+        private async Task<string> CheckHashAsync(BlobClient hashBlobClient, string content)
         {
             try
             {
@@ -291,6 +307,29 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management
             }
         }
 
+        /// <summary>
+        /// Performs a best-effort notification to the platform when triggers are synchronized.
+        /// </summary>
+        /// <remarks>
+        /// Exposed as <see langword="internal"/> for direct unit testing.
+        /// </remarks>
+        internal async Task NotifyPlatformIfEnabledAsync()
+        {
+            if (!_notifyPlatformOnSync)
+            {
+                return;
+            }
+
+            try
+            {
+                await _meshServiceClient.NotifyTriggersChanged();
+            }
+            catch (Exception exc) when (!exc.IsFatal())
+            {
+                _logger.LogWarning(exc, "Failed to notify platform of triggers change.");
+            }
+        }
+
         internal async Task<BlobClient> GetHashBlobAsync()
         {
             if (_hashBlobClient == null)
@@ -306,19 +345,28 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management
             return _hashBlobClient;
         }
 
-        public async Task<SyncTriggersPayload> GetSyncTriggersPayload()
+        private async Task<SyncTriggersPayload> GetSyncTriggersPayload()
         {
+            PrepareSyncTriggers();
+
             var hostOptions = _applicationHostOptions.CurrentValue.ToHostOptions();
-            var functionsMetadata = _functionMetadataManager.GetFunctionMetadata().Where(m => !m.IsProxy());
+            var functionsMetadata = _functionMetadataManager.GetFunctionMetadata().Where(m => !m.IsProxy()).DistinctBy(m => m.Name, StringComparer.OrdinalIgnoreCase);
 
             // trigger information used by the ScaleController
             var triggers = await GetFunctionTriggers(functionsMetadata, hostOptions);
             var triggersArray = new JArray(triggers);
             int count = triggersArray.Count;
 
+            // add host configuration
+            JObject hostConfig = null;
+            if (Utility.TryGetHostService<IHostOptionsProvider>(_scriptHostManager, out IHostOptionsProvider hostOptionsProvider))
+            {
+                hostConfig = hostOptionsProvider.GetOptions();
+            }
+
             // Form the base minimal result
             string hostId = await _hostIdProvider.GetHostIdAsync(CancellationToken.None);
-            JObject result = GetMinimalPayload(hostId, triggersArray);
+            JObject result = GetMinimalPayload(hostId, triggersArray, hostConfig);
 
             if (!ArmCacheEnabled)
             {
@@ -331,7 +379,6 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management
             }
 
             // Add all listable functions details to the payload
-            JObject functions = new JObject();
             var listableFunctions = _functionMetadataManager.GetFunctionMetadata().Where(m => !m.IsCodeless());
             var functionDetails = await WebFunctionsManager.GetFunctionMetadataResponse(listableFunctions, hostOptions, _hostNameProvider);
             result.Add("functions", new JArray(functionDetails.Select(p => JObject.FromObject(p))));
@@ -399,7 +446,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management
                 // If we're over limit, revert to the minimal triggers format.
                 _logger.LogWarning($"SyncTriggers payload of length '{json.Length}' exceeds max length of '{ScriptConstants.MaxTriggersStringLength}'. Reverting to minimal format.");
 
-                var minimalResult = GetMinimalPayload(hostId, triggersArray);
+                var minimalResult = GetMinimalPayload(hostId, triggersArray, hostConfig);
                 json = JsonConvert.SerializeObject(minimalResult);
             }
 
@@ -410,18 +457,18 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management
             };
         }
 
-        private JObject GetMinimalPayload(string hostId, JArray triggersArray)
+        private JObject GetMinimalPayload(string hostId, JArray triggersArray, JObject hostConfig)
         {
-            JObject result = new JObject
+            // When the HostId is sent, ScaleController will use it directly rather than compute it itself.
+            var result = new JObject
             {
-                { "triggers", triggersArray }
+                { "triggers", triggersArray },
+                { "hostId", hostId }
             };
 
-            if (_environment.IsFlexConsumptionSku())
+            if (hostConfig != null)
             {
-                // Currently we're only sending the HostId for Flex Consumption. Eventually we'll do this for all SKUs.
-                // When the HostId is sent, ScaleController will use it directly rather than compute it itself.
-                result["hostId"] = hostId;
+                result.Add("hostConfig", Sanitizer.Sanitize(hostConfig));
             }
 
             return result;
@@ -455,11 +502,11 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management
             return null;
         }
 
-        internal async Task<IEnumerable<JObject>> GetFunctionTriggers(IEnumerable<FunctionMetadata> functionsMetadata, ScriptJobHostOptions hostOptions)
+        private async Task<IEnumerable<JObject>> GetFunctionTriggers(IEnumerable<FunctionMetadata> functionsMetadata, ScriptJobHostOptions hostOptions)
         {
             var triggers = (await functionsMetadata
                 .Where(f => !f.IsProxy())
-                .Select(f => f.ToFunctionTrigger(hostOptions))
+                .Select(f => f.ToFunctionTrigger(hostOptions, _environment.IsFlexConsumptionSku()))
                 .WhenAll())
                 .Where(t => t != null);
 
@@ -723,32 +770,26 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management
         }
 
         // This function will call POST https://{app}.azurewebsites.net/operation/settriggers with the content
-        // of triggers. It'll verify app ownership using a SWT token valid for 5 minutes. It should be plenty.
+        // of triggers. It'll verify app ownership using a site token valid for 5 minutes. It should be plenty.
         private async Task<(bool Success, string ErrorMessage)> SetTriggersAsync(string content)
         {
-            string swtToken = SimpleWebTokenHelper.CreateToken(DateTime.UtcNow.AddMinutes(5));
-            string jwtToken = JwtTokenHelper.CreateToken(DateTime.UtcNow.AddMinutes(5));
-
-            string sanitizedContentString = content;
-            if (ArmCacheEnabled)
+            // sanitize the content before logging
+            var sanitizedContent = JToken.Parse(content);
+            if (sanitizedContent.Type == JTokenType.Object)
             {
-                // sanitize the content before logging
-                var sanitizedContent = JToken.Parse(content);
-                if (sanitizedContent.Type == JTokenType.Object)
-                {
-                    ((JObject)sanitizedContent).Remove("secrets");
-                    sanitizedContentString = sanitizedContent.ToString();
-                }
+                ((JObject)sanitizedContent).Remove("secrets");
             }
+            var sanitizedContentString = Sanitizer.Sanitize(sanitizedContent.ToString());
 
             using (var request = BuildSetTriggersRequest())
             {
                 var requestId = Guid.NewGuid().ToString();
                 request.Headers.Add(ScriptConstants.AntaresLogIdHeaderName, requestId);
                 request.Headers.Add("User-Agent", ScriptConstants.FunctionsUserAgent);
-                request.Headers.Add(ScriptConstants.SiteRestrictedTokenHeaderName, swtToken);
-                request.Headers.Add(ScriptConstants.SiteTokenHeaderName, jwtToken);
                 request.Content = new StringContent(content, Encoding.UTF8, "application/json");
+
+                string jwtToken = JwtTokenHelper.CreateToken(DateTime.UtcNow.AddMinutes(5));
+                request.Headers.Add(ScriptConstants.SiteTokenHeaderName, jwtToken);
 
                 if (_environment.IsManagedAppEnvironment())
                 {
@@ -778,6 +819,26 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management
                     return (false, message);
                 }
             }
+        }
+
+        public async Task<TriggersResult> GetTriggersAsync()
+        {
+            var result = new TriggersResult
+            {
+                Success = true
+            };
+
+            if (!IsSyncTriggersEnvironment(_webHostEnvironment, _environment))
+            {
+                result.Success = false;
+                result.Error = "Invalid environment for GetTriggers operation.";
+                _logger.LogWarning(result.Error);
+                return result;
+            }
+
+            var payload = await GetSyncTriggersPayload();
+            result.Content = payload.Content;
+            return result;
         }
 
         public void Dispose()

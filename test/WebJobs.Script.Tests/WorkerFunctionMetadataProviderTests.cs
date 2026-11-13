@@ -1,14 +1,19 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
 using System.Collections.Generic;
+using System.Collections.Immutable;
 using System.IO;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Script.Description;
-using Microsoft.Azure.WebJobs.Script.Grpc.Messages;
 using Microsoft.Azure.WebJobs.Script.Workers;
+using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 using Moq;
 using Xunit;
 
@@ -16,6 +21,28 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 {
     public class WorkerFunctionMetadataProviderTests
     {
+        private readonly WorkerFunctionMetadataProvider _workerFunctionMetadataProvider;
+
+        public WorkerFunctionMetadataProviderTests()
+        {
+            var mockScriptOptions = new Mock<IOptionsMonitor<ScriptApplicationHostOptions>>();
+            var mockLogger = new Mock<ILogger<WorkerFunctionMetadataProvider>>();
+            var mockEnvironment = new Mock<IEnvironment>();
+            var mockChannelManager = new Mock<IWebHostRpcWorkerChannelManager>();
+            var mockScriptHostManager = new Mock<IScriptHostManager>();
+
+            var mockRuntimeResolver = new Mock<IWorkerRuntimeResolver>(MockBehavior.Strict);
+            mockRuntimeResolver.Setup(r => r.GetWorkerRuntime(It.IsAny<string>())).Returns("node");
+
+            _workerFunctionMetadataProvider = new WorkerFunctionMetadataProvider(
+                mockScriptOptions.Object,
+                mockLogger.Object,
+                mockEnvironment.Object,
+                mockChannelManager.Object,
+                mockScriptHostManager.Object,
+                mockRuntimeResolver.Object);
+        }
+
         [Fact]
         public void ValidateBindings_NoBindings_Throws()
         {
@@ -24,7 +51,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             var ex = Assert.Throws<FormatException>(() =>
             {
-                WorkerFunctionMetadataProvider.ValidateBindings(rawBindings, functionMetadata);
+                _workerFunctionMetadataProvider.ValidateBindings(rawBindings, functionMetadata);
             });
 
             Assert.Equal("At least one binding must be declared.", ex.Message);
@@ -41,10 +68,10 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             var ex = Assert.Throws<InvalidOperationException>(() =>
             {
-                WorkerFunctionMetadataProvider.ValidateBindings(rawBindings, functionMetadata);
+                _workerFunctionMetadataProvider.ValidateBindings(rawBindings, functionMetadata);
             });
 
-            Assert.Equal("Multiple bindings with name 'dupe' discovered. Binding names must be unique.", ex.Message);
+            Assert.Equal($"{nameof(WorkerFunctionDescriptorProvider)}: Multiple bindings with name 'dupe' discovered. Binding names must be unique.", ex.Message);
         }
 
         [Fact]
@@ -56,7 +83,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             var ex = Assert.Throws<InvalidOperationException>(() =>
             {
-                WorkerFunctionMetadataProvider.ValidateBindings(rawBindings, functionMetadata);
+                _workerFunctionMetadataProvider.ValidateBindings(rawBindings, functionMetadata);
             });
 
             Assert.Equal("No trigger binding specified. A function must have a trigger input binding.", ex.Message);
@@ -65,7 +92,6 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         [Theory]
         [InlineData(null)]
         [InlineData("")]
-        [InlineData("_binding")]
         [InlineData("binding-test")]
         [InlineData("binding name")]
         public void ValidateBindings_InvalidName_Throws(string bindingName)
@@ -77,13 +103,25 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             var ex = Assert.Throws<ArgumentException>(() =>
             {
-                WorkerFunctionMetadataProvider.ValidateBindings(rawBindings, functionMetadata);
+                _workerFunctionMetadataProvider.ValidateBindings(rawBindings, functionMetadata);
             });
 
-            Assert.Equal($"The binding name {bindingName} is invalid. Please assign a valid name to the binding.", ex.Message);
+            Assert.Equal($"The binding name {bindingName} is invalid. Please assign a valid name to the binding. See https://aka.ms/azure-functions-binding-name-rules for more details.", ex.Message);
         }
 
         [Theory]
+        [InlineData("__")]
+        [InlineData("__binding")]
+        [InlineData("binding__")]
+        [InlineData("bind__ing")]
+        [InlineData("__binding__")]
+        [InlineData("_binding")]
+        [InlineData("binding_")]
+        [InlineData("_binding_")]
+        [InlineData("_another_binding_test_")]
+        [InlineData("long_binding_name_that_is_valid")]
+        [InlineData("binding_name")]
+        [InlineData("_")]
         [InlineData("bindingName")]
         [InlineData("binding1")]
         [InlineData(ScriptConstants.SystemReturnParameterBindingName)]
@@ -104,7 +142,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             try
             {
-                WorkerFunctionMetadataProvider.ValidateBindings(rawBindings, functionMetadata);
+                _workerFunctionMetadataProvider.ValidateBindings(rawBindings, functionMetadata);
             }
             catch (ArgumentException)
             {
@@ -117,9 +155,9 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         {
             var logger = new TestLogger<WorkerFunctionMetadataProvider>();
             logger.ClearLogMessages();
-            string scriptPath = Path.Combine(Environment.CurrentDirectory, @"..", "..", "..", "..", "..", "sample", "node");
+            string scriptPath = Path.Combine(Environment.CurrentDirectory, @"..", "..", "..", "..", "sample", "node");
             var environment = SystemEnvironment.Instance;
-            WorkerFunctionMetadataProvider.ValidateFunctionAppFormat(scriptPath, logger, environment);
+            _workerFunctionMetadataProvider.ValidateFunctionAppFormat(scriptPath, logger, environment);
             var traces = logger.GetLogMessages();
             var functionLoadLogs = traces.Where(m => m.FormattedMessage.Contains("Detected mixed function app. Some functions may not be indexed"));
             Assert.True(functionLoadLogs.Any());
@@ -135,10 +173,200 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             var ex = Assert.Throws<ArgumentException>(() =>
             {
-                WorkerFunctionMetadataProvider.ValidateBindings(rawBindings, functionMetadata);
+                _workerFunctionMetadataProvider.ValidateBindings(rawBindings, functionMetadata);
             });
 
             Assert.Equal($"{ScriptConstants.SystemReturnParameterBindingName} bindings must specify a direction of 'out'.", ex.Message);
+        }
+
+        [Fact]
+        public async void ValidateFunctionMetadata_Logging()
+        {
+            var logger = new TestLogger<WorkerFunctionMetadataProvider>();
+            logger.ClearLogMessages();
+
+            var workerConfigs = TestHelpers.GetTestWorkerConfigs().ToImmutableArray();
+            workerConfigs.ToList().ForEach(config => config.Description.WorkerIndexing = "true");
+
+            var scriptApplicationHostOptions = new ScriptApplicationHostOptions();
+            var optionsMonitor = TestHelpers.CreateOptionsMonitor(scriptApplicationHostOptions);
+
+            var mockScriptHostManager = new Mock<IScriptHostManager>();
+            mockScriptHostManager.Setup(m => m.State).Returns(ScriptHostState.Running);
+
+            var mockWebHostRpcWorkerChannelManager = new Mock<IWebHostRpcWorkerChannelManager>();
+            mockWebHostRpcWorkerChannelManager.Setup(m => m.GetChannels(It.IsAny<string>())).Returns(() => new Dictionary<string, TaskCompletionSource<IRpcWorkerChannel>>
+            {
+            });
+
+            TestEnvironment environment = new();
+            var mockRuntimeResolver = new Mock<IWorkerRuntimeResolver>();
+            mockRuntimeResolver.Setup(r => r.GetWorkerRuntime(It.IsAny<string>())).Returns("node");
+
+            var workerFunctionMetadataProvider = new WorkerFunctionMetadataProvider(
+                optionsMonitor, logger, environment, mockWebHostRpcWorkerChannelManager.Object, mockScriptHostManager.Object, mockRuntimeResolver.Object);
+            await workerFunctionMetadataProvider.GetFunctionMetadataAsync(workerConfigs, false);
+
+            var traces = logger.GetLogMessages();
+
+            // Assert that the logs contain the expected messages
+            Assert.Equal(3, traces.Count);
+            Assert.Equal("Fetching metadata for workerRuntime: node", traces[0].FormattedMessage);
+            Assert.Equal("Reading functions metadata (Worker)", traces[1].FormattedMessage);
+            // The third log is Host is running without any initialized channels, restarting the JobHost. This is not relevant to this test.
+        }
+
+        [Fact]
+        public void ValidateFunctionMetadata_IsoStringNotAltered()
+        {
+            FunctionMetadata functionMetadata = new FunctionMetadata();
+            List<string> rawBindings = new List<string>();
+            var isoString = "2025-02-10T22:45:33Z";
+            rawBindings.Add("{\"type\": \"cosmosDBTrigger\",\"name\": \"cosmosTrigger\",\"direction\": \"in\",\"databaseName\":\"databaseName\"," +
+                "\"containerName\":\"containerNameFoo\",\"leaseContainerName\":\"leaseContanerFoo\",\"createLeaseContainerIfNotExists\":true," +
+                "\"connection\":\"CosmosConnection\",\"startFromTime\":\"" + isoString + "\",\"dataType\":\"String\"}");
+
+            var function = _workerFunctionMetadataProvider.ValidateBindings(rawBindings, functionMetadata);
+            Assert.Equal(isoString, function.Bindings.FirstOrDefault().Raw["startFromTime"].ToString());
+        }
+
+        [Fact]
+        public async Task GetFunctionMetadataAsync_Idempotent()
+        {
+            var mockFunctionMetadataProvider = new Mock<IWorkerFunctionMetadataProvider>(MockBehavior.Strict);
+            var mockChannelManager = new Mock<IWebHostRpcWorkerChannelManager>(MockBehavior.Strict);
+            var mockScriptHostManager = new Mock<IScriptHostManager>(MockBehavior.Strict);
+            var mockOptionsMonitor = new Mock<IOptionsMonitor<ScriptApplicationHostOptions>>(MockBehavior.Strict);
+            var scriptOptions = new ScriptApplicationHostOptions
+            {
+                IsFileSystemReadOnly = true
+            };
+            mockOptionsMonitor.Setup(m => m.CurrentValue).Returns(scriptOptions);
+
+            var testEnvironment = new TestEnvironment();
+
+            var mockRpcWorkerChannel = new Mock<IRpcWorkerChannel>(MockBehavior.Strict);
+            var rawFunctionMetadataList = new List<RawFunctionMetadata>
+            {
+                new RawFunctionMetadata
+                {
+                    Metadata = new FunctionMetadata { Name = "TestFunction" },
+                    Bindings = ["{\"type\": \"httpTrigger\", \"name\": \"req\", \"direction\": \"in\"}"],
+                    UseDefaultMetadataIndexing = false
+                }
+            };
+            mockRpcWorkerChannel.Setup(m => m.GetFunctionMetadata()).ReturnsAsync(rawFunctionMetadataList);
+
+            var tcs = new TaskCompletionSource<IRpcWorkerChannel>();
+            tcs.SetResult(mockRpcWorkerChannel.Object);
+            var channels = new Dictionary<string, TaskCompletionSource<IRpcWorkerChannel>>
+            {
+                { "testWorkerId", tcs }
+            };
+
+            mockChannelManager.Setup(m => m.GetChannels("node")).Returns(channels);
+
+            var mockRuntimeResolver = new Mock<IWorkerRuntimeResolver>(MockBehavior.Strict);
+            mockRuntimeResolver.Setup(r => r.GetWorkerRuntime(It.IsAny<string>())).Returns("node");
+
+            var provider = new WorkerFunctionMetadataProvider(
+                mockOptionsMonitor.Object,
+                NullLogger<WorkerFunctionMetadataProvider>.Instance,
+                testEnvironment,
+                mockChannelManager.Object,
+                mockScriptHostManager.Object,
+                mockRuntimeResolver.Object);
+
+            var workerConfigs = new List<RpcWorkerConfig>();
+
+            // Calling this twice should return the same data
+            var result1 = await provider.GetFunctionMetadataAsync(workerConfigs, true);
+            var result2 = await provider.GetFunctionMetadataAsync(workerConfigs, true);
+
+            var function1 = result1.Functions.Single();
+            var function2 = result2.Functions.Single();
+
+            static void AssertFunction(FunctionMetadata function)
+            {
+                Assert.Equal("TestFunction", function.Name);
+                Assert.Equal("node", function.Language);
+                Assert.Collection(function.Bindings, binding =>
+                {
+                    Assert.Equal("httpTrigger", binding.Type);
+                    Assert.Equal("req", binding.Name);
+                    Assert.Equal(BindingDirection.In, binding.Direction);
+                });
+            }
+
+            AssertFunction(function1);
+            AssertFunction(function2);
+        }
+
+        [Fact]
+        public async Task GetFunctionMetadataAsync_HostInErrorStateWithNoActiveHost_InitializesChannelInsteadOfRestarting()
+        {
+            // Regression test for the host startup deadlock: when the JobHost is mid-startup (Error state
+            // during a retry) and no active host has been assigned yet, the provider must not call
+            // RestartHostAsync. GetFunctionMetadataAsync runs synchronously inside BuildHost while the start
+            // semaphore is held, so a restart would re-enter host startup and deadlock. It must initialize
+            // the worker channel directly instead.
+            var workerConfigs = TestHelpers.GetTestWorkerConfigs().ToImmutableArray();
+
+            var scriptApplicationHostOptions = new ScriptApplicationHostOptions();
+            var optionsMonitor = TestHelpers.CreateOptionsMonitor(scriptApplicationHostOptions);
+
+            var mockScriptHostManager = new Mock<IScriptHostManager>();
+            mockScriptHostManager.Setup(m => m.State).Returns(ScriptHostState.Error);
+
+            var mockChannelManager = new Mock<IWebHostRpcWorkerChannelManager>();
+            mockChannelManager.Setup(m => m.GetChannels(It.IsAny<string>()))
+                .Returns(() => new Dictionary<string, TaskCompletionSource<IRpcWorkerChannel>>());
+            mockChannelManager.Setup(m => m.InitializeChannelAsync(It.IsAny<IEnumerable<RpcWorkerConfig>>(), It.IsAny<string>()))
+                .ReturnsAsync(Mock.Of<IRpcWorkerChannel>());
+
+            var environment = new TestEnvironment();
+            var mockRuntimeResolver = new Mock<IWorkerRuntimeResolver>();
+            mockRuntimeResolver.Setup(r => r.GetWorkerRuntime(It.IsAny<string>())).Returns("node");
+
+            var provider = new WorkerFunctionMetadataProvider(
+                optionsMonitor,
+                NullLogger<WorkerFunctionMetadataProvider>.Instance,
+                environment,
+                mockChannelManager.Object,
+                mockScriptHostManager.Object,
+                mockRuntimeResolver.Object);
+
+            await provider.GetFunctionMetadataAsync(workerConfigs, false);
+
+            mockChannelManager.Verify(m => m.InitializeChannelAsync(It.IsAny<IEnumerable<RpcWorkerConfig>>(), "node"), Times.Once);
+            mockScriptHostManager.Verify(m => m.RestartHostAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+        }
+
+        [Fact]
+        public void ValidateBindings_MasksSensitiveDataInBindings()
+        {
+            var functionMetadata = new FunctionMetadata();
+            List<string> rawBindings =
+            [
+                """{"type": "queueTrigger","name": "myQueueItem","direction": "in","queueName": "test-input-node","connection": "DefaultEndpointsProtocol=https;AccountName=a;AccountKey=b/c==;EndpointSuffix=core.windows.net"}""",
+                """{"type": "queue","name": "$return","direction": "out","queueName": "test-output-node","connection": "MyConnection"}""",
+            ];
+
+            var function = _workerFunctionMetadataProvider.ValidateBindings(rawBindings, functionMetadata);
+            Assert.NotNull(function);
+            Assert.NotNull(function.Bindings);
+            Assert.Equal(2, function.Bindings.Count);
+
+            // The first binding should have its connection string replaced with "[Hidden Credential]"
+            var binding1 = function.Bindings[0];
+            Assert.NotNull(binding1);
+            Assert.Equal("[Hidden Credential]", binding1.Connection);
+            Assert.Equal("[Hidden Credential]", binding1.Raw["connection"]!.ToString());
+
+            // The second binding should remain unchanged (named connection)
+            var binding2 = function.Bindings[1];
+            Assert.Equal("MyConnection", binding2.Connection);
+            Assert.Equal("MyConnection", binding2.Raw["connection"]!.ToString());
         }
     }
 }

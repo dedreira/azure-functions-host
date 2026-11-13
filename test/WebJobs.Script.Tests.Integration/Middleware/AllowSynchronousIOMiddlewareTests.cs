@@ -8,17 +8,19 @@ using System.Text;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Script.WebHost;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.WebJobs.Script.Tests;
 using Newtonsoft.Json.Linq;
 using Xunit;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Middleware
 {
+    [Trait(TestTraits.Group, TestTraits.NonE2EControllers)]
     public class AllowSynchronousIOMiddlewareTests
     {
         [Fact(Skip = "Seems very difficult to trigger this failure now.")]
         public async Task SyncRead_Fails_ByDefault()
         {
-            using (var host = GetHost())
+            await using (var host = GetHost())
             {
                 HostSecretsInfo secrets = await host.SecretManager.GetHostSecretsAsync();
                 var response = await MakeRequest(host.HttpClient, secrets.MasterKey);
@@ -34,7 +36,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Middleware
         [Fact]
         public async Task SyncRead_Succeeds_WithFlag()
         {
-            using (var host = GetHost(d => d.Add(EnvironmentSettingNames.AzureWebJobsFeatureFlags, ScriptConstants.FeatureFlagAllowSynchronousIO)))
+            await using (var host = GetHost(d => d.Add(EnvironmentSettingNames.AzureWebJobsFeatureFlags, ScriptConstants.FeatureFlagAllowSynchronousIO)))
             {
                 HostSecretsInfo secrets = await host.SecretManager.GetHostSecretsAsync();
                 var response = await MakeRequest(host.HttpClient, secrets.MasterKey);
@@ -46,7 +48,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Middleware
         [Fact]
         public async Task SyncRead_Succeeds_InV2CompatMode()
         {
-            using (var host = GetHost(d => d.Add(EnvironmentSettingNames.FunctionsV2CompatibilityModeKey, "true")))
+            await using (var host = GetHost(d => d.Add(EnvironmentSettingNames.FunctionsV2CompatibilityModeKey, "true")))
             {
                 HostSecretsInfo secrets = await host.SecretManager.GetHostSecretsAsync();
                 var response = await MakeRequest(host.HttpClient, secrets.MasterKey);
@@ -60,7 +62,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Middleware
         [Fact]
         public async Task SyncDownload_Succeeds()
         {
-            using (var host = GetHost())
+            await using (var host = GetHost())
             {
                 HostSecretsInfo secrets = await host.SecretManager.GetHostSecretsAsync();
                 var response = await MakeDownloadRequest(host.HttpClient, secrets.MasterKey);
@@ -73,7 +75,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Middleware
         private static TestFunctionHost GetHost(Action<IDictionary<string, string>> addEnvironmentVariables = null)
         {
             string scriptPath = @"TestScripts\DirectLoad\";
-            string logPath = Path.Combine(Path.GetTempPath(), @"Functions");
+            string logPath = Path.Combine(Path.GetTempPath(), "Functions", "AllowSynchronousIOMiddlewareTests");
 
             var host = new TestFunctionHost(scriptPath, logPath,
                 configureWebHostServices: s =>

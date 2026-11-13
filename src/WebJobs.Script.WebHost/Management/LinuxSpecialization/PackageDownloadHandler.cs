@@ -1,8 +1,7 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
-using System.Diagnostics;
 using System.IO;
 using System.IO.Abstractions;
 using System.Net;
@@ -10,7 +9,6 @@ using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Threading;
 using System.Threading.Tasks;
-using DryIoc;
 using Microsoft.Azure.WebJobs.Logging;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.WebHost.Models;
@@ -26,19 +24,19 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management.LinuxSpecialization
 
         private readonly HttpClient _httpClient;
         private readonly IManagedIdentityTokenProvider _managedIdentityTokenProvider;
-        private readonly IBashCommandHandler _bashCommandHandler;
+        private readonly ICommandExecutor _commandExecutor;
         private readonly ILogger<PackageDownloadHandler> _logger;
         private readonly IMetricsLogger _metricsLogger;
         private readonly IEnvironment _environment;
         private readonly IFileSystem _fileSystem;
 
         public PackageDownloadHandler(IHttpClientFactory httpClientFactory, IManagedIdentityTokenProvider managedIdentityTokenProvider,
-            IBashCommandHandler bashCommandHandler, IEnvironment environment, IFileSystem fileSystem, ILogger<PackageDownloadHandler> logger,
+            ICommandExecutor commandExecutor, IEnvironment environment, IFileSystem fileSystem, ILogger<PackageDownloadHandler> logger,
             IMetricsLogger metricsLogger)
         {
             _httpClient = httpClientFactory?.CreateClient() ?? throw new ArgumentNullException(nameof(httpClientFactory));
             _managedIdentityTokenProvider = managedIdentityTokenProvider ?? throw new ArgumentNullException(nameof(managedIdentityTokenProvider));
-            _bashCommandHandler = bashCommandHandler ?? throw new ArgumentNullException(nameof(bashCommandHandler));
+            _commandExecutor = commandExecutor ?? throw new ArgumentNullException(nameof(commandExecutor));
             _environment = environment ?? throw new ArgumentNullException(nameof(environment));
             _fileSystem = fileSystem ?? FileUtility.Instance;
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
@@ -126,9 +124,10 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management.LinuxSpecialization
 
         private void AriaDownload(string directory, string fileName, Uri zipUri, bool isWarmupRequest, string downloadMetricName)
         {
-            var command = $"{Aria2CExecutable} --allow-overwrite -x12 -d {directory} -o {fileName} '{zipUri}'";
-            (string stdout, string stderr, int exitCode) = _bashCommandHandler.RunBashCommand(
-                command,
+            string[] arguments = ["--allow-overwrite", "-x12", "-d", directory, "-o", fileName, zipUri.ToString()];
+            (string stdout, string stderr, int exitCode) = _commandExecutor.RunCommand(
+                Aria2CExecutable,
+                arguments,
                 downloadMetricName);
             if (exitCode != 0)
             {
@@ -136,7 +135,11 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management.LinuxSpecialization
                 _logger.LogError(msg);
                 throw new InvalidOperationException(msg);
             }
-            _logger.LogInformation($"Executed: {Sanitizer.Sanitize(command)}");
+            if (_logger.IsEnabled(LogLevel.Information))
+            {
+                var command = $"{Aria2CExecutable} {string.Join(" ", arguments)}";
+                _logger.LogInformation($"Executed: {Sanitizer.Sanitize(command)}");
+            }
 
             var fileInfo = FileUtility.FileInfoFromFileName(Path.Combine(directory, fileName));
             _logger.LogInformation("'{fileInfo.Length}' bytes downloaded. IsWarmupRequest = '{isWarmupRequest}'",
@@ -159,7 +162,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management.LinuxSpecialization
                             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
                             request.Headers.Add(ScriptConstants.AzureVersionHeader, StorageBlobDownloadApiVersion);
                         }
-
+                        // CodeQL [SM03781] Not an SSRF attack because this process is not multi-tenant and runs exclusively on customer-scoped compute. Any possibility of modifying those endpoints will require control of the entire environment already.
                         response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
                         response.EnsureSuccessStatusCode();
                     }
@@ -222,6 +225,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management.LinuxSpecialization
                     cts.CancelAfter(TimeSpan.FromSeconds(5));
                     using (var httpRequest = new HttpRequestMessage(HttpMethod.Head, resourceUrl))
                     {
+                        // CodeQL [SM03781] Not an SSRF attack because this process is not multi-tenant and runs exclusively on customer-scoped compute. Any possibility of modifying those endpoints will require control of the entire environment already. The URL is from a trusted source for blob storage and file shares and the call only checks for status code.
                         using (var httpResponse = await _httpClient.SendAsync(httpRequest, cts.Token))
                         {
                             return httpResponse.StatusCode == HttpStatusCode.OK;

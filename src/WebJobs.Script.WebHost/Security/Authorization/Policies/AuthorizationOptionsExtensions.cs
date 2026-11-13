@@ -1,14 +1,21 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
+using System;
+using System.Security.Claims;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc.Controllers;
 using Microsoft.AspNetCore.Mvc.Filters;
 using Microsoft.Azure.WebJobs.Extensions.Http;
 using Microsoft.Azure.WebJobs.Script.Extensions;
 using Microsoft.Azure.WebJobs.Script.WebHost.Authentication;
+using Microsoft.Azure.WebJobs.Script.WebHost.Configuration;
+using Microsoft.Azure.WebJobs.Script.WebHost.Controllers;
+using Microsoft.Azure.WebJobs.Script.WebHost.Security.Authentication;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
 
 namespace Microsoft.Azure.WebJobs.Script.WebHost.Security.Authorization.Policies
 {
@@ -24,7 +31,8 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Security.Authorization.Policies
                 {
                     if (c.Resource is AuthorizationFilterContext filterContext)
                     {
-                        if (!CheckPlatformInternal(filterContext.HttpContext, allowAppServiceInternal: false))
+                        if (!IsScmSyncTriggers(filterContext, c.User)
+                            && !EnforceAdminIsolation(filterContext.HttpContext, allowAppServiceInternal: true))
                         {
                             return false;
                         }
@@ -34,65 +42,28 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Security.Authorization.Policies
                 });
             });
 
-            options.AddPolicy(PolicyNames.SystemAuthLevel, p =>
-            {
-                p.AddScriptAuthenticationSchemes();
-                p.AddRequirements(new AuthLevelRequirement(AuthorizationLevel.System));
-            });
-
-            options.AddPolicy(PolicyNames.AdminAuthLevelOrInternal, p =>
-            {
-                p.AddScriptAuthenticationSchemes();
-                p.RequireAssertion(async c =>
-                {
-                    if (c.Resource is AuthorizationFilterContext filterContext)
-                    {
-                        if (!CheckPlatformInternal(filterContext.HttpContext, allowAppServiceInternal: true))
-                        {
-                            return false;
-                        }
-
-                        if (filterContext.HttpContext.Request.IsAppServiceInternalRequest())
-                        {
-                            return true;
-                        }
-
-                        var authorizationService = filterContext.HttpContext.RequestServices.GetRequiredService<IAuthorizationService>();
-                        AuthorizationResult result = await authorizationService.AuthorizeAsync(c.User, PolicyNames.AdminAuthLevel);
-
-                        return result.Succeeded;
-                    }
-
-                    return false;
-                });
-            });
-
-            options.AddPolicy(PolicyNames.SystemKeyAuthLevel, p =>
+            options.AddPolicy(PolicyNames.ExtensionWebhookInvoke, p =>
             {
                 p.AddScriptAuthenticationSchemes();
                 p.RequireAssertion(c =>
                 {
                     if (c.Resource is AuthorizationFilterContext filterContext)
                     {
-                        if (filterContext.HttpContext.Request.IsAppServiceInternalRequest())
+                        string extensionName = filterContext.RouteData.Values["extensionName"]?.ToString();
+
+                        // First check to see if anonymous access has been configured for the webhook.
+                        // E.g. this might be configured for a Webhook extension in an app where App Service
+                        // authentication is being used.
+                        var snapshot = filterContext.HttpContext.RequestServices.GetRequiredService<IOptionsSnapshot<ExtensionSystemOptions>>();
+                        var extensionSystemOptions = snapshot.Get(extensionName);
+                        if (!string.IsNullOrEmpty(extensionName) && extensionSystemOptions?.WebhookAuthorizationLevel == AuthorizationLevel.Anonymous)
                         {
                             return true;
                         }
 
-                        string keyName = null;
-                        object keyNameObject = filterContext.RouteData.Values["extensionName"];
-                        if (keyNameObject != null)
-                        {
-                            keyName = DefaultScriptWebHookProvider.GetKeyName(keyNameObject.ToString());
-                        }
-                        else
-                        {
-                            keyNameObject = filterContext.RouteData.Values["keyName"];
-                            if (keyNameObject != null)
-                            {
-                                keyName = keyNameObject.ToString();
-                            }
-                        }
+                        string keyName = !string.IsNullOrEmpty(extensionName)
+                            ? DefaultScriptWebHookProvider.GetKeyName(extensionName)
+                            : filterContext.RouteData.Values["keyName"]?.ToString();
 
                         if (!string.IsNullOrEmpty(keyName) && AuthUtility.PrincipalHasAuthLevelClaim(filterContext.HttpContext.User, AuthorizationLevel.System, keyName))
                         {
@@ -107,14 +78,18 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Security.Authorization.Policies
 
         private static void AddScriptAuthenticationSchemes(this AuthorizationPolicyBuilder builder)
         {
-            builder.AuthenticationSchemes.Add(ArmAuthenticationDefaults.AuthenticationScheme);
             builder.AuthenticationSchemes.Add(AuthLevelAuthenticationDefaults.AuthenticationScheme);
             builder.AuthenticationSchemes.Add(JwtBearerDefaults.AuthenticationScheme);
         }
 
-        internal static bool CheckPlatformInternal(HttpContext httpContext, bool allowAppServiceInternal)
+        /// <summary>
+        /// When AdminIsolation is enabled, performs platform internal request verification on the specified HTTP context.
+        /// </summary>
+        /// <param name="httpContext">The <see cref="HttpContext"/> to check.</param>
+        /// <param name="allowAppServiceInternal">True if App Service internal requests should also be allowed; otherwise, false.</param>
+        /// <returns>True if the request passes isolation checks, false otherwise.</returns>
+        internal static bool EnforceAdminIsolation(HttpContext httpContext, bool allowAppServiceInternal)
         {
-            // when AdminIsolation is enabled, verify the request is platform internal
             var environment = httpContext.RequestServices.GetRequiredService<IEnvironment>();
             if (environment.IsAdminIsolationEnabled() &&
                 !(httpContext.Request.IsPlatformInternalRequest(environment) || (allowAppServiceInternal && httpContext.Request.IsAppServiceInternalRequest())))
@@ -125,6 +100,22 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Security.Authorization.Policies
             }
 
             return true;
+        }
+
+        /// <summary>
+        /// Determines whether the request targets the host SyncTriggers endpoint and is authenticated via an
+        /// SCM (Kudu) site token. Such requests are exempt from admin isolation enforcement. The endpoint accepts
+        /// no payload (it only signals the host to re-read trigger metadata from disk), so this is low risk.
+        /// </summary>
+        /// <param name="filterContext">The <see cref="AuthorizationFilterContext"/> for the current request.</param>
+        /// <param name="user">The authenticated principal for the current request.</param>
+        /// <returns>True if the request is an SCM-authenticated SyncTriggers call; otherwise, false.</returns>
+        private static bool IsScmSyncTriggers(AuthorizationFilterContext filterContext, ClaimsPrincipal user)
+        {
+            return filterContext.ActionDescriptor is ControllerActionDescriptor { MethodInfo: { } method }
+                && method.DeclaringType == typeof(HostController)
+                && string.Equals(method.Name, nameof(HostController.SyncTriggers), StringComparison.Ordinal)
+                && user.IsScmSite();
         }
     }
 }

@@ -32,9 +32,8 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
         /// Retrieves function secrets.
         /// </summary>
         /// <param name="functionName">The name of the function.</param>
-        /// <param name="merged">True if the results should include host level secrets (where function secrets would take priority); otherwise, false.</param>
         /// <returns>A <see cref="IDictionary{string, string}"/> containing the named function secrets.</returns>
-        Task<IDictionary<string, string>> GetFunctionSecretsAsync(string functionName, bool merged = false);
+        Task<IDictionary<string, string>> GetFunctionSecretsAsync(string functionName);
 
         /// <summary>
         /// Retrieves the host secrets.
@@ -53,6 +52,20 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
         /// <param name="secretsType">The target secrets type.</param>
         /// <returns>A <see cref="Task"/> that completes when the operation is finished.</returns>
         Task<KeyOperationResult> AddOrUpdateFunctionSecretAsync(string secretName, string secret, string keyScope, ScriptSecretsType secretsType);
+
+        /// <summary>
+        /// Gets the value of the named host system key, creating and persisting a new key if one does not already exist.
+        /// </summary>
+        /// <remarks>
+        /// Unlike a direct <see cref="GetHostSecretsAsync"/> lookup, this method guards against a stale host secrets
+        /// cache. The cache can be seeded from a one-time startup context snapshot that predates a key, so a simple
+        /// cache miss is not a reliable signal that the key is absent. Before generating a new key, this method
+        /// re-reads authoritative secrets from storage, ensuring an existing key is never overwritten (which would
+        /// invalidate previously issued extension webhook URLs).
+        /// </remarks>
+        /// <param name="keyName">The name of the system key to get or create.</param>
+        /// <returns>The value of the existing or newly created system key.</returns>
+        Task<string> GetOrCreateSystemKeyAsync(string keyName);
 
         /// <summary>
         /// Updates the host master key.

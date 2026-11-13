@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
@@ -10,10 +10,13 @@ using System.Net.Http;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Azure.AppService.Proxy.Runtime.Configuration;
 using Microsoft.Azure.WebJobs.Host.Executors;
 using Microsoft.Azure.WebJobs.Script.Config;
 using Microsoft.Azure.WebJobs.Script.WebHost;
 using Microsoft.Azure.WebJobs.Script.WebHost.Management;
+using Microsoft.Azure.WebJobs.Script.Workers;
 using Microsoft.Azure.WebJobs.Script.Workers.Http;
 using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
 using Microsoft.Extensions.Configuration;
@@ -22,12 +25,33 @@ using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Microsoft.Extensions.Primitives;
 using Moq;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using Xunit;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
 {
     public class WebFunctionsManagerTests : IDisposable
     {
+        private const string Function1MetadataJson = @"
+        {
+          ""scriptFile"": ""main.py"",
+          ""disabled"": false,
+          ""bindings"": [
+            {
+              ""authLevel"": ""anonymous"",
+              ""type"": ""httpTrigger"",
+              ""direction"": ""in"",
+              ""name"": ""req""
+            },
+            {
+              ""type"": ""http"",
+              ""direction"": ""out"",
+              ""name"": ""$return""
+            }
+          ]
+        }";
+
         private const string TestHostName = "test.azurewebsites.net";
 
         private readonly string _testRootScriptPath;
@@ -35,10 +59,15 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
         private readonly ScriptApplicationHostOptions _hostOptions;
         private readonly WebFunctionsManager _webFunctionsManager;
         private readonly Mock<IEnvironment> _mockEnvironment;
+        private readonly Mock<HttpRequest> _mockHttpRequest;
         private readonly IFileSystem _fileSystem;
 
         public WebFunctionsManagerTests()
         {
+            _mockHttpRequest = new Mock<HttpRequest>();
+            _mockHttpRequest.Setup(r => r.Scheme).Returns("https");
+            _mockHttpRequest.Setup(r => r.Host).Returns(new HostString(TestHostName));
+
             _testRootScriptPath = Path.GetTempPath();
             _testHostConfigFilePath = Path.Combine(_testRootScriptPath, ScriptConstants.HostMetadataFileName);
             FileUtility.DeleteFileSafe(_testHostConfigFilePath);
@@ -48,11 +77,10 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
                 ScriptPath = @"x:\root",
                 IsSelfHost = false,
                 LogPath = @"x:\tmp\log",
-                SecretsPath = @"x:\secrets",
-                TestDataPath = @"x:\test"
+                SecretsPath = @"x:\secrets"
             };
 
-            string functionsPath = Path.Combine(Environment.CurrentDirectory, @"..", "..", "..", "..", "..", "sample");
+            string functionsPath = Path.Combine(Environment.CurrentDirectory, @"..", "..", "..", "..", "sample");
 
             var fileSystem = CreateFileSystem(_hostOptions);
             var loggerFactory = MockNullLoggerFactory.CreateLoggerFactory();
@@ -68,7 +96,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
             var hostSecretsInfo = new HostSecretsInfo();
             secretManagerMock.Setup(p => p.GetHostSecretsAsync()).ReturnsAsync(hostSecretsInfo);
             Dictionary<string, string> functionSecrets = new Dictionary<string, string>();
-            secretManagerMock.Setup(p => p.GetFunctionSecretsAsync("httptrigger", false)).ReturnsAsync(functionSecrets);
+            secretManagerMock.Setup(p => p.GetFunctionSecretsAsync("httptrigger")).ReturnsAsync(functionSecrets);
 
             var configurationMock = new Mock<IConfiguration>(MockBehavior.Strict);
             configurationMock.Setup(p => p.GetReloadToken()).Returns(new Mock<IChangeToken>().Object);
@@ -80,56 +108,66 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
             _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady)).Returns("1");
             _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.CoreToolsEnvironment)).Returns((string)null);
             _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteHostName)).Returns(TestHostName);
+            _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.WebSiteAuthEncryptionKey)).Returns((string)null);
+            _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.FunctionsNotifyPlatformOnSync)).Returns((string)null);
             var hostNameProvider = new HostNameProvider(_mockEnvironment.Object);
+
+            var workerRuntimeResolverMock = new Mock<IWorkerRuntimeResolver>(MockBehavior.Strict);
+            workerRuntimeResolverMock.Setup(p => p.GetWorkerRuntime(It.IsAny<string>())).Returns((string)null);
 
             var workerOptions = new LanguageWorkerOptions();
             FileUtility.Instance = fileSystem;
             _fileSystem = fileSystem;
-            var metadataProvider = new HostFunctionMetadataProvider(optionsMonitor, NullLogger<HostFunctionMetadataProvider>.Instance, new TestMetricsLogger(), SystemEnvironment.Instance);
+            var metadataProvider = new HostFunctionMetadataProvider(optionsMonitor, NullLogger<HostFunctionMetadataProvider>.Instance, new TestMetricsLogger(), workerRuntimeResolverMock.Object);
             var defaultProvider = new FunctionMetadataProvider(NullLogger<FunctionMetadataProvider>.Instance, null, metadataProvider, new OptionsWrapper<FunctionsHostingConfigOptions>(new FunctionsHostingConfigOptions()), SystemEnvironment.Instance);
-            var functionMetadataManager = TestFunctionMetadataManager.GetFunctionMetadataManager(new OptionsWrapper<ScriptJobHostOptions>(new ScriptJobHostOptions()), defaultProvider, null, new OptionsWrapper<HttpWorkerOptions>(new HttpWorkerOptions()), loggerFactory, new TestOptionsMonitor<LanguageWorkerOptions>(TestHelpers.GetTestLanguageWorkerOptions()));
+            var functionMetadataManager = TestFunctionMetadataManager.GetFunctionMetadataManager(new OptionsWrapper<ScriptJobHostOptions>(new ScriptJobHostOptions()), defaultProvider, null, loggerFactory, new TestOptionsMonitor<LanguageWorkerOptions>(TestHelpers.GetTestLanguageWorkerOptions()));
+
+            var mockScriptHostManager = new Mock<IScriptHostManager>(MockBehavior.Strict);
+            var scriptHostManagerServiceProviderMock = mockScriptHostManager.As<IServiceProvider>();
+            scriptHostManagerServiceProviderMock.Setup(p => p.GetService(typeof(IHostOptionsProvider))).Returns(null);
 
             var emptyOptions = new JobHostInternalStorageOptions();
             var azureBlobStorageProvider = TestHelpers.GetAzureBlobStorageProvider(configurationMock.Object, storageOptions: emptyOptions);
-            var functionsSyncManager = new FunctionsSyncManager(configurationMock.Object, hostIdProviderMock.Object, optionsMonitor, loggerFactory.CreateLogger<FunctionsSyncManager>(), httpClientFactory, secretManagerProviderMock.Object, mockWebHostEnvironment.Object, _mockEnvironment.Object, hostNameProvider, functionMetadataManager, azureBlobStorageProvider);
-            _webFunctionsManager = new WebFunctionsManager(optionsMonitor, loggerFactory, httpClientFactory, secretManagerProviderMock.Object, functionsSyncManager, hostNameProvider, functionMetadataManager);
+            var functionsSyncManager = new FunctionsSyncManager(hostIdProviderMock.Object, optionsMonitor, loggerFactory.CreateLogger<FunctionsSyncManager>(), httpClientFactory, secretManagerProviderMock.Object, mockWebHostEnvironment.Object, _mockEnvironment.Object, hostNameProvider, functionMetadataManager, azureBlobStorageProvider, mockScriptHostManager.Object);
+            _webFunctionsManager = new WebFunctionsManager(optionsMonitor, loggerFactory, httpClientFactory, secretManagerProviderMock.Object, functionsSyncManager, hostNameProvider, functionMetadataManager, metadataProvider, new TestOptionsMonitor<LanguageWorkerOptions>(TestHelpers.GetTestLanguageWorkerOptions()));
         }
 
-        [Theory]
-        [InlineData(true)]
-        [InlineData(false)]
-        public async Task ReadFunctionsMetadataSucceeds(bool testDataCapEnabled)
+        [Fact]
+        public async Task ReadFunctionsMetadataSucceeds()
         {
-            var env = new Dictionary<string, string>();
-            if (!testDataCapEnabled)
-            {
-                env.Add(EnvironmentSettingNames.TestDataCapEnabled, "0");
-            }
-            var envScope = new TestScopedEnvironmentVariable(env);
-            using (envScope)
-            {
-                var metadata = (await _webFunctionsManager.GetFunctionsMetadata(includeProxies: false)).ToArray();
+            var metadata = (await _webFunctionsManager.GetFunctionsMetadata(includeProxies: false)).ToArray();
 
-                Assert.Equal(2, metadata.Count(p => p.Language == RpcWorkerConstants.NodeLanguageWorkerName));
-                Assert.Equal(1, metadata.Count(p => string.IsNullOrEmpty(p.Language)));
+            Assert.Equal(2, metadata.Count(p => p.Language == RpcWorkerConstants.NodeLanguageWorkerName));
+            Assert.Equal(1, metadata.Count(p => string.IsNullOrEmpty(p.Language)));
+        }
 
-                Assert.Equal("https://test.azurewebsites.net/admin/vfs/function1.dat", metadata[0].TestDataHref.AbsoluteUri);
-                Assert.Equal("https://test.azurewebsites.net/admin/vfs/function2.dat", metadata[1].TestDataHref.AbsoluteUri);
-                Assert.Equal("https://test.azurewebsites.net/admin/vfs/function3.dat", metadata[2].TestDataHref.AbsoluteUri);
+        [Fact]
+        public async Task CreateOrUpdate_DoesNotPersistTestData()
+        {
+            // A request body that still carries a test_data member must deserialize cleanly --
+            // Newtonsoft ignores the now-unknown member rather than throwing -- and the host must
+            // never write a test data file as a result.
+            string requestBody = $@"{{
+              ""test_data"": ""foo"",
+              ""config"": {Function1MetadataJson}
+            }}";
 
-                Assert.Equal("Test Data 1", metadata[0].TestData);
-                Assert.Equal("Test Data 2", metadata[1].TestData);
+            var functionMetadataResponse = JsonConvert.DeserializeObject<Management.Models.FunctionMetadataResponse>(requestBody);
+            Assert.NotNull(functionMetadataResponse);
+            Assert.NotNull(functionMetadataResponse.Config);
 
-                if (testDataCapEnabled)
-                {
-                    // TestData size is capped by default
-                    Assert.Null(metadata[2].TestData);
-                }
-                else
-                {
-                    Assert.Equal(ScriptConstants.MaxTestDataInlineStringLength + 1, metadata[2].TestData.Length);
-                }
-            }
+            var fileBaseMock = Mock.Get(_fileSystem.File);
+
+            var result = await _webFunctionsManager.CreateOrUpdate("function1", functionMetadataResponse, _mockHttpRequest.Object);
+
+            Assert.True(result.Success);
+
+            var serialized = JObject.Parse(JsonConvert.SerializeObject(result.Response));
+            Assert.False(serialized.ContainsKey("test_data"));
+            Assert.False(serialized.ContainsKey("test_data_href"));
+
+            fileBaseMock.Verify(f => f.Open(It.Is<string>(p => p.EndsWith(".dat")), It.IsAny<FileMode>(), It.IsAny<FileAccess>(), It.IsAny<FileShare>()), Times.Never());
+            fileBaseMock.Verify(f => f.WriteAllText(It.Is<string>(p => p.EndsWith(".dat")), It.IsAny<string>()), Times.Never());
         }
 
         [Fact]
@@ -204,7 +242,6 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
         private static IFileSystem CreateEmptyFileSystem(ScriptApplicationHostOptions options)
         {
             string rootPath = options.ScriptPath;
-            string testDataPath = options.TestDataPath;
 
             var fullFileSystem = new FileSystem();
             var fileSystem = new Mock<IFileSystem>();
@@ -229,7 +266,6 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
         private static IFileSystem CreateFileSystem(ScriptApplicationHostOptions options)
         {
             string rootPath = options.ScriptPath;
-            string testDataPath = options.TestDataPath;
 
             var fullFileSystem = new FileSystem();
             var fileSystem = new Mock<IFileSystem>();
@@ -255,23 +291,6 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
                     Path.Combine(rootPath, "function3")
                 });
 
-            var function1 = @"{
-  ""scriptFile"": ""main.py"",
-  ""disabled"": false,
-  ""bindings"": [
-    {
-      ""authLevel"": ""anonymous"",
-      ""type"": ""httpTrigger"",
-      ""direction"": ""in"",
-      ""name"": ""req""
-    },
-    {
-      ""type"": ""http"",
-      ""direction"": ""out"",
-      ""name"": ""$return""
-    }
-  ]
-}";
             var function2 = @"{
   ""disabled"": false,
   ""scriptFile"": ""main.js"",
@@ -300,22 +319,14 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
   ]
 }";
 
-            string testData1 = "Test Data 1";
-            string testData2 = "Test Data 2";
-            string testData3 = TestHelpers.NewRandomString(ScriptConstants.MaxTestDataInlineStringLength + 1);
-
+            dirBase.Setup(d => d.Exists(Path.Combine(rootPath, @"function1"))).Returns(true);
             fileBase.Setup(f => f.Exists(Path.Combine(rootPath, @"function1", "function.json"))).Returns(true);
             fileBase.Setup(f => f.Exists(Path.Combine(rootPath, @"function1", "main.py"))).Returns(true);
-            fileBase.Setup(f => f.ReadAllText(Path.Combine(rootPath, @"function1", "function.json"))).Returns(function1);
+            fileBase.Setup(f => f.ReadAllText(Path.Combine(rootPath, @"function1", "function.json"))).Returns(Function1MetadataJson);
             fileBase.Setup(f => f.Open(Path.Combine(rootPath, @"function1", "function.json"), It.IsAny<FileMode>(), It.IsAny<FileAccess>(), It.IsAny<FileShare>())).Returns(() =>
             {
-                return new MemoryStream(Encoding.UTF8.GetBytes(function1));
+                return new MemoryStream(Encoding.UTF8.GetBytes(Function1MetadataJson));
             });
-            fileBase.Setup(f => f.Open(Path.Combine(testDataPath, "function1.dat"), It.IsAny<FileMode>(), It.IsAny<FileAccess>(), It.IsAny<FileShare>())).Returns(() =>
-            {
-                return new MemoryStream(Encoding.UTF8.GetBytes(testData1));
-            });
-
             fileBase.Setup(f => f.Exists(Path.Combine(rootPath, @"function2", "function.json"))).Returns(true);
             fileBase.Setup(f => f.Exists(Path.Combine(rootPath, @"function2", "main.js"))).Returns(true);
             fileBase.Setup(f => f.ReadAllText(Path.Combine(rootPath, @"function2", "function.json"))).Returns(function2);
@@ -323,21 +334,12 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
             {
                 return new MemoryStream(Encoding.UTF8.GetBytes(function2));
             });
-            fileBase.Setup(f => f.Open(Path.Combine(testDataPath, "function2.dat"), It.IsAny<FileMode>(), It.IsAny<FileAccess>(), It.IsAny<FileShare>())).Returns(() =>
-            {
-                return new MemoryStream(Encoding.UTF8.GetBytes(testData2));
-            });
-
             fileBase.Setup(f => f.Exists(Path.Combine(rootPath, @"function3", "function.json"))).Returns(true);
             fileBase.Setup(f => f.Exists(Path.Combine(rootPath, @"function3", "main.js"))).Returns(true);
             fileBase.Setup(f => f.ReadAllText(Path.Combine(rootPath, @"function3", "function.json"))).Returns(function3);
             fileBase.Setup(f => f.Open(Path.Combine(rootPath, @"function3", "function.json"), It.IsAny<FileMode>(), It.IsAny<FileAccess>(), It.IsAny<FileShare>())).Returns(() =>
             {
                 return new MemoryStream(Encoding.UTF8.GetBytes(function3));
-            });
-            fileBase.Setup(f => f.Open(Path.Combine(testDataPath, "function3.dat"), It.IsAny<FileMode>(), It.IsAny<FileAccess>(), It.IsAny<FileShare>())).Returns(() =>
-            {
-                return new MemoryStream(Encoding.UTF8.GetBytes(testData3));
             });
 
             return fileSystem.Object;

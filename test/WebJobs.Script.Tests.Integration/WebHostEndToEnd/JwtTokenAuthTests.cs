@@ -1,6 +1,7 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net;
@@ -9,10 +10,15 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Script.WebHost;
+using Microsoft.IdentityModel.Tokens;
 using Microsoft.Azure.WebJobs.Script.WebHost.Management;
 using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using Microsoft.WebJobs.Script.Tests;
+using Newtonsoft.Json;
 using Xunit;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.WebHostEndToEnd
@@ -20,6 +26,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.WebHostEndToEnd
     /// <summary>
     /// Tests for our JWT token auth handler.
     /// </summary>
+    [Trait(TestTraits.Group, TestTraits.NonE2EWebHost)]
     public class JwtTokenAuthTests : IClassFixture<JwtTokenAuthTests.TestFixture>
     {
         private TestFixture _fixture;
@@ -38,6 +45,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.WebHostEndToEnd
         [InlineData(nameof(HttpRequestHeader.Authorization), "https://testsite.azurewebsites.net", "https://testsite.azurewebsites.net")]
         [InlineData(ScriptConstants.SiteTokenHeaderName)]
         [InlineData(ScriptConstants.SiteTokenHeaderName, "https://appservice.core.azurewebsites.net", "https://testsite.azurewebsites.net")]
+        [InlineData(ScriptConstants.SiteTokenHeaderName, "https://AppService.Core.Azurewebsites.net", "https://TestSite.Azurewebsites.net")]
         [InlineData(ScriptConstants.SiteTokenHeaderName, "https://appservice.core.azurewebsites.net", "https://testsite.azurewebsites.net/azurefunctions")]
         [InlineData(ScriptConstants.SiteTokenHeaderName, "https://testsite.scm.azurewebsites.net", "https://testsite.azurewebsites.net")]
         [InlineData(ScriptConstants.SiteTokenHeaderName, "https://testsite.scm.azurewebsites.net", "https://testsite.azurewebsites.net/azurefunctions")]
@@ -63,10 +71,10 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.WebHostEndToEnd
         [Theory]
         [InlineData(nameof(HttpRequestHeader.Authorization))]
         [InlineData(ScriptConstants.SiteTokenHeaderName)]
-        public async Task InvokeAdminApi_InvalidToken_Fails(string headerName)
+        public async Task InvokeAdminApi_InvalidAudience_Fails(string headerName)
         {
             HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Get, "admin/host/status");
-            string token = _fixture.Host.GenerateAdminJwtToken("invalid", "invalid");
+            string token = _fixture.Host.GenerateAdminJwtToken(audience: "invalid");
 
             if (string.Compare(nameof(HttpRequestHeader.Authorization), headerName) == 0)
             {
@@ -77,8 +85,107 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.WebHostEndToEnd
                 request.Headers.Add(headerName, token);
             }
 
+            _fixture.Host.ClearLogMessages();
+
             var response = await _fixture.Host.HttpClient.SendAsync(request);
             Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+
+            var validationError = _fixture.Host.GetScriptHostLogMessages().Single(p => p.Category == ScriptConstants.LogCategoryHostAuthentication && p.Level == LogLevel.Debug);
+            Assert.Equal(ScriptConstants.LogCategoryHostAuthentication, validationError.Category);
+            Assert.Equal("Token audience validation failed for audience 'invalid'.", validationError.FormattedMessage);
+            Assert.True(validationError.Exception.Message.StartsWith("IDX10231: Audience validation failed."));
+        }
+
+        [Theory]
+        [InlineData(nameof(HttpRequestHeader.Authorization))]
+        [InlineData(ScriptConstants.SiteTokenHeaderName)]
+        public async Task InvokeAdminApi_InvalidIssuer_Fails(string headerName)
+        {
+            HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Get, "admin/host/status");
+            string token = _fixture.Host.GenerateAdminJwtToken(issuer: "invalid");
+
+            if (string.Compare(nameof(HttpRequestHeader.Authorization), headerName) == 0)
+            {
+                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+            }
+            else
+            {
+                request.Headers.Add(headerName, token);
+            }
+
+            _fixture.Host.ClearLogMessages();
+
+            var response = await _fixture.Host.HttpClient.SendAsync(request);
+            Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+
+            var validationError = _fixture.Host.GetScriptHostLogMessages().Single(p => p.Category == ScriptConstants.LogCategoryHostAuthentication && p.Level == LogLevel.Debug);
+            Assert.Equal(ScriptConstants.LogCategoryHostAuthentication, validationError.Category);
+            Assert.Equal("Token issuer validation failed for issuer 'invalid'.", validationError.FormattedMessage);
+            Assert.Equal("IDX10205: Issuer validation failed.", validationError.Exception.Message);
+        }
+
+        [Theory]
+        [InlineData(nameof(HttpRequestHeader.Authorization))]
+        [InlineData(ScriptConstants.SiteTokenHeaderName)]
+        public async Task InvokeAdminApi_InvalidSignature_Fails(string headerName)
+        {
+            HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Get, "admin/host/status");
+
+            byte[] keyBytes = TestHelpers.GenerateKeyBytes();
+            string token = _fixture.Host.GenerateAdminJwtToken(key: keyBytes);
+
+            if (string.Compare(nameof(HttpRequestHeader.Authorization), headerName) == 0)
+            {
+                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+            }
+            else
+            {
+                request.Headers.Add(headerName, token);
+            }
+
+            _fixture.Host.ClearLogMessages();
+
+            var response = await _fixture.Host.HttpClient.SendAsync(request);
+            Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+
+            var validationError = _fixture.Host.GetScriptHostLogMessages().Single(p => p.Category == ScriptConstants.LogCategoryHostAuthentication && p.Level == LogLevel.Debug);
+            Assert.Equal(ScriptConstants.LogCategoryHostAuthentication, validationError.Category);
+            Assert.Equal("Token validation failed.", validationError.FormattedMessage);
+            Assert.True(validationError.Exception.Message.StartsWith("IDX10517: Signature validation failed."));
+        }
+
+        [Theory]
+        [InlineData(nameof(HttpRequestHeader.Authorization))]
+        [InlineData(ScriptConstants.SiteTokenHeaderName)]
+        public async Task InvokeAdminApi_ExpiredToken_Fails(string headerName)
+        {
+            HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Get, "admin/host/status");
+
+            // Create a token that is already expired 
+            // Default ClockSkew is 5 minutes; pick a lifetime comfortably outside that window.
+            string token = _fixture.Host.GenerateAdminJwtToken(
+                validUntil: DateTime.UtcNow.AddHours(-1),
+                notBefore: DateTime.UtcNow.AddHours(-2));
+
+            if (string.Equals(nameof(HttpRequestHeader.Authorization), headerName, StringComparison.Ordinal))
+            {
+                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+            }
+            else
+            {
+                request.Headers.Add(headerName, token);
+            }
+
+            _fixture.Host.ClearLogMessages();
+
+            var response = await _fixture.Host.HttpClient.SendAsync(request);
+            Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+
+            var validationError = _fixture.Host.GetScriptHostLogMessages().Single(p => p.Category == ScriptConstants.LogCategoryHostAuthentication && p.Level == LogLevel.Debug);
+            Assert.Equal(ScriptConstants.LogCategoryHostAuthentication, validationError.Category);
+            Assert.Equal("Token validation failed.", validationError.FormattedMessage);
+            Assert.IsType<SecurityTokenExpiredException>(validationError.Exception);
+            Assert.StartsWith("IDX10223: Lifetime validation failed.", validationError.Exception.Message);
         }
 
         [Fact]
@@ -91,6 +198,28 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.WebHostEndToEnd
 
             var response = await _fixture.Host.HttpClient.SendAsync(request);
             response.EnsureSuccessStatusCode();
+        }
+
+        [Fact]
+        public async Task InvokeNonAdminApi_InvalidToken_DoesNotLogTokenAuthFailure()
+        {
+            HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, $"api/HttpTrigger-Scenarios?code=test");
+            request.Content = new StringContent(JsonConvert.SerializeObject(new { scenario = "staticWebApp" }));
+            string key = SecretsUtility.GetEncryptionKeyValue();
+            string token = _fixture.Host.GenerateAdminJwtToken(issuer: "invalid");
+            request.Headers.Add(ScriptConstants.SiteTokenHeaderName, token);
+
+            var response = await _fixture.Host.HttpClient.SendAsync(request);
+            response.EnsureSuccessStatusCode();
+
+            var validationErrors = _fixture.Host.GetScriptHostLogMessages(ScriptConstants.LogCategoryHostAuthentication);
+            Assert.Empty(validationErrors);
+
+            const string jwtCategory = "Microsoft.AspNetCore.Authentication.JwtBearer.JwtBearerHandler";
+            var authErrors = _fixture.Host.GetScriptHostLogMessages(jwtCategory)
+                .Concat(_fixture.Host.GetWebHostLogMessages(jwtCategory))
+                .Where(p => p.Level == LogLevel.Error || p.Exception is not null);
+            Assert.Empty(authErrors);
         }
 
         public class TestFixture : EndToEndTestFixture
@@ -107,7 +236,8 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.WebHostEndToEnd
                     { "AzureWebEncryptionKey", testKey },
                     { EnvironmentSettingNames.WebSiteAuthEncryptionKey, testKey },
                     { "AzureWebJobsStorage", null },
-                    { EnvironmentSettingNames.AzureWebsiteName, "testsite" }
+                    { EnvironmentSettingNames.AzureWebsiteName, "testsite" },
+                    { EnvironmentSettingNames.AzureWebsiteHostName, "testsite.azurewebsites.test" }
                 };
                 _scopedEnvironment = new TestScopedEnvironmentVariable(settings);
             }
@@ -134,6 +264,9 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.WebHostEndToEnd
                 var service = services.FirstOrDefault(d => d.ServiceType == typeof(IFunctionsSyncManager));
                 services.Remove(service);
                 services.AddSingleton<IFunctionsSyncManager, FunctionsSyncManager>();
+
+                services.AddHttpClient(Options.DefaultName)
+                    .ConfigurePrimaryHttpMessageHandler(() => new TestHandler());
             }
 
             public override void ConfigureWebHost(IServiceCollection services)

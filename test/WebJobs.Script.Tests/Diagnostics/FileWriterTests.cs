@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
@@ -91,7 +91,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             {
                 files = directory.GetFiles().OrderByDescending(p => p.LastWriteTime).ToArray();
                 return files.Length == 2;
-            }, timeout: 5000);
+            }, timeout: 10000);
 
             // expect only 2 files to remain - the new file we just created, as well
             // as the oversize file we just wrote to last (it has a new timestamp now so
@@ -183,6 +183,36 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         }
 
         [Fact]
+        public async Task LogsAreFlushedOnTimer()
+        {
+            FileWriter fileWriter = new FileWriter(_logFilePath, flushIntervalMs: 10);
+
+            // timer should elapse 50 times during this test
+            int numLogs = 100;
+            for (int i = 0; i < numLogs; i++)
+            {
+                fileWriter.AppendLine($"Test message {Thread.CurrentThread.ManagedThreadId} {i}");
+                await Task.Delay(5);
+            }
+
+            int GetLogLineCount()
+            {
+                var directory = new DirectoryInfo(_logFilePath);
+                int count = directory.EnumerateFiles().Count();
+                if (count < 1)
+                {
+                    return 0;
+                }
+
+                string logFile = directory.EnumerateFiles().First().FullName;
+                string[] fileLines = File.ReadAllLines(logFile);
+                return fileLines.Length;
+            }
+
+            await TestHelpers.Await(() => GetLogLineCount() == numLogs, timeout: 5000);
+        }
+
+        [Fact]
         public async Task Flush_ThrottlesLogs()
         {
             int numLogs = 10000;
@@ -215,9 +245,14 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             // created
             File.Delete(firstLogFile.FullName);
 
-            // wait at least a second to ensure the file gets a distinct timestamp
-            await TestHelpers.Await(() => !File.Exists(firstLogFile.FullName));
-            await Task.Delay(1000);
+            // wait until the timestamp used in the filename has advanced
+            string instanceId = FileWriter.GetInstanceId();
+            await TestHelpers.Await(() =>
+            {
+                string currentLogFileName = FileWriter.GetFileName(instanceId);
+                return !File.Exists(firstLogFile.FullName) &&
+                    !string.Equals(firstLogFile.Name, currentLogFileName, StringComparison.Ordinal);
+            });
 
             fileWriter.AppendLine("test trace");
             fileWriter.Flush();

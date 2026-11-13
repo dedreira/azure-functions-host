@@ -1,7 +1,7 @@
 // Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
-using System;
+using AwesomeAssertions;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Extensions;
 using Newtonsoft.Json.Linq;
@@ -21,7 +21,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Extensions
             JObject bindingJObject = JObject.Parse(rawJson);
             var bindingMetadata = BindingMetadata.Create(bindingJObject);
             bool result = bindingMetadata.SupportsDeferredBinding();
-            Assert.Equal(expectedResult, result);
+            result.Should().Be(expectedResult);
         }
 
         [Fact]
@@ -30,7 +30,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Extensions
             JObject bindingJObject = JObject.Parse("{\"name\":\"book\",\"direction\":\"In\",\"type\":\"blobTrigger\",\"blobPath\":\"expression-trigger\",\"connection\":\"AzureWebJobsStorage\",\"properties\":{\"skipDeferredBinding\":\"blah\"}}");
             var bindingMetadata = BindingMetadata.Create(bindingJObject);
             bool result = bindingMetadata.SupportsDeferredBinding();
-            Assert.False(result);
+            result.Should().BeFalse();
         }
 
         [Theory]
@@ -43,7 +43,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Extensions
             JObject bindingJObject = JObject.Parse(rawJson);
             var bindingMetadata = BindingMetadata.Create(bindingJObject);
             bool result = bindingMetadata.SkipDeferredBinding();
-            Assert.Equal(expectedResult, result);
+            result.Should().Be(expectedResult);
         }
 
         [Fact]
@@ -52,7 +52,90 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Extensions
             JObject bindingJObject = JObject.Parse("{\"name\":\"book\",\"direction\":\"In\",\"type\":\"blobTrigger\",\"blobPath\":\"expression-trigger\",\"connection\":\"AzureWebJobsStorage\",\"properties\":{\"skipDeferredBinding\":\"blah\"}}");
             var bindingMetadata = BindingMetadata.Create(bindingJObject);
             bool result = bindingMetadata.SkipDeferredBinding();
-            Assert.False(result);
+            result.Should().BeFalse();
+        }
+
+        [Theory]
+        [InlineData("httpTrigger", true)]
+        [InlineData("otherTrigger", false)]
+        [InlineData("http2Trigger", false)]
+        [InlineData("inputBinding", false)]
+        public void IsHttpTrigger_ReturnsExpectedValue(string type, bool expected)
+        {
+            var bindingMetadata = new BindingMetadata
+            {
+                Type = type,
+            };
+
+            bindingMetadata.IsHttpTrigger().Should().Be(expected);
+        }
+
+        [Theory]
+        [InlineData("eventGridTrigger", true)]
+        [InlineData("signalRTrigger", true)]
+        [InlineData("assistantSkillTrigger", true)]
+        [InlineData("webPubSubTrigger", true)]
+        [InlineData("blobTrigger", false, "eventGrid")]
+        [InlineData("blobTrigger", false, "other")]
+        [InlineData("httpTrigger", false)]
+        [InlineData("inputBinding", false)]
+        public void IsWebHookTrigger_ReturnsExpectedValue(string type, bool expected, string source = null)
+        {
+            var bindingMetadata = new BindingMetadata
+            {
+                Type = type,
+            };
+
+            if (source is not null)
+            {
+                bindingMetadata.Raw = new JObject
+                {
+                    ["source"] = source,
+                };
+            }
+
+            bindingMetadata.IsWebHookTrigger().Should().Be(expected);
+        }
+
+        [Theory]
+        [InlineData("orchestrationTrigger", true)]
+        [InlineData("activityTrigger", true)]
+        [InlineData("entityTrigger", true)]
+        [InlineData("httpTrigger", false)]
+        [InlineData("inputBinding", false)]
+        public void IsDurableTrigger_ReturnsExpectedValue(string type, bool expected)
+        {
+            var bindingMetadata = new BindingMetadata
+            {
+                Type = type,
+            };
+
+            bindingMetadata.IsDurableTrigger().Should().Be(expected);
+        }
+
+        [Theory]
+        [InlineData("blobTrigger", true, "eventGrid")]
+        [InlineData("blobTrigger", false, "other")]
+        [InlineData("blobTrigger", false, null)]
+        [InlineData("otherTrigger", false, "eventGrid")]
+        [InlineData("otherTrigger", false, "other")]
+        [InlineData("otherTrigger", false, null)]
+        public void IsEventGridBlobTrigger_ReturnsExpectedValue(string type, bool expected, string source)
+        {
+            var bindingMetadata = new BindingMetadata
+            {
+                Type = type,
+            };
+
+            if (source is not null)
+            {
+                bindingMetadata.Raw = new JObject
+                {
+                    ["source"] = source,
+                };
+            }
+
+            bindingMetadata.IsEventGridBlobTrigger().Should().Be(expected);
         }
     }
 }

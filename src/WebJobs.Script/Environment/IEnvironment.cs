@@ -1,9 +1,7 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
-using System;
-using System.Collections.Generic;
-using System.Text;
+using System.Runtime.InteropServices;
 
 namespace Microsoft.Azure.WebJobs.Script
 {
@@ -13,6 +11,16 @@ namespace Microsoft.Azure.WebJobs.Script
     public interface IEnvironment
     {
         /// <summary>
+        /// Gets a value indicating whether the current process is a 64-bit process.
+        /// </summary>
+        public bool Is64BitProcess { get; }
+
+        /// <summary>
+        /// Gets the <see cref="OSPlatform"/> that the current process is running on.
+        /// </summary>
+        public OSPlatform Platform { get; }
+
+        /// <summary>
         /// Returns the value of an environment variable for the current <see cref="IEnvironment"/>.
         /// </summary>
         /// <param name="name">The environment variable name.</param>
@@ -20,7 +28,7 @@ namespace Microsoft.Azure.WebJobs.Script
         string GetEnvironmentVariable(string name);
 
         /// <summary>
-        /// Creates, modifies, or deletes an environment variable stored in the current <see cref="IEnvironment"/>
+        /// Creates, modifies, or deletes an environment variable stored in the current <see cref="IEnvironment"/>.
         /// </summary>
         /// <param name="name">The environment variable name.</param>
         /// <param name="value">The value to assign to the variable.</param>

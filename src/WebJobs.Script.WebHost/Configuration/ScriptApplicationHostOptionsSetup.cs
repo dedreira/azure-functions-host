@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
@@ -56,11 +56,12 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Configuration
                 // to be used by the placeholder site.
                 // Important that we use paths that are different than the configured paths
                 // to ensure that placeholder files are isolated
-                string tempRoot = Path.GetTempPath();
+                var tempRoot = Path.GetTempPath();
+                var standbyFunctionsPath = Path.Combine(tempRoot, "functions", "standby");
 
-                options.LogPath = Path.Combine(tempRoot, @"functions\standby\logs");
-                options.ScriptPath = Path.Combine(tempRoot, @"functions\standby\wwwroot");
-                options.SecretsPath = Path.Combine(tempRoot, @"functions\standby\secrets");
+                options.LogPath = Path.Combine(standbyFunctionsPath, "logs");
+                options.ScriptPath = Path.Combine(standbyFunctionsPath, "wwwroot");
+                options.SecretsPath = Path.Combine(standbyFunctionsPath, "secrets");
                 options.IsSelfHost = options.IsSelfHost;
                 options.IsStandbyConfiguration = true;
             }
@@ -71,6 +72,21 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Configuration
 
         private bool IsZipDeployment(out bool isScmRunFromPackage)
         {
+            // Flex consumption does not support mutable filesystems, and therefore always counts as zip deployment. It does not use scmRunFromPackage.
+            // TODO: revisit whether this flex consumption path should return false when in placeholder mode? Thats how it appears to work for other SKUs.
+            if (_environment.IsFlexConsumptionSku())
+            {
+                isScmRunFromPackage = false;
+                return true;
+            }
+
+            // Functions on Container Apps always have a read-only filesystem
+            if (_environment.IsManagedAppEnvironment())
+            {
+                isScmRunFromPackage = false;
+                return true;
+            }
+
             // Check app settings for run from package.
             bool runFromPkgConfigured = Utility.IsValidZipSetting(_environment.GetEnvironmentVariable(AzureWebsiteZipDeployment)) ||
                 Utility.IsValidZipSetting(_environment.GetEnvironmentVariable(AzureWebsiteAltZipDeployment)) ||

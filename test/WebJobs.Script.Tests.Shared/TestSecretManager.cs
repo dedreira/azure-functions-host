@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
@@ -6,13 +6,14 @@ using System.Collections.Generic;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Extensions.Http;
 using Microsoft.Azure.WebJobs.Script.WebHost;
+using Microsoft.Azure.WebJobs.Script.WebHost.Security;
 using Microsoft.Extensions.Logging;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests
 {
     public class TestSecretManager : ISecretManager
     {
-        internal const string TestMasterKey = "1234";
+        public const string TestMasterKey = "1234";
         private Dictionary<string, string> _hostSystemKeys;
         private Dictionary<string, string> _hostFunctionKeys;
 
@@ -31,7 +32,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             return Task.FromResult(true);
         }
 
-        public virtual Task<IDictionary<string, string>> GetFunctionSecretsAsync(string functionName, bool merged = false)
+        public virtual Task<IDictionary<string, string>> GetFunctionSecretsAsync(string functionName)
         {
             // for testing, any time we're asked for function keys, we return a static set
             return Task.FromResult<IDictionary<string, string>>(new Dictionary<string, string>
@@ -69,6 +70,20 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             return Task.FromResult(new KeyOperationResult(resultSecret, OperationResult.Created));
         }
 
+        public virtual async Task<string> GetOrCreateSystemKeyAsync(string keyName)
+        {
+            var hostSecrets = await GetHostSecretsAsync();
+            if (hostSecrets.SystemKeys.TryGetValue(keyName, out string keyValue))
+            {
+                return keyValue;
+            }
+
+            keyValue = SecretGenerator.GenerateSystemKeyValue();
+            var result = await AddOrUpdateFunctionSecretAsync(keyName, keyValue, HostKeyScopes.SystemKeys, ScriptSecretsType.Host);
+
+            return result.Secret;
+        }
+
         public virtual Task<KeyOperationResult> SetMasterKeyAsync(string value)
         {
             throw new NotImplementedException();
@@ -87,6 +102,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 { "SystemKey1", "SystemValue1" },
                 { "SystemKey2", "SystemValue2" },
                 { "Test_Extension", "SystemValue3" },
+                { "Test2_Extension", "SystemValue4" }
             };
         }
 

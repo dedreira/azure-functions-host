@@ -121,15 +121,15 @@ namespace Microsoft.Azure.WebJobs.Script.Diagnostics.Extensions
                 new EventId(325, nameof(ScriptStartUpLoadedExtension)),
                 "Loaded extension '{startupExtensionName}' ({startupExtensionVersion})");
 
-        private static readonly Action<ILogger, Exception> _functionMetadataProviderReadingMetadata =
-            LoggerMessage.Define(LogLevel.Information,
-                new EventId(326, nameof(FunctionMetadataManagerLoadingFunctionsMetadata)),
-                "Reading functions metadata");
+        private static readonly Action<ILogger, string, Exception> _readingFunctionMetadataFromProvider =
+            LoggerMessage.Define<string>(LogLevel.Information,
+                new EventId(326, nameof(ReadingFunctionMetadataFromProvider)),
+                "Reading functions metadata ({provider})");
 
-        private static readonly Action<ILogger, int, Exception> _functionMetadataProviderFunctionsFound =
-            LoggerMessage.Define<int>(LogLevel.Information,
-                new EventId(327, nameof(FunctionMetadataManagerFunctionsLoaded)),
-                "{count} functions found");
+        private static readonly Action<ILogger, int, string, Exception> _functionsReturnedByProvider =
+            LoggerMessage.Define<int, string>(LogLevel.Information,
+                new EventId(327, nameof(FunctionsReturnedByProvider)),
+                "{count} functions found ({provider})");
 
         private static readonly Action<ILogger, string, Guid, Exception> _customHandlerForwardingHttpTriggerInvocation =
             LoggerMessage.Define<string, Guid>(LogLevel.Debug,
@@ -161,10 +161,10 @@ namespace Microsoft.Azure.WebJobs.Script.Diagnostics.Extensions
                 new EventId(333, nameof(IncorrectAutorestGeneratedJsonFile)),
                 "autorest_generated.json file found is incorrect (https://aka.ms/stencil) | exception:\n{contents}");
 
-        private static readonly Action<ILogger, string, bool, bool, bool, Exception> _scriptStartUpNotLoadingExtensionBundle =
-            LoggerMessage.Define<string, bool, bool, bool>(LogLevel.Information,
+        private static readonly Action<ILogger, string, bool, bool, bool, bool, bool, Exception> _scriptStartUpNotLoadingExtensionBundle =
+            LoggerMessage.Define<string, bool, bool, bool, bool, bool>(LogLevel.Information,
                 new EventId(334, nameof(ScriptStartNotLoadingExtensionBundle)),
-                "Loading extensions from {path}. BundleConfigured: {bundleConfigured}, PrecompiledFunctionApp: {isPrecompiledFunctionApp}, LegacyBundle: {isLegacyExtensionBundle}");
+                "Extension Bundle not loaded. Loading extensions from {path}. BundleConfigured: {bundleConfigured}, PrecompiledFunctionApp: {isPrecompiledFunctionApp}, LegacyBundle: {isLegacyExtensionBundle}, DotnetIsolatedApp: {isDotnetIsolatedApp}, isLogicApp: {isLogicApp}");
 
         private static readonly Action<ILogger, string, Exception> _scriptStartupResettingLoadContextWithBasePath =
             LoggerMessage.Define<string>(LogLevel.Information,
@@ -174,14 +174,52 @@ namespace Microsoft.Azure.WebJobs.Script.Diagnostics.Extensions
         private static readonly Action<ILogger, string, string, Version, string, string, Exception> _minimumExtensionVersionNotSatisfied =
             LoggerMessage.Define<string, string, Version, string, string>(
             LogLevel.Error,
-            new EventId(334, nameof(MinimumExtensionVersionNotSatisfied)),
+            new EventId(336, nameof(MinimumExtensionVersionNotSatisfied)),
             "ExtensionStartupType {extensionTypeName} from assembly '{extensionTypeAssemblyFullName}' does not meet the required minimum version of {minimumAssemblyVersion}. Update your NuGet package reference for {requirementPackageName} to {requirementMinimumPackageVersion} or later.");
 
         private static readonly Action<ILogger, string, string, string, string, Exception> _minimumBundleVersionNotSatisfied =
             LoggerMessage.Define<string, string, string, string>(
             LogLevel.Error,
-            new EventId(335, nameof(MinimumBundleVersionNotSatisfied)),
+            new EventId(337, nameof(MinimumBundleVersionNotSatisfied)),
             "Referenced bundle {bundleId} of version {bundleVersion} does not meet the required minimum version of {minimumVersion}. Update your extension bundle reference in host.json to reference {minimumVersion2} or later.");
+
+        private static readonly Action<ILogger, string, Exception> _hostJsonZipDeploymentIssue =
+            LoggerMessage.Define<string>(LogLevel.Error,
+            new EventId(338, nameof(HostJsonZipDeploymentIssue)),
+            "No functions were found. A valid host.json file wasn't found in the package root. However, one was located at: {hostJsonFilesPath}. This state indicates that your deployment package was created incorrectly. For deployment package requirements, see https://aka.ms/deployment-zip-push.");
+
+        private static readonly Action<ILogger, Exception> _noHostJsonFile =
+            LoggerMessage.Define(LogLevel.Information,
+            new EventId(339, nameof(NoHostJsonFile)),
+            "No functions were found. This can occur before you deploy code to your function app or when the host.json file is missing from the most recent deployment. Make sure that your deployment package includes the host.json file in the root of the package. For deployment package requirements, see https://aka.ms/functions-deployment-technologies.");
+
+        private static readonly Action<ILogger, string, Exception> _missingAzureFunctionsFolder =
+            LoggerMessage.Define<string>(LogLevel.Warning,
+            new EventId(340, nameof(MissingAzureFunctionsFolder)),
+            "Could not find the .azurefunctions folder in the deployed artifacts of a .NET isolated function app. Make sure that your deployment package includes the .azurefunctions folder at the root of the package. For deployment package requirements, see https://aka.ms/functions-deployment-technologies. If this is not intended to be a .NET isolated app, please ensure that the {functionWorkerRuntime} app setting is configured correctly.");
+
+        private static readonly Action<ILogger, string, string, Exception> _incorrectAzureFunctionsFolderPath =
+            LoggerMessage.Define<string, string>(LogLevel.Warning,
+            new EventId(341, nameof(IncorrectAzureFunctionsFolderPath)),
+            "Could not find the .azurefunctions folder in the deployed artifacts of a .NET isolated function app. However, it is found to be located at: {path}. Make sure that your deployment package includes the .azurefunctions folder at the root of the package. For deployment package requirements, see https://aka.ms/functions-deployment-technologies. If this is not intended to be a .NET isolated app, please ensure that the {functionWorkerRuntime} app setting is configured correctly.");
+
+        private static readonly Action<ILogger, string, Exception> _publishingMetrics =
+            LoggerMessage.Define<string>(LogLevel.Debug, new EventId(338, nameof(PublishingMetrics)), "{metrics}");
+
+        private static readonly Action<ILogger, string, Exception> _outdatedExtensionBundle =
+           LoggerMessage.Define<string>(LogLevel.Warning,
+           new EventId(342, nameof(OutdatedExtensionBundle)),
+           "Your app is using a deprecated version - {currentVersion} of extension bundles. Upgrade to a supported version: https://aka.ms/FunctionsBundlesUpgrade");
+
+        private static readonly Action<ILogger, string, Exception> _defaultWorkersDirectoryPath =
+           LoggerMessage.Define<string>(LogLevel.Debug,
+           new EventId(343, nameof(DefaultWorkersDirectoryPath)),
+           "Workers Directory set to: {workersDirPath}");
+
+        public static void PublishingMetrics(this ILogger logger, string metrics)
+        {
+            _publishingMetrics(logger, metrics, null);
+        }
 
         public static void ExtensionsManagerRestoring(this ILogger logger)
         {
@@ -208,9 +246,9 @@ namespace Microsoft.Azure.WebJobs.Script.Diagnostics.Extensions
             _scriptStartupResettingLoadContextWithBasePath(logger, path, null);
         }
 
-        public static void ScriptStartNotLoadingExtensionBundle(this ILogger logger, string path, bool bundleConfigured, bool isPrecompiledFunctionApp, bool isLegacyExtensionBundle)
+        public static void ScriptStartNotLoadingExtensionBundle(this ILogger logger, string path, bool bundleConfigured, bool isPrecompiledFunctionApp, bool isLegacyExtensionBundle, bool isDotnetIsolatedApp, bool isLogicApp)
         {
-            _scriptStartUpNotLoadingExtensionBundle(logger, path, bundleConfigured, isPrecompiledFunctionApp, isLegacyExtensionBundle, null);
+            _scriptStartUpNotLoadingExtensionBundle(logger, path, bundleConfigured, isPrecompiledFunctionApp, isLegacyExtensionBundle, isDotnetIsolatedApp, isLogicApp, null);
         }
 
         public static void ScriptStartUpLoadingStartUpExtension(this ILogger logger, string startupExtensionName)
@@ -280,19 +318,19 @@ Lock file hash: {currentLockFileHash}";
             _functionMetadataManagerLoadingFunctionsMetadata(logger, null);
         }
 
+        public static void ReadingFunctionMetadataFromProvider(this ILogger logger, string provider)
+        {
+            _readingFunctionMetadataFromProvider(logger, provider, null);
+        }
+
         public static void FunctionMetadataManagerFunctionsLoaded(this ILogger logger, int count)
         {
             _functionMetadataManagerFunctionsLoaded(logger, count, null);
         }
 
-        public static void FunctionMetadataProviderParsingFunctions(this ILogger logger)
+        public static void FunctionsReturnedByProvider(this ILogger logger, int count, string provider)
         {
-            _functionMetadataProviderReadingMetadata(logger, null);
-        }
-
-        public static void FunctionMetadataProviderFunctionFound(this ILogger logger, int count)
-        {
-            _functionMetadataProviderFunctionsFound(logger, count, null);
+            _functionsReturnedByProvider(logger, count, provider, null);
         }
 
         public static void AutoRecoveringFileSystemWatcherFailureDetected(this ILogger logger, string errorMessage, string path)
@@ -358,6 +396,36 @@ Lock file hash: {currentLockFileHash}";
         public static void MinimumBundleVersionNotSatisfied(this ILogger logger, string bundleId, string bundleVersion, string minimumVersion)
         {
             _minimumBundleVersionNotSatisfied(logger, bundleId, bundleVersion, minimumVersion, minimumVersion, null);
+        }
+
+        public static void HostJsonZipDeploymentIssue(this ILogger logger, string path)
+        {
+            _hostJsonZipDeploymentIssue(logger, path, null);
+        }
+
+        public static void NoHostJsonFile(this ILogger logger)
+        {
+            _noHostJsonFile(logger, null);
+        }
+
+        public static void MissingAzureFunctionsFolder(this ILogger logger)
+        {
+            _missingAzureFunctionsFolder(logger, EnvironmentSettingNames.FunctionWorkerRuntime, null);
+        }
+
+        public static void IncorrectAzureFunctionsFolderPath(this ILogger logger, string path)
+        {
+            _incorrectAzureFunctionsFolderPath(logger, path, EnvironmentSettingNames.FunctionWorkerRuntime, null);
+        }
+
+        public static void DefaultWorkersDirectoryPath(this ILogger logger, string workersDirPath)
+        {
+            _defaultWorkersDirectoryPath(logger, workersDirPath, null);
+        }
+
+        public static void OutdatedExtensionBundle(this ILogger logger, string currentVersion)
+        {
+            _outdatedExtensionBundle(logger, currentVersion, null);
         }
     }
 }

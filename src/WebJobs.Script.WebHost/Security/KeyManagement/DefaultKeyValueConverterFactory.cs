@@ -13,12 +13,28 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
 {
     public sealed class DefaultKeyValueConverterFactory : IKeyValueConverterFactory
     {
-        private readonly bool _encryptionSupported;
+        private readonly bool _shouldEncrypt;
+
+        /// <summary>
+        /// Forces Azure Websites Data Protection configuration; otherwise uses existing hosting-environment detection.
+        /// </summary>
+        private readonly bool _forceAzureWebsitesDataProtection;
         private static readonly PlaintextKeyValueConverter PlaintextValueConverter = new PlaintextKeyValueConverter(FileAccess.ReadWrite);
 
-        public DefaultKeyValueConverterFactory(bool allowEncryption)
+        public DefaultKeyValueConverterFactory(bool repositorySupportsEncryption)
+            : this(repositorySupportsEncryption, forceAzureWebsitesDataProtection: false)
         {
-            _encryptionSupported = !allowEncryption && IsEncryptionSupported();
+        }
+
+        /// <summary>
+        /// Initializes a factory with optional forced Azure Websites Data Protection configuration.
+        /// </summary>
+        /// <param name="repositorySupportsEncryption">Whether the repository provides its own encryption.</param>
+        /// <param name="forceAzureWebsitesDataProtection">Whether to force Azure Websites Data Protection configuration instead of hosting-environment detection.</param>
+        internal DefaultKeyValueConverterFactory(bool repositorySupportsEncryption, bool forceAzureWebsitesDataProtection)
+        {
+            _forceAzureWebsitesDataProtection = forceAzureWebsitesDataProtection;
+            _shouldEncrypt = !repositorySupportsEncryption && IsEncryptionSupported();
         }
 
         private static bool IsEncryptionSupported()
@@ -32,7 +48,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
         {
             if (key.IsEncrypted)
             {
-                return new DataProtectionKeyValueConverter(FileAccess.Read);
+                return new DataProtectionKeyValueConverter(FileAccess.Read, forceAzureWebsitesDataProtection: _forceAzureWebsitesDataProtection);
             }
 
             return PlaintextValueConverter;
@@ -40,9 +56,9 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
 
         public IKeyValueWriter GetValueWriter(Key key)
         {
-            if (_encryptionSupported)
+            if (_shouldEncrypt)
             {
-                return new DataProtectionKeyValueConverter(FileAccess.Write);
+                return new DataProtectionKeyValueConverter(FileAccess.Write, forceAzureWebsitesDataProtection: _forceAzureWebsitesDataProtection);
             }
 
             return PlaintextValueConverter;

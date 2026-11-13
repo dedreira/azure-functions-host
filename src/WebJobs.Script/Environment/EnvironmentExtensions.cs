@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
@@ -8,8 +8,10 @@ using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using Microsoft.Azure.WebJobs.Script.Config;
+using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
 using static Microsoft.Azure.WebJobs.Script.EnvironmentSettingNames;
+using static Microsoft.Azure.WebJobs.Script.Utility;
 
 namespace Microsoft.Azure.WebJobs.Script
 {
@@ -68,13 +70,17 @@ namespace Microsoft.Azure.WebJobs.Script
         /// </summary>
         public static bool IsAzureMonitorEnabled(this IEnvironment environment)
         {
-            string value = environment.GetEnvironmentVariable(AzureMonitorCategories);
-            if (value == null)
-            {
-                return true;
-            }
-            string[] categories = value.Split(',');
-            return categories.Contains(ScriptConstants.AzureMonitorTraceCategory);
+            return IsAzureMonitorLoggingEnabled(environment.GetEnvironmentVariable(AzureMonitorCategories));
+        }
+
+        /// <summary>
+        /// Returns true only when a Functions AzureMonitor log category has been explicitly subscribed to.
+        /// Unlike <see cref="IsAzureMonitorEnabled"/>, an unset variable returns false rather than defaulting to true.
+        /// </summary>
+        public static bool IsAzureMonitorExplicitlyEnabled(this IEnvironment environment)
+        {
+            string categories = environment.GetEnvironmentVariable(AzureMonitorCategories);
+            return categories is not null && IsAzureMonitorLoggingEnabled(categories);
         }
 
         /// <summary>
@@ -113,6 +119,12 @@ namespace Microsoft.Azure.WebJobs.Script
         {
             return !string.IsNullOrEmpty(environment.GetEnvironmentVariable(AzureFilesConnectionString)) &&
                    !string.IsNullOrEmpty(environment.GetEnvironmentVariable(AzureFilesContentShare));
+        }
+
+        public static bool IsDotNetInProcSupported(this IEnvironment environment)
+        {
+            return !IsFlexConsumptionSku(environment)
+                   && !string.Equals(environment.GetEnvironmentVariable(EnvironmentSettingNames.FunctionsDisableInProc), "1", StringComparison.OrdinalIgnoreCase);
         }
 
         public static string GetAzureWebsiteHomePath(this IEnvironment environment)
@@ -165,6 +177,11 @@ namespace Microsoft.Azure.WebJobs.Script
                 && runningInContainerValue;
         }
 
+        public static bool IsCorsConfigurationEnabled(this IEnvironment environment)
+        {
+            return environment.GetEnvironmentVariable(EnableCorsConfiguration) == "1";
+        }
+
         public static bool IsPersistentFileSystemAvailable(this IEnvironment environment)
         {
             return environment.IsWindowsAzureManagedHosting()
@@ -196,7 +213,13 @@ namespace Microsoft.Azure.WebJobs.Script
         /// <returns><see cref="true"/> if running in a Windows Consumption App Service app; otherwise, false.</returns>
         public static bool IsWindowsConsumption(this IEnvironment environment)
         {
+            if (environment.Platform != OSPlatform.Windows)
+            {
+                return false;
+            }
+
             string value = environment.GetEnvironmentVariable(AzureWebsiteSku);
+
             return string.Equals(value, ScriptConstants.DynamicSku, StringComparison.OrdinalIgnoreCase);
         }
 
@@ -212,6 +235,11 @@ namespace Microsoft.Azure.WebJobs.Script
             return IsWindowsConsumption(environment) || IsAnyLinuxConsumption(environment) || IsFlexConsumptionSku(environment);
         }
 
+        internal static bool IsAdminWarmupRouteEnabled(this IEnvironment environment)
+        {
+            return !environment.IsAnyLinuxConsumption() && !environment.IsWindowsConsumption();
+        }
+
         /// <summary>
         /// Gets a value indicating whether the application is running in the Flex Consumption Sku.
         /// </summary>
@@ -219,15 +247,24 @@ namespace Microsoft.Azure.WebJobs.Script
         /// <returns><see cref="true"/> if running in the FlexConsumption Sku, false otherwise.</returns>
         public static bool IsFlexConsumptionSku(this IEnvironment environment)
         {
+            // SKU is part of Flex Consumption placeholder environment vars, so should always be present
             string value = environment.GetEnvironmentVariable(AzureWebsiteSku);
             if (string.Equals(value, ScriptConstants.FlexConsumptionSku, StringComparison.OrdinalIgnoreCase))
             {
                 return true;
             }
 
-            // when in placeholder mode, site settings like SKU are not available
-            // to enable this check to run in both modes, we check additional settings
-            return environment.IsLinuxConsumptionOnLegion();
+            // In the past, SKU was not set in placeholder mode, so the following additional
+            // checks were performed. May not be needed anymore.
+            if (!environment.IsConsumptionOnLegion())
+            {
+                // not running on Legion, so not Flex Consumption
+                return false;
+            }
+
+            // If we're running on Legion and the app isn't CV1 on Legion,
+            // then it's Flex
+            return !environment.WebsiteSkuIsDynamic();
         }
 
         /// <summary>
@@ -262,6 +299,16 @@ namespace Microsoft.Azure.WebJobs.Script
             return string.Equals(value, ScriptConstants.ElasticPremiumSku, StringComparison.OrdinalIgnoreCase);
         }
 
+        /// <summary>
+        /// Gets a value indicating whether the application is running in a Windows App Service environment.
+        /// </summary>
+        /// <param name="environment">The environment to verify.</param>
+        /// <returns><see cref="true"/> if running in a Windows App Service app; otherwise, false.</returns>
+        public static bool IsHostedWindowsEnvironment(this IEnvironment environment)
+        {
+            return environment.IsWindowsAzureManagedHosting() || environment.IsWindowsConsumption() || environment.IsWindowsElasticPremium();
+        }
+
         public static bool IsDynamicSku(this IEnvironment environment)
         {
             return environment.IsConsumptionSku() || environment.IsWindowsElasticPremium();
@@ -275,7 +322,12 @@ namespace Microsoft.Azure.WebJobs.Script
         /// <returns><see cref="true"/> if running in a Windows Azure managed hosting environment; otherwise, false.</returns>
         public static bool IsWindowsAzureManagedHosting(this IEnvironment environment)
         {
-            return environment.IsAppService() && RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+            if (environment.Platform != OSPlatform.Windows)
+            {
+                return false;
+            }
+
+            return environment.IsAppService();
         }
 
         /// <summary>
@@ -289,7 +341,7 @@ namespace Microsoft.Azure.WebJobs.Script
         }
 
         /// <summary>
-        /// Gets a value indicating whether the application is running in Managed App environment.
+        /// Gets a value indicating whether the application is running in Managed App environment (Azure Container Apps environment).
         /// </summary>
         /// <param name="environment">The environment to verify.</param>
         /// <returns><see cref="true"/> if running in Managed App environment; otherwise, false.</returns>
@@ -306,22 +358,70 @@ namespace Microsoft.Azure.WebJobs.Script
         /// <returns><see cref="true"/> if running in a Linux Consumption App Service app; otherwise, false.</returns>
         public static bool IsAnyLinuxConsumption(this IEnvironment environment)
         {
-            return (environment.IsLinuxConsumptionOnAtlas() || environment.IsFlexConsumptionSku()) && !environment.IsManagedAppEnvironment();
+            return (environment.IsLinuxConsumptionOnAtlas() || environment.IsFlexConsumptionSku() || environment.IsLinuxConsumptionOnLegion()) && !environment.IsManagedAppEnvironment();
         }
 
         public static bool IsLinuxConsumptionOnAtlas(this IEnvironment environment)
         {
             return !environment.IsAppService() &&
                    !string.IsNullOrEmpty(environment.GetEnvironmentVariable(ContainerName)) &&
-                   string.IsNullOrEmpty(environment.GetEnvironmentVariable(LegionServiceHost));
+                   string.IsNullOrEmpty(environment.GetEnvironmentVariable(LegionServiceHost)) &&
+                   !environment.IsManagedAppEnvironment();
         }
 
-        private static bool IsLinuxConsumptionOnLegion(this IEnvironment environment)
+        public static bool IsConsumptionOnLegion(this IEnvironment environment)
         {
             return !environment.IsAppService() &&
                    (!string.IsNullOrEmpty(environment.GetEnvironmentVariable(ContainerName)) ||
                    !string.IsNullOrEmpty(environment.GetEnvironmentVariable(WebsitePodName))) &&
-                   !string.IsNullOrEmpty(environment.GetEnvironmentVariable(LegionServiceHost));
+                   !string.IsNullOrEmpty(environment.GetEnvironmentVariable(LegionServiceHost)) &&
+                   !environment.IsManagedAppEnvironment();
+        }
+
+        /// <summary>
+        /// Returns a value indicating whether the app is V1 Linux Consumption running on Legion.
+        /// </summary>
+        /// <param name="environment">The environment to verify.</param>
+        /// <returns><see cref="true"/> if the app is V1 Linux Consumption running on Legion; otherwise, <see cref="false"/>.</returns>
+        public static bool IsLinuxConsumptionOnLegion(this IEnvironment environment)
+        {
+            return IsConsumptionOnLegion(environment) && environment.WebsiteSkuIsDynamic();
+        }
+
+        /// <summary>
+        /// Gets a value indicating whether the host should notify the platform when triggers are synchronized,
+        /// based on the <see cref="FunctionsNotifyPlatformOnSync"/> environment variable.
+        /// </summary>
+        /// <param name="environment">The environment to verify.</param>
+        /// <returns><see langword="true"/> if platform notification is enabled; otherwise, <see langword="false"/>.</returns>
+        public static bool ShouldNotifyPlatformOnSync(this IEnvironment environment)
+        {
+            return bool.TryParse(environment.GetEnvironmentVariable(FunctionsNotifyPlatformOnSync), out bool enabled) && enabled;
+        }
+
+        /// <summary>
+        /// Checks both WEBSITE_SKU and WEBSITE_SKU_NAME and returns true IFF one is
+        /// set to "Dynamic".
+        /// </summary>
+        /// <param name="environment">The environment to check.</param>
+        /// <returns><see cref="true"/> if the sku is Dynamic; otherwise, <see cref="false"/>.</returns>
+        public static bool WebsiteSkuIsDynamic(this IEnvironment environment)
+        {
+            string value = environment.GetEnvironmentVariable(AzureWebsiteSku);
+            if (string.Equals(value, ScriptConstants.DynamicSku, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            // Linux Consumption uses WEBSITE_SKU_NAME but is migrating to use WEBSITE_SKU.
+            // So for now, we must check both.
+            value = environment.GetEnvironmentVariable(AzureWebsiteSkuName);
+            if (string.Equals(value, ScriptConstants.DynamicSku, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            return false;
         }
 
         /// <summary>
@@ -395,12 +495,29 @@ namespace Microsoft.Azure.WebJobs.Script
         }
 
         /// <summary>
+        /// Get hosting environment configuration file (different from scmhosting file).
+        /// </summary>
+        public static string GetFunctionsHostingEnvironmentConfigFilePath(this IEnvironment environment)
+        {
+            return environment.GetEnvironmentVariableOrDefault(FunctionsHostingEnvironmentConfigFilePath, string.Empty);
+        }
+
+        /// <summary>
         /// Gets if runtime environment is logic apps.
         /// </summary>
         public static bool IsLogicApp(this IEnvironment environment)
         {
             string appKind = environment.GetEnvironmentVariable(AppKind)?.ToLower();
             return !string.IsNullOrEmpty(appKind) && appKind.Contains(ScriptConstants.WorkFlowAppKind);
+        }
+
+        /// <summary>
+        /// Gets if codeful mode is enabled for Logic App app kind.
+        /// </summary>
+        public static bool IsLogicAppCodefulModeEnabled(this IEnvironment environment)
+        {
+            bool.TryParse(environment.GetEnvironmentVariable(EnvironmentSettingNames.LogicAppCodefulModeEnabled), out bool logicAppCodefulModeEnabled);
+            return logicAppCodefulModeEnabled;
         }
 
         /// <summary>
@@ -437,7 +554,12 @@ namespace Microsoft.Azure.WebJobs.Script
         {
             if (environment.IsAnyLinuxConsumption())
             {
-                return environment.GetEnvironmentVariableOrDefault(ContainerName, string.Empty);
+                var instanceId = environment.GetEnvironmentVariableOrDefault(WebsitePodName, string.Empty);
+                if (string.IsNullOrEmpty(instanceId))
+                {
+                    instanceId = environment.GetEnvironmentVariableOrDefault(ContainerName, string.Empty);
+                }
+                return instanceId;
             }
             else
             {
@@ -565,18 +687,9 @@ namespace Microsoft.Azure.WebJobs.Script
             }
         }
 
-        public static string GetFunctionsWorkerRuntime(this IEnvironment environment)
+        public static string GetFunctionsSiteUpdateId(this IEnvironment environment)
         {
-            return environment.GetEnvironmentVariableOrDefault(FunctionWorkerRuntime, string.Empty);
-        }
-
-        /// <summary>
-        /// Gets a value indicating whether AzureFileShare should be mounted when specializing Linux Consumption workers.
-        /// </summary>
-        public static bool SupportsAzureFileShareMount(this IEnvironment environment)
-        {
-            return string.Equals(environment.GetFunctionsWorkerRuntime(), RpcWorkerConstants.PowerShellLanguageWorkerName,
-                StringComparison.OrdinalIgnoreCase);
+            return environment.GetEnvironmentVariableOrDefault(FunctionsSiteUpdateId, string.Empty);
         }
 
         public static string GetHttpLeaderEndpoint(this IEnvironment environment)
@@ -603,12 +716,34 @@ namespace Microsoft.Azure.WebJobs.Script
         {
             string placeholderList = environment.GetEnvironmentVariableOrDefault(RpcWorkerConstants.FunctionWorkerPlaceholderModeListSettingName, string.Empty);
             var placeholderRuntimeSet = new HashSet<string>(placeholderList.Trim().Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries).Select(p => p.Trim()));
-            string workerRuntime = environment.GetEnvironmentVariable(RpcWorkerConstants.FunctionWorkerRuntimeSettingName);
-            if (!string.IsNullOrEmpty(workerRuntime))
+            string workerRuntime = environment.GetEnvironmentVariable(FunctionWorkerRuntime);
+
+            if (!environment.IsInProc(workerRuntime))
             {
                 placeholderRuntimeSet.Add(workerRuntime);
             }
+
             return placeholderRuntimeSet;
+        }
+
+        public static bool IsInProc(this IEnvironment environment, string workerRuntime = null)
+        {
+            if (workerRuntime is null)
+            {
+                workerRuntime = environment.GetEnvironmentVariable(FunctionWorkerRuntime);
+            }
+
+            return string.IsNullOrEmpty(workerRuntime) || string.Equals(workerRuntime, RpcWorkerConstants.DotNetLanguageWorkerName, StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// Returns the Antares platform release channel specified by the environment variable.
+        /// Value of this setting could be "LATEST", "STANDARD" or "EXTENDED".
+        /// If the environment variable is not set, the method returns the default value "LATEST".
+        /// </summary>
+        public static string GetPlatformReleaseChannel(this IEnvironment environment)
+        {
+            return environment.GetEnvironmentVariable(AntaresPlatformReleaseChannel) ?? ScriptConstants.LatestPlatformChannelNameUpper;
         }
 
         public static bool IsApplicationInsightsAgentEnabled(this IEnvironment environment)
@@ -649,6 +784,33 @@ namespace Microsoft.Azure.WebJobs.Script
         public static bool IsTargetBasedScalingEnabled(this IEnvironment environment)
         {
             return !string.Equals(environment.GetEnvironmentVariable(TargetBaseScalingEnabled), "0");
+        }
+
+        /// <summary>
+        /// Tries to get the target functions group to run, if any specified.
+        /// </summary>
+        /// <param name="environment">The environment to use.</param>
+        /// <param name="group">The target group, if any.</param>
+        /// <returns>True if group specified, false otherwise.</returns>
+        public static bool TryGetFunctionsTargetGroup(this IEnvironment environment, out string group)
+        {
+            group = environment.GetEnvironmentVariable(FunctionsTargetGroup);
+            if (group is "")
+            {
+                // standardize empty string to null
+                group = null;
+            }
+
+            return group is not null;
+        }
+
+        /// <summary>
+        /// Returns true if the worker is running in validation mode.
+        /// </summary>
+        public static bool IsInValidationMode(this IEnvironment environment)
+        {
+            return environment.TryGetFunctionsTargetGroup(out string group)
+                && string.Equals(group, FunctionGroups.ValidationWorker, StringComparison.InvariantCultureIgnoreCase);
         }
     }
 }

@@ -1,19 +1,20 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Reactive.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-using Google.Protobuf.WellKnownTypes;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.Azure.WebJobs.Script.Config;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.WebHost.Properties;
-using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.FileProviders;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Microsoft.Extensions.Primitives;
@@ -27,41 +28,43 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
     {
         private readonly IScriptHostManager _scriptHostManager;
         private readonly IOptionsMonitor<ScriptApplicationHostOptions> _options;
+        private readonly IOptionsMonitor<StandbyOptions> _standbyOptions;
         private readonly Lazy<Task> _specializationTask;
         private readonly IScriptWebHostEnvironment _webHostEnvironment;
         private readonly IEnvironment _environment;
-        private readonly IWebHostRpcWorkerChannelManager _rpcWorkerChannelManager;
+        private readonly IWebHostWorkerManager _workerManager;
         private readonly IConfigurationRoot _configuration;
         private readonly ILogger _logger;
         private readonly IMetricsLogger _metricsLogger;
         private readonly HostNameProvider _hostNameProvider;
         private readonly IDisposable _changeTokenCallbackSubscription;
         private readonly TimeSpan _specializationTimerInterval;
-        private readonly IApplicationLifetime _applicationLifetime;
+        private readonly IHostApplicationLifetime _applicationLifetime;
 
         private Timer _specializationTimer;
         private static CancellationTokenSource _standbyCancellationTokenSource = new CancellationTokenSource();
         private static IChangeToken _standbyChangeToken = new CancellationChangeToken(_standbyCancellationTokenSource.Token);
         private static SemaphoreSlim _semaphore = new SemaphoreSlim(1, 1);
 
-        public StandbyManager(IScriptHostManager scriptHostManager, IWebHostRpcWorkerChannelManager rpcWorkerChannelManager, IConfiguration configuration, IScriptWebHostEnvironment webHostEnvironment,
-            IEnvironment environment, IOptionsMonitor<ScriptApplicationHostOptions> options, ILogger<StandbyManager> logger, HostNameProvider hostNameProvider, IApplicationLifetime applicationLifetime, IMetricsLogger metricsLogger)
-            : this(scriptHostManager, rpcWorkerChannelManager, configuration, webHostEnvironment, environment, options, logger, hostNameProvider, applicationLifetime, TimeSpan.FromMilliseconds(50), metricsLogger)
+        public StandbyManager(IScriptHostManager scriptHostManager, IWebHostWorkerManager workerManager, IConfiguration configuration, IScriptWebHostEnvironment webHostEnvironment,
+            IEnvironment environment, IOptionsMonitor<ScriptApplicationHostOptions> options, IOptionsMonitor<StandbyOptions> standbyOptions, ILogger<StandbyManager> logger, HostNameProvider hostNameProvider, IHostApplicationLifetime applicationLifetime, IMetricsLogger metricsLogger)
+            : this(scriptHostManager, workerManager, configuration, webHostEnvironment, environment, options, standbyOptions, logger, hostNameProvider, applicationLifetime, TimeSpan.FromMilliseconds(50), metricsLogger)
         {
         }
 
-        public StandbyManager(IScriptHostManager scriptHostManager, IWebHostRpcWorkerChannelManager rpcWorkerChannelManager, IConfiguration configuration, IScriptWebHostEnvironment webHostEnvironment,
-            IEnvironment environment, IOptionsMonitor<ScriptApplicationHostOptions> options, ILogger<StandbyManager> logger, HostNameProvider hostNameProvider, IApplicationLifetime applicationLifetime, TimeSpan specializationTimerInterval, IMetricsLogger metricsLogger)
+        public StandbyManager(IScriptHostManager scriptHostManager, IWebHostWorkerManager workerManager, IConfiguration configuration, IScriptWebHostEnvironment webHostEnvironment,
+            IEnvironment environment, IOptionsMonitor<ScriptApplicationHostOptions> options, IOptionsMonitor<StandbyOptions> standbyOptions, ILogger<StandbyManager> logger, HostNameProvider hostNameProvider, IHostApplicationLifetime applicationLifetime, TimeSpan specializationTimerInterval, IMetricsLogger metricsLogger)
         {
             _scriptHostManager = scriptHostManager ?? throw new ArgumentNullException(nameof(scriptHostManager));
             _options = options ?? throw new ArgumentNullException(nameof(options));
+            _standbyOptions = standbyOptions ?? throw new ArgumentNullException(nameof(standbyOptions));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _metricsLogger = metricsLogger ?? throw new ArgumentNullException(nameof(metricsLogger));
             _specializationTask = new Lazy<Task>(SpecializeHostCoreAsync, LazyThreadSafetyMode.ExecutionAndPublication);
             _webHostEnvironment = webHostEnvironment ?? throw new ArgumentNullException(nameof(webHostEnvironment));
             _environment = environment ?? throw new ArgumentNullException(nameof(environment));
             _configuration = configuration as IConfigurationRoot ?? throw new ArgumentNullException(nameof(configuration));
-            _rpcWorkerChannelManager = rpcWorkerChannelManager ?? throw new ArgumentNullException(nameof(rpcWorkerChannelManager));
+            _workerManager = workerManager ?? throw new ArgumentNullException(nameof(workerManager));
             _hostNameProvider = hostNameProvider ?? throw new ArgumentNullException(nameof(hostNameProvider));
             _changeTokenCallbackSubscription = ChangeToken.RegisterChangeCallback(_ => _logger.LogDebug($"{nameof(StandbyManager)}.{nameof(ChangeToken)} callback has fired."), null);
             _specializationTimerInterval = specializationTimerInterval;
@@ -73,12 +76,16 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
         public Task SpecializeHostAsync()
         {
             IDisposable latencyEvent = _metricsLogger.LatencyEvent(MetricEventNames.SpecializationSpecializeHost);
+
+            // Tag concurrent callers as impacted by cold start
+            Activity.Current.SetColdStartImpactedTag();
+
             return _specializationTask.Value.ContinueWith(t =>
             {
                 if (t.IsFaulted)
                 {
                     // if we fail during specialization for whatever reason
-                    // this is fatal, so we shutdown
+                    // this is fatal, so we stop the application.
                     _logger.LogError(t.Exception, "Specialization failed. Shutting down.");
                     _applicationLifetime.StopApplication();
                 }
@@ -88,9 +95,17 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
 
         public async Task SpecializeHostCoreAsync()
         {
+            Activity activity = Activity.Current;
+            activity.SetColdStartTag();
+
             // Go async immediately to ensure that any async context from
             // the PlaceholderSpecializationMiddleware is properly suppressed.
             await Task.Yield();
+
+            // Start a new activity for specialization
+            using var initActivity = ActivityExtensions.StartSpecializationActivity();
+
+            ApplyMcpCustomHandlerSettings();
 
             _logger.LogInformation(Resources.HostSpecializationTrace);
 
@@ -112,19 +127,25 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             // (ex: ScriptPath is updated)
             NotifyChange();
 
+            if (!_standbyOptions.CurrentValue.SupportsPlaceholderScriptHost)
+            {
+                _logger.LogInformation("Skipping worker specialization and script host restart. The script host starts independently of specialization.");
+                return;
+            }
+
             using (_metricsLogger.LatencyEvent(MetricEventNames.SpecializationLanguageWorkerChannelManagerSpecialize))
             {
-                await _rpcWorkerChannelManager.SpecializeAsync();
+                await _workerManager.SpecializeAsync();
             }
 
             using (_metricsLogger.LatencyEvent(MetricEventNames.SpecializationRestartHost))
             {
-                await _scriptHostManager.RestartHostAsync();
+                await _scriptHostManager.RestartHostAsync("Host specialization.");
             }
 
             using (_metricsLogger.LatencyEvent(MetricEventNames.SpecializationDelayUntilHostReady))
             {
-                await _scriptHostManager.DelayUntilHostReady();
+                await _scriptHostManager.DelayUntilHostReadyAsync();
             }
         }
 
@@ -181,6 +202,16 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
                         _semaphore.Release();
                     }
                 }
+            }
+        }
+
+        private void ApplyMcpCustomHandlerSettings()
+        {
+            // For Flex Consumption SKU: if MCP custom handler preview is enabled, set worker runtime env to "custom".
+            if (_environment.IsFlexConsumptionSku() && FeatureFlags.IsEnabled(ScriptConstants.FeatureFlagEnableMcpCustomHandlerPreview, _environment))
+            {
+                _environment.SetEnvironmentVariable(EnvironmentSettingNames.FunctionWorkerRuntime, "custom");
+                _logger.LogInformation("MCP custom handler preview is enabled. Setting {envVar} to 'custom'", EnvironmentSettingNames.FunctionWorkerRuntime);
             }
         }
 

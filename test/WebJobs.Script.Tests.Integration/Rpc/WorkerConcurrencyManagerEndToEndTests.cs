@@ -1,12 +1,15 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Script.Eventing;
-using Microsoft.Azure.WebJobs.Script.Grpc.Eventing;
+using Microsoft.Azure.WebJobs.Script.Grpc;
+using Microsoft.Azure.WebJobs.Script.Grpc.Messages;
+using Microsoft.Azure.WebJobs.Script.Workers;
 using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
+using Microsoft.Extensions.DependencyInjection;
 using Xunit;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests
@@ -28,7 +31,8 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             await TestHelpers.Await(async () =>
             {
-                fd = Fixture.JobHost.FunctionDispatcher as RpcFunctionInvocationDispatcher;
+                IFunctionInvocationDispatcherFactory factory = Fixture.Host.Services.GetService<IFunctionInvocationDispatcherFactory>();
+                fd = factory.GetFunctionDispatcher() as RpcFunctionInvocationDispatcher;
                 channels = await fd.GetInitializedWorkerChannelsAsync();
                 return channels.Count() == 2;
             }, pollingInterval: 1000, timeout: 120 * 1000);
@@ -47,52 +51,45 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
         internal class TestScriptEventManager : IScriptEventManager, IDisposable
         {
-            private readonly IScriptEventManager _scriptEventManager;
-            private readonly TimeSpan _delay;
-
-            public TestScriptEventManager(TimeSpan delay)
-            {
-                _scriptEventManager = new ScriptEventManager();
-                _delay = delay;
-            }
+            private readonly IScriptEventManager _scriptEventManager = new ScriptEventManager();
 
             public void Publish(ScriptEvent scriptEvent)
             {
                 try
                 {
                     _scriptEventManager.Publish(scriptEvent);
-                } 
+                }
                 catch (ObjectDisposedException)
                 {
-                    // Do no throw ObjectDisposedException
                 }
             }
 
             public IDisposable Subscribe(IObserver<ScriptEvent> observer) => _scriptEventManager.Subscribe(observer);
 
             public void Dispose() => ((IDisposable)_scriptEventManager).Dispose();
-            public bool TryAddWorkerState<T>(string workerId, T state)
+        }
+
+        internal class TestServerDuplexChannelRegistry : ServerDuplexChannelRegistry
+        {
+            private readonly TimeSpan _delay;
+
+            public TestServerDuplexChannelRegistry(TimeSpan delay)
             {
-                // Swap for a channel that imposes a delay into the pipe
-                if (typeof(T) == typeof(Channel<InboundGrpcEvent>) && _delay > TimeSpan.Zero)
-                {
-                    state = (T)(object)(new DelayedOutboundChannel<InboundGrpcEvent>(_delay));
-                }
-                return _scriptEventManager.TryAddWorkerState(workerId, state);
+                _delay = delay;
             }
 
-            public bool TryGetWorkerState<T>(string workerId, out T state)
-                => _scriptEventManager.TryGetWorkerState(workerId, out state);
-
-            public bool TryRemoveWorkerState<T>(string workerId, out T state)
-                => _scriptEventManager.TryRemoveWorkerState(workerId, out state);
-
-
-            public class DelayedOutboundChannel<T> : Channel<T>
+            protected override ServerDuplexChannel CreateChannel()
             {
-                public DelayedOutboundChannel(TimeSpan delay)
+                return new ServerDuplexChannel(
+                    new DelayedChannel<StreamingMessage>(_delay, ServerDuplexChannel.WorkerToHostOptions),
+                    Channel.CreateUnbounded<StreamingMessage>(ServerDuplexChannel.HostToWorkerOptions));
+            }
+
+            public class DelayedChannel<T> : Channel<T>
+            {
+                public DelayedChannel(TimeSpan delay, UnboundedChannelOptions options)
                 {
-                    var toWrap = Channel.CreateUnbounded<T>(GrpcEventExtensions.OutboundOptions);
+                    var toWrap = Channel.CreateUnbounded<T>(options);
                     Reader = toWrap.Reader;
                     Writer = new DelayedChannelWriter<T>(toWrap.Writer, delay);
                 }
@@ -106,6 +103,9 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 public DelayedChannelWriter(ChannelWriter<T> toWrap, TimeSpan delay) => (_inner, _delay) = (toWrap, delay);
 
                 public override bool TryWrite(T item) => false; // Always fail, so we bounce to WriteAsync
+
+                public override bool TryComplete(Exception error = null) => _inner.TryComplete(error);
+
                 public override ValueTask<bool> WaitToWriteAsync(CancellationToken cancellationToken = default) => _inner.WaitToWriteAsync(cancellationToken);
 
                 public override async ValueTask WriteAsync(T item, CancellationToken cancellationToken = default)

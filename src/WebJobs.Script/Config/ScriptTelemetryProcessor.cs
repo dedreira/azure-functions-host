@@ -1,8 +1,8 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
-using System;
 using System.Collections.Generic;
+using System.Threading;
 using Microsoft.ApplicationInsights.Channel;
 using Microsoft.ApplicationInsights.DataContracts;
 using Microsoft.ApplicationInsights.Extensibility;
@@ -12,6 +12,8 @@ namespace Microsoft.Azure.WebJobs.Script.Config
 {
     internal class ScriptTelemetryProcessor : ITelemetryProcessor
     {
+        internal static readonly AsyncLocal<bool> SuppressDependencyTelemetry = new();
+
         public ScriptTelemetryProcessor(ITelemetryProcessor next)
         {
             this.Next = next;
@@ -21,6 +23,13 @@ namespace Microsoft.Azure.WebJobs.Script.Config
 
         public void Process(ITelemetry item)
         {
+            // Filter out HTTP dependency telemetry originating from the host's proxy calls to
+            // out-of-proc workers.
+            if (item is DependencyTelemetry && SuppressDependencyTelemetry.Value)
+            {
+                return;
+            }
+
             // Only process if exception is thrown by user code (if IsUserException is true).
             if (item is ExceptionTelemetry exceptionTelemetry
                 && exceptionTelemetry?.Exception?.InnerException is RpcException rpcException
@@ -46,24 +55,6 @@ namespace Microsoft.Azure.WebJobs.Script.Config
             newET.Timestamp = originalItem.Timestamp;
 
             return newET;
-        }
-
-        /// <summary>
-        /// Returns true if the feature flag for surfacing user code exceptions was set by the worker,
-        /// and false if not.
-        /// </summary>
-        /// <param name="ex">The <see cref="Exception"/> instance.</param>
-        private bool EnableUserExceptionFeatureFlag(Exception ex)
-        {
-            try
-            {
-                string value = (string)ex.Data[RpcWorkerConstants.EnableUserCodeException];
-                return bool.Parse(value);
-            }
-            catch
-            {
-                return false;
-            }
         }
     }
 }

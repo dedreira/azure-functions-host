@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 namespace Microsoft.WebJobs.Script.Tests
@@ -18,7 +18,7 @@ namespace Microsoft.WebJobs.Script.Tests
         public const string EndToEnd = "E2E";
 
         /// <summary>
-        /// Release Tests only run in branches: release/*
+        /// Release Tests only run in branches: release.
         /// </summary>
         public const string ReleaseTests = "ReleaseTests";
 
@@ -50,5 +50,29 @@ namespace Microsoft.WebJobs.Script.Tests
         /// Tests for the AdminIsolation feature.
         /// </summary>
         public const string AdminIsolationTests = "AdminIsolationTests";
+
+        /// <summary>
+        /// Tests for the FunctionsController.
+        /// </summary>
+        public const string FunctionsControllerEndToEnd = "FunctionsControllerEndToEnd";
+
+        public const string FlexConsumptionMetricsTests = "FlexConsumptionMetricsTests";
+
+        public const string LinuxConsumptionMetricsTests = "LinuxConsumptionMetricsTests";
+
+        public const string HostMetricsTests = "HostMetricsTests";
+
+        public const string HISSecretsTests = "HISSecretsTests";
+
+        public const string WebhookTests = "WebhookTests";
+
+        // Non-E2E test groups for process isolation
+        public const string NonE2ESpecialization = "NonE2E_Specialization";
+        public const string NonE2EWebHost = "NonE2E_WebHost";
+        public const string NonE2EIisExpress = "NonE2E_IisExpress";
+        public const string NonE2EAppInsights = "NonE2E_AppInsights";
+        public const string NonE2ETimeout = "NonE2E_Timeout";
+        public const string NonE2EControllers = "NonE2E_Controllers";
+        public const string NonE2EStorage = "NonE2E_Storage";
     }
 }

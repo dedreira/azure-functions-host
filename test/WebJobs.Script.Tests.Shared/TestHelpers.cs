@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
@@ -13,10 +13,13 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.Azure.Storage;
-using Microsoft.Azure.Storage.Blob;
+using Azure;
+using Azure.Storage.Blobs;
+using Azure.Storage.Blobs.Models;
+using Azure.Storage.Sas;
 using Microsoft.Azure.WebJobs.Host.Storage;
 using Microsoft.Azure.WebJobs.Script.WebHost;
+using Microsoft.Azure.WebJobs.Script.WebHost.Models;
 using Microsoft.Azure.WebJobs.Script.Workers;
 using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
 using Microsoft.Extensions.Azure;
@@ -31,20 +34,35 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 {
     public static partial class TestHelpers
     {
+#if DEBUG
+        public const string BuildConfig = "debug";
+#else
+        public const string BuildConfig = "release";
+#endif
+
         private const string Chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-        private static readonly Random Random = new Random();
 
         /// <summary>
-        /// Gets the common root directory that functions tests create temporary directories under.
-        /// This enables us to clean up test files by deleting this single directory.
+        /// Helper method to inline an action delegate.
         /// </summary>
-        public static string FunctionsTestDirectory
-        {
-            get
-            {
-                return Path.Combine(Path.GetTempPath(), "FunctionsTest");
-            }
-        }
+        /// <param name="act">The action.</param>
+        /// <returns>The provided action.</returns>
+        /// <remarks>
+        /// This is intended to be used with a fluent assertion.
+        /// <c>Act(() => { }).Should().Something();</c>.
+        /// </remarks>
+        public static Action Act(Action act) => act;
+
+        /// <summary>
+        /// Helper method to inline an func delegate.
+        /// </summary>
+        /// <param name="act">The function.</param>
+        /// <returns>The provided function.</returns>
+        /// <remarks>
+        /// This is intended to be used with a fluent assertion.
+        /// <c>Act(() => { }).Should().Something();</c>.
+        /// </remarks>
+        public static Func<T> Act<T>(Func<T> act) => act;
 
         public static Task WaitOneAsync(this WaitHandle waitHandle)
         {
@@ -88,7 +106,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         {
             return new string(
                 Enumerable.Repeat('x', length)
-                    .Select(c => Chars[Random.Next(Chars.Length)])
+                    .Select(c => Chars[Random.Shared.Next(Chars.Length)])
                     .ToArray());
         }
 
@@ -140,35 +158,78 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             }
         }
 
-        public static async Task<string> WaitForBlobAndGetStringAsync(CloudBlockBlob blob, Func<string> userMessageCallback = null)
+        public static async Task<string> WaitForBlobAndGetStringAsync(BlobClient blob, Func<string> userMessageCallback = null)
         {
-            await WaitForBlobAsync(blob, userMessageCallback: userMessageCallback);
+            return await WaitForBlobAndGetStringAsync(blob, static _ => true, userMessageCallback);
+        }
 
-            string result = await blob.DownloadTextAsync(Encoding.UTF8,
-                null, new BlobRequestOptions(), new OperationContext());
+        public static async Task<string> WaitForBlobAndGetStringAsync(BlobClient blob, Func<string, bool> contentPredicate, Func<string> userMessageCallback = null)
+        {
+            ArgumentNullException.ThrowIfNull(contentPredicate);
+
+            StringBuilder sb = new();
+            string result = null;
+
+            await TestHelpers.Await(
+                async () =>
+                {
+                    bool exists = await blob.ExistsAsync();
+                    sb.AppendLine($"{blob.Name} exists: {exists}.");
+                    if (!exists)
+                    {
+                        return false;
+                    }
+
+                    try
+                    {
+                        BlobDownloadResult downloadResult = await blob.DownloadContentAsync();
+                        result = downloadResult.Content.ToString();
+                    }
+                    catch (RequestFailedException ex) when (ex.Status == (int)HttpStatusCode.NotFound)
+                    {
+                        sb.AppendLine($"{blob.Name} download failed with transient status {ex.Status}. ErrorCode: {ex.ErrorCode}.");
+                        return false;
+                    }
+
+                    bool contentMatches = contentPredicate(result);
+                    sb.AppendLine($"{blob.Name} content length: {result.Length}. Content matches predicate: {contentMatches}.");
+
+                    return contentMatches;
+                },
+                pollingInterval: 500,
+                userMessageCallback: () =>
+                {
+                    if (userMessageCallback != null)
+                    {
+                        sb.AppendLine().Append(userMessageCallback());
+                    }
+
+                    return sb.ToString();
+                });
 
             return result;
         }
 
-        public static async Task WaitForBlobAsync(CloudBlockBlob blob, Func<string> userMessageCallback = null)
+        public static async Task WaitForBlobAsync(BlobClient blob, Func<string> userMessageCallback = null)
         {
-            StringBuilder sb = new StringBuilder();
+            StringBuilder sb = new();
 
-            await TestHelpers.Await(async () =>
-            {
-                bool exists = await blob.ExistsAsync();
-                sb.AppendLine($"{blob.Name} exists: {exists}.");
-                return exists;
-            },
-            pollingInterval: 500,
-            userMessageCallback: () =>
-            {
-                if (userMessageCallback != null)
+            await TestHelpers.Await(
+                async () =>
                 {
-                    sb.AppendLine().Append(userMessageCallback());
-                }
-                return sb.ToString();
-            });
+                    bool exists = await blob.ExistsAsync();
+                    sb.AppendLine($"{blob.Name} exists: {exists}.");
+                    return exists;
+                },
+                pollingInterval: 500,
+                userMessageCallback: () =>
+                {
+                    if (userMessageCallback != null)
+                    {
+                        sb.AppendLine().Append(userMessageCallback());
+                    }
+                    return sb.ToString();
+                });
         }
 
         public static void ClearFunctionLogs(string functionName)
@@ -198,13 +259,9 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
         private static bool IsHostRunning(HttpClient client)
         {
-            using (HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Get, string.Empty))
-            {
-                using (HttpResponseMessage response = client.SendAsync(request).Result)
-                {
-                    return response.StatusCode == HttpStatusCode.NoContent || response.StatusCode == HttpStatusCode.OK;
-                }
-            }
+            using HttpRequestMessage request = new(HttpMethod.Get, string.Empty);
+            using HttpResponseMessage response = client.SendAsync(request).GetAwaiter().GetResult();
+            return response.StatusCode == HttpStatusCode.NoContent || response.StatusCode == HttpStatusCode.OK;
         }
 
         public static void ClearHostLogs()
@@ -236,28 +293,20 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
         // Deleting and recreating a container can result in a 409 as the container name is not
         // immediately available. Instead, use this helper to clear a container.
-        public static async Task ClearContainerAsync(CloudBlobContainer container)
+        public static async Task ClearContainerAsync(BlobContainerClient container)
         {
-            foreach (var blob in await ListBlobsAsync(container))
+            await foreach (var blob in ListBlobsAsync(container))
             {
                 await blob.DeleteIfExistsAsync();
             }
         }
 
-        public static async Task<IEnumerable<CloudBlockBlob>> ListBlobsAsync(CloudBlobContainer container)
+        public static async IAsyncEnumerable<BlobClient> ListBlobsAsync(BlobContainerClient container)
         {
-            List<CloudBlockBlob> blobs = new List<CloudBlockBlob>();
-            BlobContinuationToken token = null;
-
-            do
+            await foreach (BlobItem blobItem in container.GetBlobsAsync())
             {
-                BlobResultSegment blobSegment = await container.ListBlobsSegmentedAsync(token);
-                token = blobSegment.ContinuationToken;
-                blobs.AddRange(blobSegment.Results.Cast<CloudBlockBlob>());
+                yield return container.GetBlobClient(blobItem.Name);
             }
-            while (token != null);
-
-            return blobs;
         }
 
         public static DirectoryInfo GetFunctionLogFileDirectory(string functionName)
@@ -300,23 +349,26 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         public static async Task<string> ReadStreamToEnd(Stream stream)
         {
             stream.Position = 0;
-            using (var sr = new StreamReader(stream))
-            {
-                return await sr.ReadToEndAsync();
-            }
+            using var sr = new StreamReader(stream);
+            return await sr.ReadToEndAsync();
         }
 
-        public static IList<RpcWorkerConfig> GetTestWorkerConfigs(bool includeDllWorker = false, int processCountValue = 1,
-            TimeSpan? processStartupInterval = null, TimeSpan? processRestartInterval = null, TimeSpan? processShutdownTimeout = null, bool workerIndexing = false)
+        public static IList<RpcWorkerConfig> GetTestWorkerConfigs(
+            bool includeDllWorker = false,
+            int processCountValue = 1,
+            TimeSpan? processStartupInterval = null,
+            TimeSpan? processRestartInterval = null,
+            TimeSpan? processShutdownTimeout = null,
+            bool workerIndexing = false)
         {
             var defaultCountOptions = new WorkerProcessCountOptions();
             TimeSpan startupInterval = processStartupInterval ?? defaultCountOptions.ProcessStartupInterval;
             TimeSpan restartInterval = processRestartInterval ?? defaultCountOptions.ProcessRestartInterval;
             TimeSpan shutdownTimeout = processShutdownTimeout ?? defaultCountOptions.ProcessShutdownTimeout;
 
-            var workerConfigs = new List<RpcWorkerConfig>
-            {
-                new RpcWorkerConfig
+            List<RpcWorkerConfig> workerConfigs =
+            [
+                new()
                 {
                     Description = GetTestWorkerDescription("node", ".js", workerIndexing),
                     CountOptions = new WorkerProcessCountOptions
@@ -327,7 +379,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                         ProcessShutdownTimeout = shutdownTimeout
                     }
                 },
-                new RpcWorkerConfig
+                new()
                 {
                     Description = GetTestWorkerDescription("java", ".jar", workerIndexing),
                     CountOptions = new WorkerProcessCountOptions
@@ -338,7 +390,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                         ProcessShutdownTimeout = shutdownTimeout
                     }
                 }
-            };
+            ];
 
             // Allow tests to have a worker that claims the .dll extension.
             if (includeDllWorker)
@@ -364,6 +416,26 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             return new List<RpcWorkerConfig>()
             {
                 new RpcWorkerConfig() { Description = workerDesc }
+            };
+        }
+
+        public static IList<RpcWorkerConfig> GetTestWorkerConfigsWithExecutableWorkingDirectory()
+        {
+            return new List<RpcWorkerConfig>()
+            {
+                new RpcWorkerConfig
+                {
+                    Description = new RpcWorkerDescription
+                    {
+                        Extensions = new List<string>()
+                        {
+                            { ".jar" }
+                        },
+                        Language = "java",
+                        WorkerDirectory = "testDir",
+                        ExecutableWorkingDirectory = "executableDirectory"
+                    }
+                },
             };
         }
 
@@ -436,43 +508,48 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
         public static async Task<Uri> CreateBlobSas(string connectionString, string filePath, string blobContainer, string blobName)
         {
-            CloudStorageAccount storageAccount = CloudStorageAccount.Parse(connectionString);
-            var blobClient = storageAccount.CreateCloudBlobClient();
-            var container = blobClient.GetContainerReference(blobContainer);
+            var blobServiceClient = new BlobServiceClient(connectionString);
+            var container = blobServiceClient.GetBlobContainerClient(blobContainer);
             await container.CreateIfNotExistsAsync();
-            var blob = container.GetBlockBlobReference(blobName);
+            var blob = container.GetBlobClient(blobName);
             if (!string.IsNullOrEmpty(filePath))
             {
-                await blob.UploadFromFileAsync(filePath);
+                await blob.UploadAsync(filePath, overwrite: true);
             }
-            var policy = new SharedAccessBlobPolicy
+
+            var sasBuilder = new BlobSasBuilder
             {
-                SharedAccessStartTime = DateTime.UtcNow,
-                SharedAccessExpiryTime = DateTime.UtcNow.AddHours(1),
-                Permissions = SharedAccessBlobPermissions.Read | SharedAccessBlobPermissions.List
+                BlobContainerName = blobContainer,
+                BlobName = blobName,
+                Resource = "b",
+                StartsOn = DateTimeOffset.UtcNow,
+                ExpiresOn = DateTimeOffset.UtcNow.AddHours(1)
             };
-            var sas = blob.GetSharedAccessSignature(policy);
-            var sasUri = new Uri(blob.Uri, sas);
+            sasBuilder.SetPermissions(BlobSasPermissions.Read | BlobSasPermissions.List);
+
+            var sasUri = blob.GenerateSasUri(sasBuilder);
 
             return sasUri;
         }
 
         public static async Task<Uri> CreateBlobContainerSas(string connectionString, string blobContainer)
         {
-            CloudStorageAccount storageAccount = CloudStorageAccount.Parse(connectionString);
-            var blobClient = storageAccount.CreateCloudBlobClient();
-            var container = blobClient.GetContainerReference(blobContainer);
+            var blobServiceClient = new BlobServiceClient(connectionString);
+            var container = blobServiceClient.GetBlobContainerClient(blobContainer);
             await container.CreateIfNotExistsAsync();
 
-            var policy = new SharedAccessBlobPolicy
+            var sasBuilder = new BlobSasBuilder
             {
-                SharedAccessStartTime = DateTime.UtcNow,
-                SharedAccessExpiryTime = DateTime.UtcNow.AddHours(1),
-                Permissions = SharedAccessBlobPermissions.Read | SharedAccessBlobPermissions.Write | SharedAccessBlobPermissions.List | SharedAccessBlobPermissions.Delete
+                BlobContainerName = blobContainer,
+                Resource = "c",
+                StartsOn = DateTimeOffset.UtcNow,
+                ExpiresOn = DateTimeOffset.UtcNow.AddHours(1)
             };
-            var sas = container.GetSharedAccessSignature(policy);
+            sasBuilder.SetPermissions(BlobContainerSasPermissions.Read | BlobContainerSasPermissions.Write | BlobContainerSasPermissions.List | BlobContainerSasPermissions.Delete);
 
-            return new Uri(container.StorageUri.PrimaryUri, sas);
+            var sasUri = container.GenerateSasUri(sasBuilder);
+
+            return sasUri;
         }
 
         // Creates an IAzureBlobStorageProvider without reacting to Specialization and ActiveHost change. To test the specialization logic, please refer to
@@ -487,6 +564,15 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 .ConfigureAppConfiguration(c =>
                 {
                     c.AddConfiguration(webHostConfiguration);
+
+                    // These are used internally inside Hosting.
+                    c.AddInMemoryCollection(new Dictionary<string, string>
+                    {
+                        ["shutdownTimeoutSeconds"] = "1",
+                        ["startupTimeoutSeconds"] = "1",
+                        ["servicesStartConcurrently"] = true.ToString(),
+                        ["servicesStopConcurrently"] = true.ToString(),
+                    });
                 })
                 .Build();
 
@@ -515,6 +601,42 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             return services;
         }
 
+        public static IAzureTableStorageProvider GetAzureTableStorageProvider(IConfiguration webHostConfiguration, IConfiguration jobHostConfiguration = null, IEnvironment environment = default)
+        {
+            environment ??= new TestEnvironment();
+
+            IHost tempHost = new HostBuilder()
+                .ConfigureServices(services =>
+                {
+                    AddTestAzureTableStorageProvider(services, jobHostConfiguration ?? webHostConfiguration, environment);
+                })
+                .ConfigureAppConfiguration(c =>
+                {
+                    c.AddConfiguration(webHostConfiguration);
+                })
+                .Build();
+
+            var azureTableStorageProvider = tempHost.Services.GetRequiredService<IAzureTableStorageProvider>();
+            return azureTableStorageProvider;
+        }
+
+        public static IServiceCollection AddTestAzureTableStorageProvider(IServiceCollection services, IConfiguration configuration, IEnvironment environment, IScriptHostManager scriptHostManager = null)
+        {
+            // Adds necessary Azure services to create clients
+            services.AddAzureClientsCore();
+
+            if (scriptHostManager == null)
+            {
+                scriptHostManager = new TestScriptHostService(configuration);
+            }
+
+            services.AddSingleton<IScriptHostManager>(scriptHostManager);
+
+            services.AddSingleton<IAzureTableStorageProvider, HostAzureTableStorageProvider>();
+
+            return services;
+        }
+
         /// <summary>
         /// Mock an HttpClientFactory and its CreateClient functionality.
         /// </summary>
@@ -529,16 +651,40 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             return mockFactory.Object;
         }
 
+        public static ManagedServiceIdentity CreateMsi(ManagedServiceIdentityType type, string prefix)
+        {
+            return new ManagedServiceIdentity
+            {
+                Type = type,
+                ClientId = $"{prefix}-clientId-placeholder",
+                PrincipalId = $"{prefix}-principalId-placeholder",
+                TenantId = $"{prefix}-tenantId-placeholder",
+                Thumbprint = $"{prefix}-thumbprint-placeholder",
+                SecretUrl = $"{prefix}-secretUrl-placeholder",
+                ResourceId = $"{prefix}-resourceId-placeholder",
+                Certificate = $"{prefix}-certificate-placeholder",
+                AuthenticationEndpoint = $"{prefix}-authenticationEndpoint-placeholder",
+            };
+        }
+
         /// <summary>
         /// Test class for IScriptHostManager to register an IAzureBlobStorageProvider.
         /// </summary>
         public class TestScriptHostService : IScriptHostManager, IServiceProvider
         {
             private readonly IConfiguration _configuration;
+            private readonly IDictionary<Type, object> _services;
 
             public TestScriptHostService(IConfiguration configuration)
             {
                 _configuration = configuration;
+                _services = new Dictionary<Type, object>();
+            }
+
+            public TestScriptHostService(IConfiguration configuration, IDictionary<Type, object> services)
+            {
+                _configuration = configuration;
+                _services = services ?? new Dictionary<Type, object>();
             }
 
             event EventHandler IScriptHostManager.HostInitializing
@@ -560,6 +706,8 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             Exception IScriptHostManager.LastError => throw new NotImplementedException();
 
+            IServiceProvider IScriptHostManager.Services => this;
+
             public void OnActiveHostChanged()
             {
                 ActiveHostChanged?.Invoke(this, new ActiveHostChangedEventArgs(null, null));
@@ -572,10 +720,15 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                     return _configuration;
                 }
 
-                throw new NotImplementedException();
+                if (_services != null && _services.TryGetValue(serviceType, out var instance))
+                {
+                    return instance;
+                }
+
+                throw new NotImplementedException($"No service registered for type {serviceType}");
             }
 
-            Task IScriptHostManager.RestartHostAsync(CancellationToken cancellationToken)
+            Task IScriptHostManager.RestartHostAsync(string reason, CancellationToken cancellationToken)
             {
                 throw new NotImplementedException();
             }

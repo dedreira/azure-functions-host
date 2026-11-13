@@ -3,9 +3,11 @@
 
 using System;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Hosting;
+using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.WebHost;
 using Microsoft.Azure.WebJobs.Script.WebHost.Management;
 using Microsoft.Extensions.Logging;
@@ -18,19 +20,20 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
     public class FunctionsSyncServiceTests
     {
         private readonly TestLoggerProvider _loggerProvider;
+        private readonly LoggerFactory _loggerFactory;
         private readonly FunctionsSyncService _syncService;
         private readonly Mock<IScriptHostManager> _mockScriptHostManager;
         private readonly Mock<IPrimaryHostStateProvider> _mockPrimaryHostStateProviderMock;
         private readonly Mock<IFunctionsSyncManager> _mockSyncManager;
         private readonly Mock<IScriptWebHostEnvironment> _mockWebHostEnvironment;
         private readonly Mock<IEnvironment> _mockEnvironment;
-        private readonly int _testDueTime = 250;
+        private readonly int _testDueTime = 1000;
 
         public FunctionsSyncServiceTests()
         {
             _loggerProvider = new TestLoggerProvider();
-            var loggerFactory = new LoggerFactory();
-            loggerFactory.AddProvider(_loggerProvider);
+            _loggerFactory = new LoggerFactory();
+            _loggerFactory.AddProvider(_loggerProvider);
 
             _mockScriptHostManager = new Mock<IScriptHostManager>(MockBehavior.Strict);
             _mockPrimaryHostStateProviderMock = new Mock<IPrimaryHostStateProvider>(MockBehavior.Strict);
@@ -38,16 +41,23 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             _mockPrimaryHostStateProviderMock.Setup(p => p.IsPrimary).Returns(true);
             _mockScriptHostManager.Setup(p => p.State).Returns(ScriptHostState.Running);
-            _mockSyncManager.Setup(p => p.TrySyncTriggersAsync(true)).ReturnsAsync(new SyncTriggersResult { Success = true });
 
             _mockWebHostEnvironment = new Mock<IScriptWebHostEnvironment>(MockBehavior.Strict);
             _mockWebHostEnvironment.SetupGet(p => p.InStandbyMode).Returns(false);
             _mockEnvironment = new Mock<IEnvironment>(MockBehavior.Strict);
             _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady)).Returns("1");
             _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.CoreToolsEnvironment)).Returns((string)null);
+            _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.FunctionsTargetGroup)).Returns((string)null);
 
-            _syncService = new FunctionsSyncService(loggerFactory, _mockScriptHostManager.Object, _mockPrimaryHostStateProviderMock.Object, _mockSyncManager.Object);
-            _syncService.DueTime = _testDueTime;
+            _syncService = new(
+                _loggerFactory,
+                _mockScriptHostManager.Object,
+                _mockPrimaryHostStateProviderMock.Object,
+                _mockSyncManager.Object,
+                _mockEnvironment.Object)
+            {
+                DueTime = _testDueTime
+            };
         }
 
         [Theory]
@@ -64,12 +74,36 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             Assert.Equal(expected, _syncService.ShouldSyncTriggers);
         }
 
+        [Theory]
+        [InlineData(FunctionGroups.ValidationWorker, false)]
+        [InlineData("function:http", true)]
+        [InlineData(null, true)]
+        public void ShouldSyncTriggers_DisabledForValidationPod(string functionGroup, bool expected)
+        {
+            _mockPrimaryHostStateProviderMock.Setup(p => p.IsPrimary).Returns(true);
+            _mockScriptHostManager.Setup(p => p.State).Returns(ScriptHostState.Running);
+
+            var mockEnvironment = new Mock<IEnvironment>(MockBehavior.Strict);
+            mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady)).Returns("1");
+            mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.CoreToolsEnvironment)).Returns((string)null);
+            mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.FunctionsTargetGroup)).Returns(functionGroup);
+
+            var syncService = new FunctionsSyncService(_loggerFactory, _mockScriptHostManager.Object, _mockPrimaryHostStateProviderMock.Object, _mockSyncManager.Object,
+                                                        mockEnvironment.Object);
+            syncService.DueTime = _testDueTime;
+
+            Assert.Equal(expected, syncService.ShouldSyncTriggers);
+        }
+
         [Fact]
         public async Task StartAsync_PrimaryHost_Running_SyncsTriggers_AfterTimeout()
         {
-            await _syncService.StartAsync(CancellationToken.None);
-            await Task.Delay(2 * _testDueTime);
+            TaskCompletionSource syncTriggers = new TaskCompletionSource();
+            _mockSyncManager.Setup(p => p.TrySyncTriggersAsync(true)).ReturnsAsync(new TriggersOperationResult { Success = true }).Callback(() => syncTriggers.TrySetResult());
 
+            await _syncService.StartAsync(CancellationToken.None);
+
+            await syncTriggers.Task.WaitAsync(TimeSpan.FromMilliseconds(2 * _testDueTime));
             _mockSyncManager.Verify(p => p.TrySyncTriggersAsync(true), Times.Once);
 
             var logMessage = _loggerProvider.GetAllLogMessages().Select(p => p.FormattedMessage).Single();
@@ -77,14 +111,34 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         }
 
         [Fact]
-        public async Task StartAsync_TokenCancelledBeforeTimeout_DoesNotSyncTriggers()
+        public async Task StartAsync_TokenCancelledBeforeCall_DoesNotSyncTriggers()
         {
-            var cts = new CancellationTokenSource();
-            cts.CancelAfter(_testDueTime / 2);
+            using CancellationTokenSource cts = new();
+            cts.Cancel();
             await _syncService.StartAsync(cts.Token);
             await Task.Delay(2 * _testDueTime);
 
             _mockSyncManager.Verify(p => p.TrySyncTriggersAsync(true), Times.Never);
+        }
+
+        [Fact]
+        public async Task StartAsync_TokenCancelledBeforeTimeout_DoesNotSyncTriggers()
+        {
+            using CancellationTokenSource cts = new();
+            TaskCompletionSource firstCall = new();
+            _mockSyncManager
+                .Setup(m => m.TrySyncTriggersAsync(true))
+                .Callback(() =>
+                {
+                    cts.Cancel();
+                    firstCall.SetResult();
+                });
+
+            await _syncService.StartAsync(cts.Token);
+            await firstCall.Task;
+            await Task.Delay(2 * _testDueTime);
+
+            _mockSyncManager.Verify(p => p.TrySyncTriggersAsync(true), Times.Once());
         }
 
         [Fact]
@@ -100,11 +154,12 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         [Fact]
         public async Task UnhandledExceptions_HandledInCallback()
         {
-            _mockSyncManager.Setup(p => p.TrySyncTriggersAsync(true)).ThrowsAsync(new Exception("Kaboom!"));
+            TaskCompletionSource syncTriggers = new TaskCompletionSource();
+            _mockSyncManager.Setup(p => p.TrySyncTriggersAsync(true)).ThrowsAsync(new Exception("Kaboom!")).Callback(() => syncTriggers.TrySetResult());
 
             await _syncService.StartAsync(CancellationToken.None);
-            await Task.Delay(2 * _testDueTime);
 
+            await syncTriggers.Task.WaitAsync(TimeSpan.FromMilliseconds(2 * _testDueTime));
             _mockSyncManager.Verify(p => p.TrySyncTriggersAsync(true), Times.Once);
         }
 
@@ -147,6 +202,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady)).Returns(containerReady ? "1" : null);
             _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.ManagedEnvironment)).Returns(isManagedAppEnvironment ? "1" : null);
             _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.WebsitePodName)).Returns(isConsumptionLinuxOnLegion ? "RandomPodName" : null);
+            _mockEnvironment.Setup(p => p.Platform).Returns(OSPlatform.Windows);
 
             var result = FunctionsSyncManager.IsSyncTriggersEnvironment(_mockWebHostEnvironment.Object, _mockEnvironment.Object);
             Assert.Equal(expected, result);
@@ -163,6 +219,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.WebSiteAuthEncryptionKey)).Returns("1");
             _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.ContainerName)).Returns((string)null);
             _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady)).Returns("1");
+            _mockEnvironment.Setup(p => p.Platform).Returns(OSPlatform.Windows);
 
             var result = FunctionsSyncManager.IsSyncTriggersEnvironment(_mockWebHostEnvironment.Object, _mockEnvironment.Object);
             Assert.Equal(expected, result);

@@ -5,6 +5,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using Microsoft.Azure.WebJobs.Script.Description;
+using Microsoft.Azure.WebJobs.Script.Extensions;
 using Newtonsoft.Json.Linq;
 
 namespace Microsoft.Azure.WebJobs.Script
@@ -41,7 +42,7 @@ namespace Microsoft.Azure.WebJobs.Script
 
         public static bool IsHttpTriggerFunction(this FunctionMetadata metadata)
         {
-            return metadata.InputBindings.Any(b => string.Equals(HttpTriggerKey, b.Type, StringComparison.OrdinalIgnoreCase));
+            return metadata.InputBindings.Any(b => b.IsHttpTrigger());
         }
 
         public static bool IsLegacyBlobTriggerFunction(this FunctionMetadata metadata)
@@ -55,19 +56,58 @@ namespace Microsoft.Azure.WebJobs.Script
                         return !string.Equals(token.ToString(), BlobEventGridSourceValue, StringComparison.OrdinalIgnoreCase);
                     }
                 }
+                return true;
             }
-            return true;
+            return false;
+        }
+
+        /// <summary>
+        /// Gets the function group for the specified <see cref="FunctionMetadata"/>.
+        /// </summary>
+        /// <param name="metadata">The function metadata.</param>
+        /// <returns>The function group for this metadata.</returns>
+        public static string GetFunctionGroup(this FunctionMetadata metadata)
+        {
+            if (metadata == null)
+            {
+                throw new ArgumentNullException(nameof(metadata));
+            }
+
+            // Ensure http and durable triggers are grouped together.
+            foreach (BindingMetadata binding in metadata.InputBindings)
+            {
+                if (binding.IsHttpTrigger() || binding.IsWebHookTrigger())
+                {
+                    return FunctionGroups.Http;
+                }
+
+                if (binding.IsDurableTrigger())
+                {
+                    return FunctionGroups.Durable;
+                }
+
+                if (binding.IsEventGridBlobTrigger())
+                {
+                    return FunctionGroups.Blob;
+                }
+            }
+
+            // A function with no specified group will be assigned to a group of itself.
+            return FunctionGroups.ForFunction(metadata.Name);
         }
 
         public static string GetFunctionId(this FunctionMetadata metadata)
         {
-            if (!metadata.Properties.TryGetValue(FunctionIdKey, out object idObj)
-                || !(idObj is string))
+            if (metadata.Properties.TryGetValue(FunctionIdKey, out object idObj)
+                && idObj is string id)
             {
-                metadata.Properties[FunctionIdKey] = Guid.NewGuid().ToString();
+                return id;
             }
 
-            return metadata.Properties[FunctionIdKey] as string;
+            id = Guid.NewGuid().ToString();
+            return metadata.Properties.TryAdd(FunctionIdKey, id)
+                ? id
+                : metadata.Properties[FunctionIdKey] as string;
         }
 
         internal static void SetFunctionId(this FunctionMetadata metadata, string functionId)
@@ -82,6 +122,14 @@ namespace Microsoft.Azure.WebJobs.Script
         {
             Utility.TryReadAsBool(metadata.Properties, IsDirectKey, out bool result);
             return result;
+        }
+
+        public static bool IsDotNetInProc(this FunctionMetadata metadata)
+        {
+            return metadata.IsDirect()
+                   || (string.Equals(metadata.Language, DotNetScriptTypes.CSharp, StringComparison.OrdinalIgnoreCase)
+                       || string.Equals(metadata.Language, DotNetScriptTypes.DotNetAssembly, StringComparison.OrdinalIgnoreCase)
+                       || string.Equals(metadata.Language, DotNetScriptTypes.RawDotNetAssembly, StringComparison.OrdinalIgnoreCase));
         }
 
         public static bool IsDisabled(this FunctionMetadata metadata)

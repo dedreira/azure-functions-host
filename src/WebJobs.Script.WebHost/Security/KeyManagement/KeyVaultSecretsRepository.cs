@@ -9,6 +9,7 @@ using Azure;
 using Azure.Core;
 using Azure.Identity;
 using Azure.Security.KeyVault.Secrets;
+using Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics.Extensions;
 using Microsoft.Extensions.Logging;
 
 namespace Microsoft.Azure.WebJobs.Script.WebHost
@@ -21,10 +22,12 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
         private const string HostPrefix = "host--";
         private const string FunctionPrefix = "function--";
         private const string NormalizedCharMark = "-";
-        private const string MasterKey = "host--masterKey--";
+        private const string MasterKeyPrefix = "host--masterKey--";
+        private const string MasterKeySecretName = MasterKeyPrefix + ScriptConstants.DefaultMasterKeyName;
         private const string FunctionKeyPrefix = "host--functionKey--";
         private const string SystemKeyPrefix = "host--systemKey--";
 
+        private readonly Lazy<TokenCredential> _tokenCredential;
         private readonly Lazy<SecretClient> _secretClient;
         private readonly IEnvironment _environment;
 
@@ -37,17 +40,42 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
 
             Uri keyVaultUri = string.IsNullOrEmpty(vaultUri) ? throw new ArgumentException(nameof(vaultUri)) : new Uri(vaultUri);
 
+            _tokenCredential = new Lazy<TokenCredential>(() =>
+            {
+                if (!TryCreateTokenCredential(clientId, clientSecret, tenantId, out TokenCredential credential))
+                {
+                    throw new InvalidOperationException("Failed to create token credential for KeyVaultSecretsRepository");
+                }
+
+                return credential;
+            });
+
             _secretClient = new Lazy<SecretClient>(() =>
             {
-                // If clientSecret and tenantId are provided, use ClientSecret credential; otherwise use managed identity
-                TokenCredential credential = !string.IsNullOrEmpty(clientSecret) && !string.IsNullOrEmpty(tenantId)
-                    ? new ClientSecretCredential(tenantId, clientId, clientSecret)
-                    : new ChainedTokenCredential(new ManagedIdentityCredential(clientId), new ManagedIdentityCredential());
-
-                return new SecretClient(keyVaultUri, credential);
+                return new SecretClient(keyVaultUri, _tokenCredential.Value);
             });
 
             _environment = environment ?? throw new ArgumentNullException(nameof(environment));
+        }
+
+        internal KeyVaultSecretsRepository(string secretsSentinelFilePath, string vaultUri, ILogger logger, IEnvironment environment, TokenCredential testEnvironmentTokenCredential)
+            : this(secretsSentinelFilePath, vaultUri, null, null, null, logger, environment)
+        {
+            _tokenCredential = new Lazy<TokenCredential>(() =>
+            {
+                if (!TryCreateTokenCredential(null, null, null, out TokenCredential credential))
+                {
+                    throw new InvalidOperationException("Failed to create token credential for KeyVaultSecretsRepository");
+                }
+
+                return new ChainedTokenCredential(testEnvironmentTokenCredential, credential);
+            });
+        }
+
+        // For testing
+        internal KeyVaultSecretsRepository(SecretClient secretClient, string secretsSentinelFilePath, ILogger logger, IEnvironment environment) : base(secretsSentinelFilePath, logger, environment)
+        {
+            _secretClient = new Lazy<SecretClient>(() => secretClient);
         }
 
         public override bool IsEncryptionSupported
@@ -65,6 +93,25 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             return type == ScriptSecretsType.Host ? await ReadHostSecrets() : await ReadFunctionSecrets(functionName);
         }
 
+        private static bool TryCreateTokenCredential(string clientId, string clientSecret, string tenantId, out TokenCredential credential)
+        {
+            if (!string.IsNullOrEmpty(clientId) && !string.IsNullOrEmpty(clientSecret) && !string.IsNullOrEmpty(tenantId))
+            {
+                credential = new ClientSecretCredential(tenantId, clientId, clientSecret);
+                return true;
+            }
+            else if (!string.IsNullOrEmpty(clientId))
+            {
+                credential = new ManagedIdentityCredential(clientId);
+                return true;
+            }
+            else
+            {
+                credential = new ManagedIdentityCredential();
+                return true;
+            }
+        }
+
         public override async Task WriteAsync(ScriptSecretsType type, string functionName, ScriptSecrets secrets)
         {
             // Get secrets as dictionary
@@ -75,11 +122,12 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             List<Task> deleteTasks = new List<Task>();
             string prefix = (type == ScriptSecretsType.Host) ? HostPrefix : FunctionPrefix + Normalize(functionName);
 
-            foreach (SecretProperties item in await FindSecrets(secretsPages, x => x.Name.StartsWith(prefix)))
+            foreach (SecretProperties item in await FindSecrets(secretsPages, x => x.Name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)))
             {
                 // Delete only keys which no longer exist in passed-in secrets
                 if (!dictionary.Keys.Contains(item.Name))
                 {
+                    Logger?.KeyVaultSecretRepoDeleteKey(item.Name);
                     deleteTasks.Add(_secretClient.Value.StartDeleteSecretAsync(item.Name));
                 }
             }
@@ -93,6 +141,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             List<Task> setTasks = new List<Task>();
             foreach (string key in dictionary.Keys)
             {
+                Logger?.KeyVaultSecretRepoSetKey(key);
                 setTasks.Add(_secretClient.Value.SetSecretAsync(key, dictionary[key]));
             }
             await Task.WhenAll(setTasks);
@@ -124,11 +173,24 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             AsyncPageable<SecretProperties> secretsPages = GetKeyVaultSecretsPagesAsync(_secretClient.Value);
             List<Task<Response<KeyVaultSecret>>> tasks = new List<Task<Response<KeyVaultSecret>>>();
 
-            // Add master key task
-            List<SecretProperties> masterItems = await FindSecrets(secretsPages, x => x.Name.StartsWith(MasterKey));
-            if (masterItems.Count > 0)
+            // Scan for master-key-prefixed secrets and warn about any non-canonical names
+            List<SecretProperties> masterKeyPrefixedSecrets = await FindSecrets(
+                secretsPages,
+                x => x.Name.StartsWith(MasterKeyPrefix, StringComparison.OrdinalIgnoreCase));
+
+            SecretProperties canonicalMasterKey = masterKeyPrefixedSecrets
+                .FirstOrDefault(x => string.Equals(x.Name, MasterKeySecretName, StringComparison.OrdinalIgnoreCase));
+
+            foreach (SecretProperties unexpected in masterKeyPrefixedSecrets.Where(
+                x => !string.Equals(x.Name, MasterKeySecretName, StringComparison.OrdinalIgnoreCase)))
             {
-                tasks.Add(_secretClient.Value.GetSecretAsync(masterItems[0].Name));
+                Logger?.KeyVaultSecretRepoUnexpectedMasterKey(unexpected.Name);
+            }
+
+            // Add master key task (exact canonical name match only)
+            if (canonicalMasterKey is not null)
+            {
+                tasks.Add(_secretClient.Value.GetSecretAsync(canonicalMasterKey.Name));
             }
             else
             {
@@ -136,13 +198,13 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             }
 
             // Add functionKey tasks
-            foreach (SecretProperties item in await FindSecrets(secretsPages, x => x.Name.StartsWith(FunctionKeyPrefix)))
+            foreach (SecretProperties item in await FindSecrets(secretsPages, x => x.Name.StartsWith(FunctionKeyPrefix, StringComparison.OrdinalIgnoreCase)))
             {
                 tasks.Add(_secretClient.Value.GetSecretAsync(item.Name));
             }
 
             // Add systemKey tasks
-            foreach (SecretProperties item in await FindSecrets(secretsPages, x => x.Name.StartsWith(SystemKeyPrefix)))
+            foreach (SecretProperties item in await FindSecrets(secretsPages, x => x.Name.StartsWith(SystemKeyPrefix, StringComparison.OrdinalIgnoreCase)))
             {
                 tasks.Add(_secretClient.Value.GetSecretAsync(item.Name));
             }
@@ -158,16 +220,32 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             foreach (Task<Response<KeyVaultSecret>> task in tasks)
             {
                 KeyVaultSecret item = task.Result;
-                if (item.Name.StartsWith(MasterKey))
+                string secretName = item.Name;
+
+                if (string.Equals(secretName, MasterKeySecretName, StringComparison.OrdinalIgnoreCase))
                 {
-                    hostSecrets.MasterKey = KeyVaultSecretToKey(item, MasterKey);
+                    hostSecrets.MasterKey = KeyVaultSecretToKey(item, MasterKeyPrefix);
                 }
-                else if (item.Name.StartsWith(FunctionKeyPrefix))
+                else if (secretName.StartsWith(FunctionKeyPrefix, StringComparison.OrdinalIgnoreCase))
                 {
+                    string token = secretName.Substring(FunctionKeyPrefix.Length);
+                    if (!IsCanonicalToken(token))
+                    {
+                        Logger?.KeyVaultSecretRepoSkipNonCanonical(secretName);
+                        continue;
+                    }
+
                     hostSecrets.FunctionKeys.Add(KeyVaultSecretToKey(item, FunctionKeyPrefix));
                 }
-                else if (item.Name.StartsWith(SystemKeyPrefix))
+                else if (secretName.StartsWith(SystemKeyPrefix, StringComparison.OrdinalIgnoreCase))
                 {
+                    string token = secretName.Substring(SystemKeyPrefix.Length);
+                    if (!IsCanonicalToken(token))
+                    {
+                        Logger?.KeyVaultSecretRepoSkipNonCanonical(secretName);
+                        continue;
+                    }
+
                     hostSecrets.SystemKeys.Add(KeyVaultSecretToKey(item, SystemKeyPrefix));
                 }
             }
@@ -200,6 +278,13 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             foreach (Task<Response<KeyVaultSecret>> task in tasks)
             {
                 KeyVaultSecret item = task.Result;
+                string token = item.Name.Substring(prefix.Length);
+                if (!IsCanonicalToken(token))
+                {
+                    Logger?.KeyVaultSecretRepoSkipNonCanonical(item.Name);
+                    continue;
+                }
+
                 functionSecrets.Keys.Add(KeyVaultSecretToKey(item, prefix));
             }
 
@@ -234,14 +319,14 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
 
         public static Dictionary<string, string> GetDictionaryFromScriptSecrets(ScriptSecrets secrets, string functionName)
         {
-            Dictionary<string, string> dic = new Dictionary<string, string>();
+            Dictionary<string, string> dic = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             HostSecrets hostSecrets = secrets as HostSecrets;
             FunctionSecrets functionSecrets = secrets as FunctionSecrets;
             if (hostSecrets != null)
             {
                 if (hostSecrets.MasterKey != null)
                 {
-                    dic.Add(MasterKey + "master", hostSecrets.MasterKey.Value);
+                    dic.Add(MasterKeySecretName, hostSecrets.MasterKey.Value);
                 }
 
                 if (hostSecrets.FunctionKeys != null)
@@ -317,6 +402,25 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
                 }
             }
             return result;
+        }
+
+        /// <summary>
+        /// Returns <see langword="true"/> when the encoded <paramref name="token"/>
+        /// round-trips through <see cref="Denormalize"/>/<see cref="Normalize"/>,
+        /// meaning it contains only canonical escape sequences.
+        /// </summary>
+        /// <example>
+        /// <code>
+        /// // Canonical: Normalize(Denormalize("eventgrid-095extension")) == "eventgrid-095extension"
+        /// IsCanonicalToken("eventgrid-095extension"); // true
+        ///
+        /// // Non-canonical: -069 decodes to 'E' (a letter), which Normalize leaves unescaped
+        /// IsCanonicalToken("-069ventgrid-095extension"); // false
+        /// </code>
+        /// </example>
+        internal static bool IsCanonicalToken(string token)
+        {
+            return string.Equals(Normalize(Denormalize(token)), token, StringComparison.Ordinal);
         }
 
         private static Key KeyVaultSecretToKey(KeyVaultSecret item, string prefix)

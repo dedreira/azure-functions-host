@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
@@ -17,7 +17,6 @@ using Microsoft.Azure.WebJobs.Script.IO;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
-using IApplicationLifetime = Microsoft.AspNetCore.Hosting.IApplicationLifetime;
 
 namespace Microsoft.Azure.WebJobs.Script.WebHost
 {
@@ -25,28 +24,28 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
     {
         private readonly ScriptJobHostOptions _scriptOptions;
         private readonly IScriptEventManager _eventManager;
-        private readonly IApplicationLifetime _applicationLifetime;
+        private readonly IScriptApplicationLifetime _applicationLifetime;
         private readonly IScriptHostManager _scriptHostManager;
         private readonly IEnvironment _environment;
         private readonly string _hostLogPath;
         private readonly ILogger _logger;
         private readonly ILogger<FileMonitoringService> _typedLogger;
         private readonly IList<IDisposable> _eventSubscriptions = new List<IDisposable>();
-        private readonly Func<Task> _restart;
+        private readonly Func<string, Task> _restart;
         private readonly Action _shutdown;
         private readonly ImmutableArray<string> _rootDirectorySnapshot;
         private AutoRecoveringFileSystemWatcher _debugModeFileWatcher;
         private AutoRecoveringFileSystemWatcher _diagnosticModeFileWatcher;
         private FileWatcherEventSource _fileEventSource;
         private bool _restartScheduled;
-        private bool _shutdownScheduled;
+        private long _shutdownScheduled;
         private long _restartRequested;
         private bool _disposed = false;
         private bool _watchersStopped = false;
         private object _stopWatchersLock = new object();
         private long _suspensionRequestsCount = 0;
 
-        public FileMonitoringService(IOptions<ScriptJobHostOptions> scriptOptions, ILoggerFactory loggerFactory, IScriptEventManager eventManager, IApplicationLifetime applicationLifetime, IScriptHostManager scriptHostManager, IEnvironment environment)
+        public FileMonitoringService(IOptions<ScriptJobHostOptions> scriptOptions, ILoggerFactory loggerFactory, IScriptEventManager eventManager, IScriptApplicationLifetime applicationLifetime, IScriptHostManager scriptHostManager, IEnvironment environment)
         {
             _scriptOptions = scriptOptions.Value;
             _eventManager = eventManager;
@@ -112,37 +111,37 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
                 using (System.Threading.ExecutionContext.SuppressFlow())
                 {
                     _typedLogger.LogDebug("Resuming scheduled restart.");
-                    Task.Run(async () => await ScheduleRestartAsync());
+                    Task.Run(async () => await ScheduleRestartAsync("Resuming scheduled restart."));
                 }
             }
         }
 
-        private async Task ScheduleRestartAsync(bool shutdown)
+        private async Task ScheduleRestartAsync(string reason, bool shutdown)
         {
             _restartScheduled = true;
             if (shutdown)
             {
-                _shutdownScheduled = true;
+                Interlocked.Exchange(ref _shutdownScheduled, 1);
             }
 
-            await ScheduleRestartAsync();
+            await ScheduleRestartAsync(reason);
         }
 
-        private async Task ScheduleRestartAsync()
+        private async Task ScheduleRestartAsync(string reason)
         {
             if (Interlocked.Read(ref _suspensionRequestsCount) > 0)
             {
-                _logger.LogDebug("Restart requested while currently suspended. Ignoring request.");
+                _logger.LogDebug("Restart requested while currently suspended. Reason: '{Reason}'. Ignoring request.", reason);
             }
             else
             {
-                if (_shutdownScheduled)
+                if (Interlocked.Read(ref _shutdownScheduled) == 1)
                 {
                     _shutdown();
                 }
                 else
                 {
-                    await _restart();
+                    await _restart(reason);
                 }
             }
         }
@@ -164,17 +163,21 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             }
 
             _eventSubscriptions.Add(_eventManager.OfType<HostRestartEvent>()
-                    .Subscribe((msg) => ScheduleRestartAsync(false)
-                    .ContinueWith(t => _logger.LogCritical(t.Exception.Message),
-                        TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously)));
+                .Subscribe(HandleHostRestartEvent));
 
             // Delay starting up for logging and debug file watchers to avoid long start up times
             Utility.ExecuteAfterColdStartDelay(_environment, InitializeSecondaryFileWatchers);
         }
 
+        private void HandleHostRestartEvent(HostRestartEvent restartEvent)
+        {
+            ScheduleRestartAsync($"Handling {nameof(HostRestartEvent)} ('{restartEvent.Name}':'{restartEvent.Source}'). Reason: {restartEvent.Reason}", false)
+                .ContinueWith(t => _logger.LogCritical(t.Exception?.Message), TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously);
+        }
+
         /// <summary>
         /// Initializes the file and directory monitoring that does not need to happen as part of a Host startup
-        /// These watchers can be started after a delay to avoid startup performance issue
+        /// These watchers can be started after a delay to avoid startup performance issue.
         /// </summary>
         private void InitializeSecondaryFileWatchers()
         {
@@ -242,7 +245,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
         }
 
         /// <summary>
-        /// Whenever the debug sentinel file changes we update our debug timeout
+        /// Whenever the debug sentinel file changes we update our debug timeout.
         /// </summary>
         private void OnDebugModeFileChanged(object sender, FileSystemEventArgs e)
         {
@@ -253,7 +256,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
         }
 
         /// <summary>
-        /// Whenever the diagnostic sentinel file changes we update our debug timeout
+        /// Whenever the diagnostic sentinel file changes we update our debug timeout.
         /// </summary>
         private void OnDiagnosticModeFileChanged(object sender, FileSystemEventArgs e)
         {
@@ -293,19 +296,35 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
                 changeDescription = "File";
                 if (File.Exists(e.FullPath))
                 {
-                    TraceFileChangeRestart(changeDescription, e.ChangeType.ToString(), e.FullPath, isShutdown: true);
+                    // Ensure a previously queued restart cannot win after app_offline.htm is detected.
+                    Interlocked.Exchange(ref _shutdownScheduled, 1);
+                    string fileChangeMsg = string.Format(CultureInfo.InvariantCulture, "{0} change of type '{1}' detected for '{2}'", changeDescription, e.ChangeType.ToString(), e.FullPath);
+                    TraceFileChangeRestart(fileChangeMsg, isShutdown: true);
                     Shutdown();
+                    return;
                 }
             }
             else if (_scriptOptions.WatchFiles.Any(f => string.Equals(fileName, f, StringComparison.OrdinalIgnoreCase)))
             {
                 changeDescription = "File";
             }
-            else if ((e.ChangeType == WatcherChangeTypes.Deleted || Directory.Exists(e.FullPath))
-                && !_rootDirectorySnapshot.SequenceEqual(Directory.EnumerateDirectories(_scriptOptions.RootScriptPath)))
+            else if (e.ChangeType == WatcherChangeTypes.Deleted || Directory.Exists(e.FullPath))
             {
                 // Check directory snapshot only if "Deleted" change or if directory changed
-                changeDescription = "Directory";
+                try
+                {
+                    if (!_rootDirectorySnapshot.SequenceEqual(Directory.EnumerateDirectories(_scriptOptions.RootScriptPath)))
+                    {
+                        changeDescription = "Directory";
+                    }
+                }
+                catch (DirectoryNotFoundException ex)
+                {
+                    // The root script path was deleted concurrently (TOCTOU race). Treat this as a directory change.
+                    _logger.LogWarning(ex, "Directory '{RootScriptPath}' was not found while processing file change event for '{FullPath}'. It may have been deleted concurrently.",
+                        _scriptOptions.RootScriptPath, e.FullPath);
+                    changeDescription = "Directory";
+                }
             }
 
             if (!string.IsNullOrEmpty(changeDescription))
@@ -316,15 +335,17 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
                     shutdown = true;
                 }
 
-                TraceFileChangeRestart(changeDescription, e.ChangeType.ToString(), e.FullPath, shutdown);
-                ScheduleRestartAsync(shutdown).ContinueWith(t => _logger.LogError(t.Exception, $"Error restarting host (full shutdown: {shutdown})"),
-                    TaskContinuationOptions.ExecuteSynchronously | TaskContinuationOptions.OnlyOnFaulted);
+                string fileChangeMsg = string.Format(CultureInfo.InvariantCulture, "{0} change of type '{1}' detected for '{2}'", changeDescription, e.ChangeType.ToString(), e.FullPath);
+                bool shutdownRequested = shutdown || Interlocked.Read(ref _shutdownScheduled) == 1;
+                TraceFileChangeRestart(fileChangeMsg, shutdownRequested);
+                ScheduleRestartAsync(fileChangeMsg, shutdownRequested)
+                    .ContinueWith(t => _logger.LogError(t.Exception, $"Error restarting host (full shutdown: {shutdownRequested})"),
+                        TaskContinuationOptions.ExecuteSynchronously | TaskContinuationOptions.OnlyOnFaulted);
             }
         }
 
-        private void TraceFileChangeRestart(string changeDescription, string changeType, string path, bool isShutdown)
+        private void TraceFileChangeRestart(string fileChangeMsg, bool isShutdown)
         {
-            string fileChangeMsg = string.Format(CultureInfo.InvariantCulture, "{0} change of type '{1}' detected for '{2}'", changeDescription, changeType, path);
             _logger.LogInformation(fileChangeMsg);
 
             string action = isShutdown ? "shutdown" : "restart";
@@ -349,11 +370,11 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             return string.Empty;
         }
 
-        private Task RestartAsync()
+        private Task RestartAsync(string reason)
         {
-            if (!_shutdownScheduled && Interlocked.Exchange(ref _restartRequested, 1) == 0)
+            if (Interlocked.Read(ref _shutdownScheduled) == 0 && Interlocked.Exchange(ref _restartRequested, 1) == 0)
             {
-                return _scriptHostManager.RestartHostAsync();
+                return _scriptHostManager.RestartHostAsync(reason);
             }
 
             return Task.CompletedTask;

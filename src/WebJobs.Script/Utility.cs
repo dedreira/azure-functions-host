@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
@@ -21,6 +21,7 @@ using Microsoft.Azure.WebJobs.Logging;
 using Microsoft.Azure.WebJobs.Script.Config;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Diagnostics.Extensions;
+using Microsoft.Azure.WebJobs.Script.Extensions;
 using Microsoft.Azure.WebJobs.Script.Models;
 using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
 using Microsoft.Extensions.DependencyInjection;
@@ -41,9 +42,22 @@ namespace Microsoft.Azure.WebJobs.Script
         private const string AssemblySeparator = "__";
         private const string BlobServiceDomain = "blob";
         private const string SasVersionQueryParam = "sv";
+        private const string SasTokenExpirationDate = "se";
+
+        /// <summary>
+        /// Gets a value indicating whether the host is running in placeholder simulation mode.
+        /// This mode is used for testing placeholder scenarios locally.
+        /// Running using either "DebugPlaceholder" or "ReleasePlaceholder" configuration mode will
+        /// cause the host to run in placeholder simulation mode.
+        /// </summary>
+#if PLACEHOLDER_SIMULATION
+        public const bool IsInPlaceholderSimulationMode = true;
+#else
+        public const bool IsInPlaceholderSimulationMode = false;
+#endif
 
         private static readonly Regex FunctionNameValidationRegex = new Regex(@"^[a-z][a-z0-9_\-]{0,127}$(?<!^host$)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-        private static readonly Regex BindingNameValidationRegex = new Regex(string.Format("^([a-zA-Z][a-zA-Z0-9]{{0,127}}|{0})$", Regex.Escape(ScriptConstants.SystemReturnParameterBindingName)));
+        private static readonly Regex BindingNameValidationRegex = new Regex(string.Format("^([a-zA-Z_][a-zA-Z0-9_]{{0,127}}|{0})$", Regex.Escape(ScriptConstants.SystemReturnParameterBindingName)));
 
         private static readonly string UTF8ByteOrderMark = Encoding.UTF8.GetString(Encoding.UTF8.GetPreamble());
         private static readonly FilteredExpandoObjectConverter _filteredExpandoObjectConverter = new FilteredExpandoObjectConverter();
@@ -127,8 +141,13 @@ namespace Microsoft.Azure.WebJobs.Script
             }, maxRetries, retryInterval);
         }
 
-        internal static async Task InvokeWithRetriesAsync(Func<Task> action, int maxRetries, TimeSpan retryInterval)
+        internal static async Task InvokeWithRetriesWhenAsync(Func<Task> action, int maxRetries, TimeSpan retryInterval, Func<Exception, bool> predicate)
         {
+            if (predicate is null)
+            {
+                throw new ArgumentNullException(nameof(predicate));
+            }
+
             int attempt = 0;
             while (true)
             {
@@ -137,7 +156,7 @@ namespace Microsoft.Azure.WebJobs.Script
                     await action();
                     return;
                 }
-                catch (Exception ex) when (!ex.IsFatal())
+                catch (Exception ex) when (predicate(ex))
                 {
                     if (++attempt > maxRetries)
                     {
@@ -147,6 +166,9 @@ namespace Microsoft.Azure.WebJobs.Script
                 }
             }
         }
+
+        internal static Task InvokeWithRetriesAsync(Func<Task> action, int maxRetries, TimeSpan retryInterval)
+            => InvokeWithRetriesWhenAsync(action, maxRetries, retryInterval, (e) => !e.IsFatal());
 
         /// <summary>
         /// Delays while the specified condition remains true.
@@ -569,7 +591,7 @@ namespace Microsoft.Azure.WebJobs.Script
         {
             if (bindingMetadata.Name == null || !BindingNameValidationRegex.IsMatch(bindingMetadata.Name))
             {
-                throw new ArgumentException($"The binding name {bindingMetadata.Name} is invalid. Please assign a valid name to the binding.");
+                throw new ArgumentException($"The binding name {bindingMetadata.Name} is invalid. Please assign a valid name to the binding. See https://aka.ms/azure-functions-binding-name-rules for more details.");
             }
 
             if (bindingMetadata.IsReturn && bindingMetadata.Direction != BindingDirection.Out)
@@ -607,11 +629,11 @@ namespace Microsoft.Azure.WebJobs.Script
             return true;
         }
 
-        internal static void VerifyFunctionsMatchSpecifiedLanguage(IEnumerable<FunctionMetadata> functions, string workerRuntime, bool isPlaceholderMode, bool isHttpWorker, CancellationToken cancellationToken)
+        internal static void VerifyFunctionsMatchSpecifiedLanguage(IEnumerable<FunctionMetadata> functions, string workerRuntime, bool isPlaceholderMode, bool shouldSkipValidation, CancellationToken cancellationToken, bool throwOnMismatch = true)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            if (isPlaceholderMode || isHttpWorker)
+            if (isPlaceholderMode || shouldSkipValidation)
             {
                 return;
             }
@@ -620,13 +642,25 @@ namespace Microsoft.Azure.WebJobs.Script
             {
                 if (string.IsNullOrEmpty(workerRuntime))
                 {
-                    throw new HostInitializationException($"Found functions with more than one language. Select a language for your function app by specifying {RpcWorkerConstants.FunctionWorkerRuntimeSettingName} AppSetting");
+                    throw new HostInitializationException($"Found functions with more than one language. Select a language for your function app by specifying {EnvironmentSettingNames.FunctionWorkerRuntime} AppSetting");
                 }
                 else
                 {
-                    throw new HostInitializationException($"Did not find functions with language [{workerRuntime}].");
+                    if (throwOnMismatch)
+                    {
+                        throw new HostInitializationException($"Did not find functions with language [{workerRuntime}].");
+                    }
                 }
             }
+        }
+
+        /// <summary>
+        /// Gets a value indicating whether AzureFileShare should be mounted when specializing Linux Consumption workers.
+        /// </summary>
+        public static bool IsAzureFileShareMountSupported(string workerRuntime)
+        {
+            return string.Equals(workerRuntime, RpcWorkerConstants.PowerShellLanguageWorkerName,
+                StringComparison.OrdinalIgnoreCase);
         }
 
         internal static bool IsSingleLanguage(IEnumerable<FunctionMetadata> functions, string workerRuntime)
@@ -642,9 +676,15 @@ namespace Microsoft.Azure.WebJobs.Script
             }
             if (string.IsNullOrEmpty(workerRuntime))
             {
-                return filteredFunctions.Select(f => f.Language).Distinct().Count() <= 1;
+                return filteredFunctions.Select(f => f.Language).Distinct(StringComparer.OrdinalIgnoreCase).Count() <= 1;
             }
             return ContainsFunctionWithWorkerRuntime(filteredFunctions, workerRuntime);
+        }
+
+        internal static bool IsDotnetIsolatedApp(IEnvironment environment, IEnumerable<FunctionMetadata> functions = null)
+        {
+            string workerRuntime = GetWorkerRuntime(functions, environment);
+            return workerRuntime?.Equals(RpcWorkerConstants.DotNetIsolatedLanguageWorkerName, StringComparison.OrdinalIgnoreCase) ?? false;
         }
 
         internal static string GetWorkerRuntime(IEnumerable<FunctionMetadata> functions, IEnvironment environment = null)
@@ -726,10 +766,20 @@ namespace Microsoft.Azure.WebJobs.Script
             {
                 return functions.Any(f => dotNetLanguages.Any(l => l.Equals(f.Language, StringComparison.OrdinalIgnoreCase)));
             }
+
+            return ContainsAnyFunctionMatchingWorkerRuntime(functions, workerRuntime);
+        }
+
+        /// <summary>
+        /// Inspect the functions metadata to determine if at least one function is of the specified worker runtime.
+        /// </summary>
+        internal static bool ContainsAnyFunctionMatchingWorkerRuntime(IEnumerable<FunctionMetadata> functions, string workerRuntime)
+        {
             if (functions != null && functions.Any())
             {
                 return functions.Any(f => !string.IsNullOrEmpty(f.Language) && f.Language.Equals(workerRuntime, StringComparison.OrdinalIgnoreCase));
             }
+
             return false;
         }
 
@@ -772,7 +822,7 @@ namespace Microsoft.Azure.WebJobs.Script
         public static void ExecuteAfterColdStartDelay(IEnvironment environment, Action targetAction, CancellationToken cancellationToken = default)
         {
             // for Dynamic SKUs where coldstart is important, we want to delay the action
-            if (environment.IsDynamicSku())
+            if (IsInPlaceholderSimulationMode || environment.IsDynamicSku())
             {
                 ExecuteAfterDelay(targetAction, TimeSpan.FromMilliseconds(ColdStartDelayMS), cancellationToken);
             }
@@ -848,7 +898,7 @@ namespace Microsoft.Azure.WebJobs.Script
 
         /// <summary>
         /// Utility function to validate a blob URL by attempting to retrieve the account name from it.
-        /// Borrowed from https://github.com/Azure/azure-sdk-for-net/blob/e0fd1cd415d8339947b20c3565c7adc7d7f60fbe/sdk/storage/Azure.Storage.Common/src/Shared/UriExtensions.cs
+        /// Borrowed from https://github.com/Azure/azure-sdk-for-net/blob/e0fd1cd415d8339947b20c3565c7adc7d7f60fbe/sdk/storage/Azure.Storage.Common/src/Shared/UriExtensions.cs.
         /// </summary>
         private static string GetAccountNameFromDomain(string domain)
         {
@@ -877,6 +927,34 @@ namespace Microsoft.Azure.WebJobs.Script
             }
 
             return true;
+        }
+
+        public static string GetSasTokenExpirationDate(string valueToParse, bool isAzureWebJobsStorage)
+        {
+            NameValueCollection queryParams = null;
+            if (isAzureWebJobsStorage)
+            {
+                var azureWebJobsStorageSpan = valueToParse.AsSpan();
+                var sasToken = azureWebJobsStorageSpan
+                            .Slice(azureWebJobsStorageSpan.LastIndexOf(';') + 1).ToString();
+                queryParams = HttpUtility.ParseQueryString(sasToken);
+            }
+            else
+            {
+                if (!Uri.IsWellFormedUriString(valueToParse, UriKind.Absolute))
+                {
+                    return null;
+                }
+                var resourceUri = new Uri(valueToParse);
+                queryParams = HttpUtility.ParseQueryString(resourceUri.Query);
+            }
+            // Parse query params
+            if (!string.IsNullOrEmpty(queryParams[SasTokenExpirationDate]))
+            {
+                return queryParams[SasTokenExpirationDate];
+            }
+
+            return null;
         }
 
         public static bool IsHttporManualTrigger(string triggerType)
@@ -959,17 +1037,23 @@ namespace Microsoft.Azure.WebJobs.Script
             }
         }
 
-        // EnableWorkerIndexing set through AzureWebjobsFeatuerFlag always take precdence
-        // if AzureWebjobsFeatuerFlag is not set then WORKER_INDEXING_ENABLED hosting config controls stamplevel enablement
-        // if WORKER_INDEXING_ENABLED is set and WORKER_INDEXING_DISABLED contains the customers app name worker indexing is then disabled for that customer only
-        // Also Worker indexing is disabled for Logic apps
+        // Worker indexing is disabled for Logic apps
+        // EnableWorkerIndexing set through AzureWebjobsFeatureFlag always take precedence
+        // If AzureWebjobsFeatureFlag is not set and
+        // WORKER_INDEXING_DISABLED contains the customers app name worker indexing is then disabled for that customer only
         public static bool CanWorkerIndex(IEnumerable<RpcWorkerConfig> workerConfigs, IEnvironment environment, FunctionsHostingConfigOptions functionsHostingConfigOptions)
         {
+            // NOTE: Enabling the worker indexing for Logic Apps with codeful mode enabled.
+            if (environment.IsLogicApp() && !environment.IsLogicAppCodefulModeEnabled())
+            {
+                return false;
+            }
+
             string appName = environment.GetAzureWebsiteUniqueSlotName();
-            bool workerIndexingEnabled = FeatureFlags.IsEnabled(ScriptConstants.FeatureFlagEnableWorkerIndexing, environment)
-                                          || (functionsHostingConfigOptions.WorkerIndexingEnabled
-                                          && !functionsHostingConfigOptions.WorkerIndexingDisabledApps.ToLowerInvariant().Split("|").Contains(appName)
-                                           && !environment.IsLogicApp());
+
+            bool workerIndexingFeatureFlagSet = FeatureFlags.IsEnabled(ScriptConstants.FeatureFlagEnableWorkerIndexing, environment);
+            bool workerIndexingDisabledViaHostingConfig = functionsHostingConfigOptions.WorkerIndexingDisabledApps.ToLowerInvariant().Split("|").Contains(appName);
+            bool workerIndexingEnabled = workerIndexingFeatureFlagSet || !workerIndexingDisabledViaHostingConfig;
 
             if (!workerIndexingEnabled)
             {
@@ -1070,6 +1154,22 @@ namespace Microsoft.Azure.WebJobs.Script
             }
 
             return result = false;
+        }
+
+        public static bool IsAzureMonitorLoggingEnabled(string azureMonitorcategoriesSubscribed)
+        {
+            if (azureMonitorcategoriesSubscribed == null)
+            {
+                return true;
+            }
+            if (string.Equals(ScriptConstants.DefaultAzureMonitorCategories, azureMonitorcategoriesSubscribed, StringComparison.Ordinal))
+            {
+                // Default value for the env variable is None.
+                // This is set when customer does not subscribe any category.
+                return false;
+            }
+
+            return azureMonitorcategoriesSubscribed.ContainsToken(token: ScriptConstants.AzureMonitorTraceCategory, separator: ',');
         }
 
         private class FilteredExpandoObjectConverter : ExpandoObjectConverter

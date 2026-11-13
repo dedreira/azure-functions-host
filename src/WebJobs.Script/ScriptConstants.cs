@@ -1,6 +1,8 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
+using System;
+using System.Collections.Generic;
 using System.Collections.Immutable;
 using NuGet.Versioning;
 
@@ -19,7 +21,9 @@ namespace Microsoft.Azure.WebJobs.Script
         public const string AzureFunctionsHostKey = "MS_AzureFunctionsHost";
         public const string AzureFunctionsNestedProxyCount = "MS_AzureFunctionsNestedProxyCount";
         public const string AzureFunctionsProxyResult = "MS_AzureFunctionsProxyResult";
+        public const string AzureFunctionsHttpTriggerContext = "MS_AzureFunctionsHttpTriggerContext";
         public const string AzureFunctionsDuplicateHttpHeadersKey = "MS_AzureFunctionsDuplicateHttpHeaders";
+        public const string AzureFunctionsArmWebhookRequestKey = "MS_AzureFunctionsArmWebhookRequest";
         public const string JobHostMiddlewarePipelineRequestDelegate = "MS_JobHostMiddlewarePipelineRequestDelegate";
         public const string HstsMiddlewareRequestDelegate = "MS_HstsMiddlewareRequestDelegate";
         public const string CorsMiddlewareRequestDelegate = "MS_CorsMiddlewareRequestDelegate";
@@ -45,17 +49,23 @@ namespace Microsoft.Azure.WebJobs.Script
         public const string TraceSourceHttpHandler = "HttpRequestTraceHandler";
         public const string TraceSourceHttpThrottleMiddleware = "HttpThrottleMiddleware";
 
+        // We have been using this to insert the full HttpRequest into the logger scope. This is not a good practice
+        // as it will worsen any execution context leaks. If logger scope is leaked, now HTTP request will be leaked as well.
+        // We will not remove it from the logger scope just yet, but we will remove all of our own usage of it.
+        [Obsolete("Do not access the HTTP request from the logger scope, this will be removed in a future version.")]
         public const string LoggerHttpRequest = "MS_HttpRequest";
 
         public const string LogCategoryHostController = "Host.Controllers.Host";
         public const string LogCategoryFunctionsController = "Host.Controllers.Functions";
         public const string LogCategoryInstanceController = "Host.Controllers.Instance";
         public const string LogCategoryKeysController = "Host.Controllers.Keys";
+        public const string LogCategoryHostAuthentication = "Host.Authentication";
         public const string LogCategoryHostGeneral = "Host.General";
         public const string LogCategoryHostMetrics = "Host.Metrics";
         public const string LogCategoryHost = "Host";
         public const string LogCategoryFunction = "Function";
         public const string LogCategoryWorker = "Worker";
+        public const string LogCategoryWorkerConfig = "Host.LanguageWorkerConfig";
 
         public const string SkipHostJsonConfigurationKey = "MS_SkipHostJsonConfiguration";
         public const string SkipHostInitializationKey = "MS_SkipHostInitialization";
@@ -88,6 +98,7 @@ namespace Microsoft.Azure.WebJobs.Script
         public const string DefaultMasterKeyName = "master";
         public const string DefaultFunctionKeyName = "default";
         public const string ColdStartEventName = "ColdStart";
+        public const string PlaceholderMissDueToBitnessEventName = "PlaceholderMissDueToBitness";
 
         public const string FunctionsUserAgent = "AzureFunctionsRuntime";
         public const string HttpScaleUserAgent = "HttpScaleManager";
@@ -100,7 +111,6 @@ namespace Microsoft.Azure.WebJobs.Script
         public const string AntaresLogIdHeaderName = "X-ARR-LOG-ID";
         public const string AntaresScaleOutHeaderName = "X-FUNCTION-SCALEOUT";
         public const string AntaresColdStartHeaderName = "X-MS-COLDSTART";
-        public const string SiteRestrictedTokenHeaderName = "x-ms-site-restricted-token";
         public const string SiteTokenHeaderName = "x-ms-site-token";
         public const string EasyAuthIdentityHeader = "x-ms-client-principal";
         public const string AntaresPlatformInternal = "x-ms-platform-internal";
@@ -122,20 +132,35 @@ namespace Microsoft.Azure.WebJobs.Script
         public const string FeatureFlagRelaxedAssemblyUnification = "RelaxedAssemblyUnification";
         public const string FeatureFlagEnableDiagnosticEventLogging = "EnableDiagnosticEventLogging";
         public const string FeatureFlagDisableDiagnosticEventLogging = "DisableDiagnosticEventLogging";
+        public const string FeatureFlagDisableWebHostLogForwarding = "DisableWebHostLogForwarding";
         public const string FeatureFlagDisableMergedWebHostScriptHostConfiguration = "DisableMergedConfiguration";
         public const string FeatureFlagEnableWorkerIndexing = "EnableWorkerIndexing";
+        public const string FeatureFlagDisableDynamicWorkerResolution = "DisableDynamicWorkerResolution";
         public const string FeatureFlagEnableDebugTracing = "EnableDebugTracing";
         public const string FeatureFlagEnableProxies = "EnableProxies";
+        public const string FeatureFlagStrictHISModeEnabled = "StrictHISModeEnabled";
+        public const string FeatureFlagStrictHISModeWarn = "StrictHISModeWarn";
+        public const string FeatureFlagEnableOrderedInvocationmessages = "EnableOrderedInvocationMessages";
+        public const string FeatureFlagEnableResponseCompression = "EnableResponseCompression";
+        public const string FeatureFlagEnableMcpCustomHandlerPreview = "EnableMcpCustomHandlerPreview";
+        public const string FeatureFlagDisableOrderedInvocationMessages = "DisableOrderedInvocationMessages";
+        public const string FeatureFlagDisableReservedRouteEnforcement = "DisableReservedRouteEnforcement";
+        public const string FeatureFlagEnableAzureMonitorTimeIsoFormat = "EnableAzureMonitorTimeIsoFormat";
         public const string HostingConfigDisableLinuxAppServiceDetailedExecutionEvents = "DisableLinuxExecutionDetails";
         public const string HostingConfigDisableLinuxAppServiceExecutionEventLogBackoff = "DisableLinuxLogBackoff";
         public const string FeatureFlagEnableLegacyDurableVersionCheck = "EnableLegacyDurableVersionCheck";
+        public const string HostingConfigDotNetInProcDisabled = "DotNetInProcDisabled";
+        public const string HostingConfigArmWebhookOptInEnforcement = "ArmWebhookOptInEnforcement";
+        public const string DefaultArmWebhookOptInExemptExtensions = "workflow";
 
         public const string SiteAzureFunctionsUriFormat = "https://{0}.azurewebsites.net/azurefunctions";
         public const string ScmSiteUriFormat = "https://{0}.scm.azurewebsites.net";
         public const string SiteUriFormat = "https://{0}.azurewebsites.net";
         public const string AppServiceCoreUri = "https://appservice.core.azurewebsites.net";
+        public const string LegionCoreUri = "https://legion.core.azurewebsites.net";
 
         public const string AzureFunctionsSystemDirectoryName = ".azurefunctions";
+        public const string Admin = "admin";
         public const string HttpMethodConstraintName = "httpMethod";
         public const string Snapshot = "snapshot";
         public const string Runtime = "runtime";
@@ -154,7 +179,6 @@ namespace Microsoft.Azure.WebJobs.Script
         /// for settriggers calls. If we raise that limit there, we should raise here as well.
         /// </summary>
         public const int MaxTriggersStringLength = 204800;
-        public const int MaxTestDataInlineStringLength = 4 * 1024;
 
         public const string ExtensionsProjectFileName = "extensions.csproj";
         public const string ItemGroupElementName = "ItemGroup";
@@ -179,8 +203,10 @@ namespace Microsoft.Azure.WebJobs.Script
         public const string AzureWebJobsHostsContainerName = "azure-webjobs-hosts";
 
         public const string DefaultExtensionBundleDirectory = "FuncExtensionBundles";
+        public const int ExtensionBundleV3MajorVersion = 3;
+        public const int ExtensionBundleV4MajorVersion = 4;
         public const string ExtensionBundleDirectory = "ExtensionBundles";
-        public const string ExtensionBundleDefaultSourceUri = "https://functionscdn.azureedge.net/public";
+        public const string ExtensionBundleDefaultSourceUri = "https://cdn.functions.azure.com/public";
         public const string ExtensionBundleMetadataFile = "bundle.json";
         public const string ExtensionBundleVersionIndexFile = "index.json";
         public const string ExtensionBundleBindingMetadataFile = "bindings.json";
@@ -199,7 +225,13 @@ namespace Microsoft.Azure.WebJobs.Script
         public const string LogicAppDefaultExtensionBundleVersion = "[1.*, 2.0.0)";
         public const string DefaultExtensionBundleVersion = "[4.*, 5.0.0)";
 
+        // Antares Platform Channel Names, used in extension bundle resolution
+        public const string LatestPlatformChannelNameUpper = "LATEST";
+        public const string StandardPlatformChannelNameUpper = "STANDARD";
+        public const string ExtendedPlatformChannelNameUpper = "EXTENDED";
+
         public const string AzureMonitorTraceCategory = "FunctionAppLogs";
+        public const string DefaultAzureMonitorCategories = "None";
 
         public const string KubernetesManagedAppName = "K8SE_APP_NAME";
         public const string KubernetesManagedAppNamespace = "K8SE_APP_NAMESPACE";
@@ -215,6 +247,8 @@ namespace Microsoft.Azure.WebJobs.Script
         public const string HostDiagnosticSourceDebugEventNamePrefix = "debug-";
         public const string DiagnosticSourceAssemblyContext = HostDiagnosticSourcePrefix + "AssemblyContext";
 
+        public const string HostEventSourcePrefix = "Azure-Functions-Host-";
+
         public static readonly ImmutableArray<string> HttpMethods = ImmutableArray.Create("get", "post", "delete", "head", "patch", "put", "options");
         public static readonly ImmutableArray<string> AssemblyFileTypes = ImmutableArray.Create(".dll", ".exe");
         public static readonly string HostUserAgent = $"azure-functions-host/{ScriptHost.Version}";
@@ -222,15 +256,30 @@ namespace Microsoft.Azure.WebJobs.Script
         public static readonly long DefaultMaxRequestBodySize = 104857600;
 
         public static readonly ImmutableArray<string> SystemLogCategoryPrefixes = ImmutableArray.Create("Microsoft.Azure.WebJobs.", "Function.", "Worker.", "Host.");
+        public static readonly IReadOnlySet<string> HostCapabilities = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         public static readonly string FunctionMetadataDirectTypeKey = "DirectType";
         public static readonly string LiveLogsSessionAIKey = "#AzFuncLiveLogsSessionId";
 
         public static readonly string FunctionsHostingConfigSectionName = "FunctionsHostingConfig";
+        public static readonly string FunctionsHostingEnvironmentConfigSectionName = "HostingEnvironmentConfig";
+        public static readonly string ExtensionRequirementsSection = $"{FunctionsHostingEnvironmentConfigSectionName}:extensionRequirements";
+        public static readonly string MaximumBundleV3Version = "FunctionRuntimeV4MaxBundleV3Version";
+        public static readonly string MaximumBundleV4Version = "FunctionRuntimeV4MaxBundleV4Version";
 
         // HTTP Proxying constants
         public static readonly string HttpProxyingEnabled = "HttpProxyingEnabled";
         public static readonly string HttpProxyCorrelationHeader = "x-ms-invocation-id";
         public static readonly string HttpProxyTask = "HttpProxyTask";
+        public static readonly string HttpProxyScriptInvocationContext = "HttpProxyScriptInvocationContext";
+        public static readonly string EnableProxyingHttpRequest = "enableProxyingHttpRequest";
+
+        public static readonly string OperationNameKey = "OperationName";
+
+        public static readonly string CancellationTokenRegistration = "CancellationTokenRegistration";
+
+        internal const string MasterKeyName = "_master";
+
+        public static readonly ImmutableHashSet<string> SensitiveMetadataBindingPropertyNames = ImmutableHashSet.Create(StringComparer.OrdinalIgnoreCase, "connection");
     }
 }

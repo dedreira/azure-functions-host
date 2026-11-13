@@ -92,12 +92,6 @@ namespace Microsoft.Azure.WebJobs.Script.Diagnostics
             try
             {
                 _fileWriter.AppendLine(formattedMessage);
-
-                // flush errors immediately
-                if (logLevel == LogLevel.Error || exception != null)
-                {
-                    _fileWriter.Flush();
-                }
             }
             catch (Exception)
             {

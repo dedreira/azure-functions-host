@@ -1,14 +1,16 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.IO;
+using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Script.Binding;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Extensibility;
+using Microsoft.Azure.WebJobs.Script.Metrics;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
@@ -32,17 +34,27 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             _host = new HostBuilder()
                 .ConfigureDefaultTestWebScriptHost(webJobsBuilder =>
                 {
-                    webJobsBuilder.AddAzureStorage();
+                    webJobsBuilder.AddAzureStorageCoreServices();
+                    webJobsBuilder.AddAzureStorageBlobs();
+                    webJobsBuilder.AddAzureStorageQueues();
                 },
                 o =>
                 {
                     o.ScriptPath = rootPath;
                     o.LogPath = TestHelpers.GetHostLogFileDirectory().Parent.FullName;
                 })
+                .ConfigureServices((context, services) =>
+                {
+                    services.AddMetrics();
+                    services.AddSingleton<IEnvironment>(new TestEnvironment());
+                    services.AddSingleton<IHostMetrics, HostMetrics>();
+                })
                 .Build();
+
             _scriptHost = _host.GetScriptHost();
             _scriptHost.InitializeAsync().GetAwaiter().GetResult();
-            _provider = new TestDescriptorProvider(_scriptHost, _host.Services.GetService<IOptions<ScriptJobHostOptions>>().Value, _host.Services.GetService<ICollection<IScriptBindingProvider>>());
+            var serviceBindingProviders = _host.Services.GetService<IEnumerable<IScriptBindingProvider>>().ToArray();
+            _provider = new TestDescriptorProvider(_scriptHost, _host.Services.GetService<IOptions<ScriptJobHostOptions>>().Value, serviceBindingProviders);
         }
 
         [Fact]
@@ -70,7 +82,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 _provider.ValidateFunction(functionMetadata);
             });
 
-            Assert.Equal("Multiple bindings with name 'dupe' discovered. Binding names must be unique.", ex.Message);
+            Assert.Equal($"{nameof(FunctionDescriptorProvider)}: Multiple bindings with name 'dupe' discovered. Binding names must be unique.", ex.Message);
         }
 
         [Fact]
@@ -194,7 +206,6 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         [Theory]
         [InlineData(null)]
         [InlineData("")]
-        [InlineData("_binding")]
         [InlineData("binding-test")]
         [InlineData("binding name")]
         public void ValidateBinding_InvalidName_Throws(string bindingName)
@@ -209,10 +220,22 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 _provider.ValidateBinding(bindingMetadata);
             });
 
-            Assert.Equal($"The binding name {bindingName} is invalid. Please assign a valid name to the binding.", ex.Message);
+            Assert.Equal($"The binding name {bindingName} is invalid. Please assign a valid name to the binding. See https://aka.ms/azure-functions-binding-name-rules for more details.", ex.Message);
         }
 
         [Theory]
+        [InlineData("__")]
+        [InlineData("__binding")]
+        [InlineData("binding__")]
+        [InlineData("bind__ing")]
+        [InlineData("__binding__")]
+        [InlineData("_binding")]
+        [InlineData("binding_")]
+        [InlineData("_binding_")]
+        [InlineData("_another_binding_test_")]
+        [InlineData("long_binding_name_that_is_valid")]
+        [InlineData("binding_name")]
+        [InlineData("_")]
         [InlineData("bindingName")]
         [InlineData("binding1")]
         [InlineData(ScriptConstants.SystemReturnParameterBindingName)]

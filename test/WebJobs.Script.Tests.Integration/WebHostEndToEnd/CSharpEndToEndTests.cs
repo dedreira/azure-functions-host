@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
@@ -11,8 +11,6 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Logging;
-using Microsoft.Azure.WebJobs.Script.Diagnostics;
-using Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.WebHost.Models;
 using Microsoft.Azure.WebJobs.Script.Workers;
 using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
@@ -243,20 +241,28 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
             await Fixture.Host.BeginFunctionAsync("MultipleOutputs", input);
 
             // verify all 3 output blobs were written
-            var blob = Fixture.TestOutputContainer.GetBlockBlobReference(id1);
-            await TestHelpers.WaitForBlobAsync(blob);
-            string blobContent = await blob.DownloadTextAsync();
+            var blob = Fixture.TestOutputContainer.GetBlobClient(id1);
+            string blobContent = await TestHelpers.WaitForBlobAndGetStringAsync(
+                blob,
+                content => IsExpectedBlobContent(content, "Test Blob 1"));
             Assert.Equal("Test Blob 1", Utility.RemoveUtf8ByteOrderMark(blobContent));
 
-            blob = Fixture.TestOutputContainer.GetBlockBlobReference(id2);
-            await TestHelpers.WaitForBlobAsync(blob);
-            blobContent = await blob.DownloadTextAsync();
+            blob = Fixture.TestOutputContainer.GetBlobClient(id2);
+            blobContent = await TestHelpers.WaitForBlobAndGetStringAsync(
+                blob,
+                content => IsExpectedBlobContent(content, "Test Blob 2"));
             Assert.Equal("Test Blob 2", Utility.RemoveUtf8ByteOrderMark(blobContent));
 
-            blob = Fixture.TestOutputContainer.GetBlockBlobReference(id3);
-            await TestHelpers.WaitForBlobAsync(blob);
-            blobContent = await blob.DownloadTextAsync();
+            blob = Fixture.TestOutputContainer.GetBlobClient(id3);
+            blobContent = await TestHelpers.WaitForBlobAndGetStringAsync(
+                blob,
+                content => IsExpectedBlobContent(content, "Test Blob 3"));
             Assert.Equal("Test Blob 3", Utility.RemoveUtf8ByteOrderMark(blobContent));
+
+            static bool IsExpectedBlobContent(string content, string expected)
+            {
+                return string.Equals(expected, Utility.RemoveUtf8ByteOrderMark(content), StringComparison.Ordinal);
+            }
         }
 
         [Fact]
@@ -313,7 +319,8 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
 
             foreach (var blob in blobs)
             {
-                string content = await blob.DownloadTextAsync();
+                var blobDownload = await blob.DownloadContentAsync();
+                string content = blobDownload.Value.Content.ToString();
                 int blobInt = int.Parse(content.Trim(new char[] { '\uFEFF', '\u200B' }));
                 Assert.True(blobInt >= 0 && blobInt <= 3);
             }
@@ -351,11 +358,11 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
             Assert.True(JObject.DeepEquals(req, res), res.ToString());
         }
 
-        [Fact]
+        [Fact(Skip = "V2 is out of support")]
         public async Task HttpTrigger_Model_Binding_V2CompatMode()
         {
             // We need a custom host to set this to v2 compat mode.
-            using (var host = new TestFunctionHost(@"TestScripts\CSharp", Path.Combine(Path.GetTempPath(), "Functions"),
+            await using (var host = new TestFunctionHost(@"TestScripts\CSharp", Path.Combine(Path.GetTempPath(), "Functions"),
                 configureWebHostServices: webHostServices =>
                 {
                     var environment = new TestEnvironment();
@@ -447,8 +454,10 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
 
             // verify blob was written
             string blobName = $"TestPrefix-{id}-TestSuffix-BBB";
-            var outBlob = Fixture.TestOutputContainer.GetBlockBlobReference(blobName);
-            string result = await TestHelpers.WaitForBlobAndGetStringAsync(outBlob);
+            var outBlob = Fixture.TestOutputContainer.GetBlobClient(blobName);
+            string result = await TestHelpers.WaitForBlobAndGetStringAsync(
+                outBlob,
+                content => string.Equals(expectedValue, Utility.RemoveUtf8ByteOrderMark(content), StringComparison.Ordinal));
             Assert.Equal(expectedValue, Utility.RemoveUtf8ByteOrderMark(result));
         }
 
@@ -567,7 +576,8 @@ namespace SecondaryDependency
             {
                 base.ConfigureScriptHost(webJobsBuilder);
 
-                webJobsBuilder.AddAzureStorage();
+                webJobsBuilder.AddAzureStorageCoreServices().AddAzureStorageBlobs().AddAzureStorageQueues();
+
                 webJobsBuilder.Services.Configure<ScriptJobHostOptions>(o =>
                 {
                     // Only load the functions we care about

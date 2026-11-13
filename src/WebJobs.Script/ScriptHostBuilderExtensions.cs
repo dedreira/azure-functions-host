@@ -1,21 +1,21 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
 using System.Collections.Generic;
-using System.Runtime.InteropServices;
-using Microsoft.ApplicationInsights;
-using Microsoft.ApplicationInsights.Channel;
-using Microsoft.ApplicationInsights.DataContracts;
+using System.ComponentModel;
+using System.Diagnostics.Tracing;
+using System.Linq;
+using System.Net.Http;
 using Microsoft.ApplicationInsights.Extensibility;
-using Microsoft.ApplicationInsights.Extensibility.Implementation;
 using Microsoft.ApplicationInsights.WindowsServer.TelemetryChannel;
 using Microsoft.Azure.WebJobs.Host;
+using Microsoft.Azure.WebJobs.Host.Abstractions;
 using Microsoft.Azure.WebJobs.Host.Executors;
-using Microsoft.Azure.WebJobs.Host.Scale;
 using Microsoft.Azure.WebJobs.Hosting;
 using Microsoft.Azure.WebJobs.Logging;
 using Microsoft.Azure.WebJobs.Logging.ApplicationInsights;
+using Microsoft.Azure.WebJobs.Script.AppCapabilities;
 using Microsoft.Azure.WebJobs.Script.Binding;
 using Microsoft.Azure.WebJobs.Script.BindingExtensions;
 using Microsoft.Azure.WebJobs.Script.Config;
@@ -23,18 +23,22 @@ using Microsoft.Azure.WebJobs.Script.Configuration;
 using Microsoft.Azure.WebJobs.Script.DependencyInjection;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
+using Microsoft.Azure.WebJobs.Script.Diagnostics.OpenTelemetry;
 using Microsoft.Azure.WebJobs.Script.Eventing;
 using Microsoft.Azure.WebJobs.Script.Extensibility;
 using Microsoft.Azure.WebJobs.Script.ExtensionBundle;
 using Microsoft.Azure.WebJobs.Script.FileProvisioning;
+using Microsoft.Azure.WebJobs.Script.Host;
 using Microsoft.Azure.WebJobs.Script.Http;
 using Microsoft.Azure.WebJobs.Script.ManagedDependencies;
+using Microsoft.Azure.WebJobs.Script.Metrics;
 using Microsoft.Azure.WebJobs.Script.Scale;
 using Microsoft.Azure.WebJobs.Script.Workers;
-using Microsoft.Azure.WebJobs.Script.Workers.Http;
 using Microsoft.Azure.WebJobs.Script.Workers.Profiles;
 using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
+using Microsoft.Azure.WebJobs.Script.Workers.Rpc.Configuration;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Configuration.EnvironmentVariables;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
@@ -42,6 +46,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Logging.Configuration;
 using Microsoft.Extensions.Options;
+using TokenCredentialOptions = Microsoft.Azure.WebJobs.Logging.ApplicationInsights.TokenCredentialOptions;
 
 namespace Microsoft.Azure.WebJobs.Script
 {
@@ -78,7 +83,7 @@ namespace Microsoft.Azure.WebJobs.Script
                                                  IMetricsLogger metricsLogger,
                                                  Action<IWebJobsBuilder> configureWebJobs = null)
         {
-            loggerFactory = loggerFactory ?? NullLoggerFactory.Instance;
+            loggerFactory ??= NullLoggerFactory.Instance;
 
             builder.SetAzureFunctionsConfigurationRoot();
             // Host configuration
@@ -95,19 +100,48 @@ namespace Microsoft.Azure.WebJobs.Script
 
                 loggingBuilder.AddConsoleIfEnabled(context);
 
-                ConfigureApplicationInsights(context, loggingBuilder);
+                loggingBuilder.ConfigureTelemetry(context);
             })
             .ConfigureAppConfiguration((context, configBuilder) =>
             {
                 if (!context.Properties.ContainsKey(ScriptConstants.SkipHostJsonConfigurationKey))
                 {
-                    configBuilder.Add(new HostJsonFileConfigurationSource(applicationOptions, SystemEnvironment.Instance, loggerFactory, metricsLogger));
+                    IConfigurationSource hostConfigurationSource = applicationOptions.RootServiceProvider
+                        ?.GetService<IHostConfigurationSourceProvider>()?.GetConfigurationSource();
+                    if (hostConfigurationSource is null)
+                    {
+                        HostJsonFileConfigurationOptions hostJsonConfigOptions = new(SystemEnvironment.Instance, applicationOptions);
+                        hostConfigurationSource = new HostJsonFileConfigurationSource(hostJsonConfigOptions, loggerFactory, metricsLogger);
+                    }
+
+                    configBuilder.Add(hostConfigurationSource);
                 }
                 // Adding hosting config into job host configuration
+                configBuilder.Add(new FunctionsHostingConfigSource(SystemEnvironment.Instance));
+
+                var hostingEnvironmentConfigFilePath = SystemEnvironment.Instance.GetFunctionsHostingEnvironmentConfigFilePath();
+                if (!string.IsNullOrEmpty(hostingEnvironmentConfigFilePath))
+                {
+                    configBuilder.AddJsonFile(hostingEnvironmentConfigFilePath, optional: true, reloadOnChange: false);
+                }
+
                 IConfiguration scriptHostConfiguration = applicationOptions.RootServiceProvider.GetService<IConfiguration>();
                 if (scriptHostConfiguration != null)
                 {
                     configBuilder.AddConfiguration(scriptHostConfiguration.GetSection(ScriptConstants.FunctionsHostingConfigSectionName));
+                }
+
+                // Selectively surface the worker runtime environment variable into the script host
+                // configuration so that IConfiguration consumers can resolve it without depending
+                // on IEnvironment directly.
+                var environment = applicationOptions.RootServiceProvider?.GetService<IEnvironment>() ?? SystemEnvironment.Instance;
+                string workerRuntime = environment.GetEnvironmentVariable(EnvironmentSettingNames.FunctionWorkerRuntime);
+                if (workerRuntime is not null)
+                {
+                    configBuilder.AddInMemoryCollection(new[]
+                    {
+                        new KeyValuePair<string, string>(EnvironmentSettingNames.FunctionWorkerRuntime, workerRuntime)
+                    });
                 }
             });
 
@@ -117,14 +151,39 @@ namespace Microsoft.Azure.WebJobs.Script
             // Allow FunctionsStartup to add configuration after all other configuration is registered.
             builder.ConfigureAppConfiguration((context, configBuilder) =>
             {
-                // Pre-build configuration here to load bundles and to store for later validation.
-                var config = configBuilder.Build();
-                var extensionBundleOptions = GetExtensionBundleOptions(config);
-                var bundleManager = new ExtensionBundleManager(extensionBundleOptions, SystemEnvironment.Instance, loggerFactory);
-                var metadataServiceManager = applicationOptions.RootServiceProvider.GetService<IFunctionMetadataManager>();
-                var languageWorkerOptions = applicationOptions.RootServiceProvider.GetService<IOptionsMonitor<LanguageWorkerOptions>>();
+                // Replace the default environment variables source with a .NET8 back-compat version.
+                for (int i = 0; i < configBuilder.Sources.Count; i++)
+                {
+                    if (configBuilder.Sources[i] is EnvironmentVariablesConfigurationSource)
+                    {
+                        configBuilder.Sources[i] = new ScriptEnvironmentVariablesConfigurationSource(liveEnvironmentLoading: false);
+                    }
+                }
 
-                var locator = new ScriptStartupTypeLocator(applicationOptions.ScriptPath, loggerFactory.CreateLogger<ScriptStartupTypeLocator>(), bundleManager, metadataServiceManager, metricsLogger, languageWorkerOptions);
+                // Pre-build configuration here to load bundles and to store for later validation.
+                IConfigurationRoot config = configBuilder.Build();
+                var environment = applicationOptions.RootServiceProvider.GetService<IEnvironment>();
+                ExtensionBundleOptions extensionBundleOptions = GetExtensionBundleOptions(config, environment);
+                FunctionsHostingConfigOptions configOption = new();
+                FunctionsHostingConfigOptionsSetup optionsSetup = new(config);
+                optionsSetup.Configure(configOption);
+
+                var extensionRequirementOptions = applicationOptions.RootServiceProvider.GetService<IOptions<ExtensionRequirementOptions>>();
+
+                var httpClientFactory = applicationOptions.RootServiceProvider.GetService<IHttpClientFactory>();
+                var bundleManager = new ExtensionBundleManager(extensionBundleOptions, SystemEnvironment.Instance, loggerFactory, configOption, httpClientFactory);
+                var metadataServiceManager = applicationOptions.RootServiceProvider.GetService<IFunctionMetadataManager>();
+                var workerConfigCacheInvalidator = applicationOptions.RootServiceProvider.GetService<WorkerConfigCacheInvalidator>();
+
+                var locator = new ScriptStartupTypeLocator(
+                    applicationOptions.ScriptPath,
+                    loggerFactory.CreateLogger<ScriptStartupTypeLocator>(),
+                    bundleManager,
+                    metadataServiceManager,
+                    metricsLogger,
+                    environment,
+                    extensionRequirementOptions,
+                    workerConfigCacheInvalidator);
 
                 // The locator (and thus the bundle manager) need to be created now in order to configure app configuration.
                 // Store them so they do not need to be re-created later when configuring services.
@@ -157,6 +216,16 @@ namespace Microsoft.Azure.WebJobs.Script
 
             builder.ConfigureServices((context, services) =>
             {
+                if (!SystemEnvironment.Instance.IsPlaceholderModeEnabled())
+                {
+                    // Register all validators here
+                    services.AddSingleton<IFunctionAppValidator, ExtensionBundleManagerValidator>();
+                    services.AddSingleton<IFunctionAppValidator, MissingAzureFunctionsFolderValidator>();
+
+                    // Add more validators as needed
+                    services.AddHostedService<FunctionAppValidationService>();
+                }
+
                 services.AddSingleton<ExternalConfigurationStartupValidator>();
                 services.AddSingleton<IHostedService>(s =>
                 {
@@ -195,6 +264,9 @@ namespace Microsoft.Azure.WebJobs.Script
 
             builder.ConfigureWebJobs((context, webJobsBuilder) =>
             {
+                webJobsBuilder.Services.AddSingleton<IActivitySourceAbstraction>(provider =>
+                  new ActivitySourceWrapper(OpenTelemetryConstants.ActivitySourceNames.WebJobs, OpenTelemetryConstants.WebJobsActivitySourceVersion));
+
                 // Built in binding registrations
                 webJobsBuilder.AddExecutionContextBinding(o =>
                 {
@@ -227,8 +299,7 @@ namespace Microsoft.Azure.WebJobs.Script
                     }
                     catch (Exception ex)
                     {
-                        string appInsightsConnStr = context.Configuration[EnvironmentSettingNames.AppInsightsConnectionString];
-                        RecordAndThrowExternalStartupException("Error configuring services in an external startup class.", ex, loggerFactory, appInsightsConnStr);
+                        RecordAndThrowExternalStartupException("Error configuring services in an external startup class.", ex, loggerFactory);
                     }
                 }
 
@@ -254,9 +325,7 @@ namespace Microsoft.Azure.WebJobs.Script
                         }
                         catch (Exception ex)
                         {
-                            // Go directly to the environment; We have no valid configuration from the customer at this point.
-                            string appInsightsConnStr = Environment.GetEnvironmentVariable(EnvironmentSettingNames.AppInsightsConnectionString);
-                            RecordAndThrowExternalStartupException("Error building configuration in an external startup class.", ex, loggerFactory, appInsightsConnStr);
+                            RecordAndThrowExternalStartupException("Error building configuration in an external startup class.", ex, loggerFactory);
                         }
                     });
                 }
@@ -269,20 +338,9 @@ namespace Microsoft.Azure.WebJobs.Script
                 // Core WebJobs/Script Host services
                 services.AddSingleton<ScriptHost>();
 
-                // HTTP Worker
-                services.AddSingleton<IHttpWorkerProcessFactory, HttpWorkerProcessFactory>();
-                services.AddSingleton<IHttpWorkerChannelFactory, HttpWorkerChannelFactory>();
-                services.AddSingleton<IHttpWorkerService, DefaultHttpWorkerService>();
-                // Rpc Worker
-                services.AddSingleton<IJobHostRpcWorkerChannelManager, JobHostRpcWorkerChannelManager>();
-                services.AddSingleton<IRpcFunctionInvocationDispatcherLoadBalancer, RpcFunctionInvocationDispatcherLoadBalancer>();
-
-                //Worker Function Invocation dispatcher
-                services.AddSingleton<IFunctionInvocationDispatcherFactory, FunctionInvocationDispatcherFactory>();
                 services.AddSingleton<IScriptJobHost>(p => p.GetRequiredService<ScriptHost>());
                 services.AddSingleton<IJobHost>(p => p.GetRequiredService<ScriptHost>());
-                services.AddSingleton<IFunctionProvider, ProxyFunctionProvider>();
-                services.AddSingleton<IHostedService, WorkerConcurrencyManager>();
+                services.TryAddEnumerable(ServiceDescriptor.Singleton<IFunctionProvider, ProxyFunctionProvider>());
 
                 services.AddSingleton<ITypeLocator, ScriptTypeLocator>();
                 services.AddSingleton<ScriptSettingsManager>();
@@ -299,12 +357,11 @@ namespace Microsoft.Azure.WebJobs.Script
                 // Configuration
                 services.AddSingleton<IOptions<ScriptApplicationHostOptions>>(new OptionsWrapper<ScriptApplicationHostOptions>(applicationHostOptions));
                 services.AddSingleton<IOptionsMonitor<ScriptApplicationHostOptions>>(new ScriptApplicationHostOptionsMonitor(applicationHostOptions));
+
                 services.ConfigureOptions<ScriptJobHostOptionsSetup>();
                 services.ConfigureOptions<JobHostFunctionTimeoutOptionsSetup>();
-                // LanguageWorkerOptionsSetup should be registered in WebHostServiceCollection as well to enable starting worker processing in placeholder mode.
-                services.ConfigureOptions<LanguageWorkerOptionsSetup>();
                 services.AddOptions<WorkerConcurrencyOptions>();
-                services.ConfigureOptions<HttpWorkerOptionsSetup>();
+                services.ConfigureOptions<ScriptHostRecycleOptionsSetup>();
                 services.ConfigureOptions<ManagedDependencyOptionsSetup>();
                 services.AddOptions<FunctionResultAggregatorOptions>()
                     .Configure<IConfiguration>((o, c) =>
@@ -314,11 +371,26 @@ namespace Microsoft.Azure.WebJobs.Script
                          .Bind(o);
                     });
                 services.ConfigureOptions<ScaleOptionsSetup>();
+                services.ConfigureOptions<TimerTriggerPlatformOptionsSetup>();
+
+                services.AddOptions<AppCapabilitiesOptions>();
+                services.ConfigureOptions<AppCapabilitiesOptionsSetup>();
+                services.AddSingleton<IValidateOptions<AppCapabilitiesOptions>, AppCapabilitiesOptionsValidator>();
 
                 services.AddSingleton<IFileLoggingStatusManager, FileLoggingStatusManager>();
 
-                if (!applicationHostOptions.HasParentScope)
+                if (applicationHostOptions.HasParentScope)
                 {
+                    // Forward the host LanguageWorkerOptions to the Job Host.
+                    var languageWorkerOptions = applicationHostOptions.RootServiceProvider.GetService<IOptionsMonitor<LanguageWorkerOptions>>();
+                    services.AddSingleton(languageWorkerOptions);
+                    services.AddSingleton<IOptions<LanguageWorkerOptions>>(s => new OptionsWrapper<LanguageWorkerOptions>(languageWorkerOptions.CurrentValue));
+                    services.ConfigureOptions<JobHostLanguageWorkerOptionsSetup>();
+                }
+                else
+                {
+                    services.ConfigureOptions<WorkerConfigurationResolverOptionsSetup>();
+                    services.ConfigureOptions<LanguageWorkerOptionsSetup>();
                     AddCommonServices(services);
                 }
 
@@ -327,9 +399,9 @@ namespace Microsoft.Azure.WebJobs.Script
                     services.AddSingleton<IDistributedLockManager, KubernetesDistributedLockManager>();
                 }
 
-                services.TryAddEnumerable(ServiceDescriptor.Singleton<IHostedService, FunctionInvocationDispatcherShutdownManager>());
-
                 services.AddSingleton<IHostOptionsProvider, HostOptionsProvider>();
+                services.AddSingleton<IInstanceServicesProviderFactory, ScriptInstanceServicesProviderFactory>();
+                services.AddSingleton<IWorkerRuntimeResolver, ScriptHostWorkerRuntimeResolver>();
             });
 
             RegisterFileProvisioningService(builder);
@@ -349,20 +421,13 @@ namespace Microsoft.Azure.WebJobs.Script
             services.TryAddSingleton<IScriptEventManager, ScriptEventManager>();
             services.AddSingleton<IWorkerProfileManager, WorkerProfileManager>();
 
-            // Add Language Worker Service
-            // Need to maintain the order: Add RpcInitializationService before core script host services
-            services.AddManagedHostedService<RpcInitializationService>();
             services.TryAddSingleton<IWorkerConsoleLogSource, WorkerConsoleLogSource>();
-            services.AddSingleton<IWorkerProcessFactory, DefaultWorkerProcessFactory>();
-            services.AddSingleton<IRpcWorkerProcessFactory, RpcWorkerProcessFactory>();
-            services.TryAddSingleton<IWebHostRpcWorkerChannelManager, WebHostRpcWorkerChannelManager>();
+
             services.TryAddSingleton<IDebugManager, DebugManager>();
             services.TryAddSingleton<IDebugStateProvider, DebugStateProvider>();
             services.TryAddSingleton<IEnvironment>(SystemEnvironment.Instance);
             services.TryAddSingleton<HostPerformanceManager>();
             services.ConfigureOptions<HostHealthMonitorOptionsSetup>();
-
-            AddProcessRegistry(services);
         }
 
         public static IHostBuilder SetAzureFunctionsEnvironment(this IHostBuilder builder)
@@ -395,32 +460,87 @@ namespace Microsoft.Azure.WebJobs.Script
             return builder;
         }
 
-        internal static void ConfigureApplicationInsights(HostBuilderContext context, ILoggingBuilder builder)
+        internal static void ConfigureTelemetry(this ILoggingBuilder loggingBuilder, HostBuilderContext context)
         {
-            string appInsightsInstrumentationKey = context.Configuration[EnvironmentSettingNames.AppInsightsInstrumentationKey];
-            string appInsightsConnectionString = context.Configuration[EnvironmentSettingNames.AppInsightsConnectionString];
+            var telemetryMode = GetTelemetryMode(context);
+
+            // Use switch statement so any change to the enum results in a build error if we don't handle it.
+            switch (telemetryMode)
+            {
+                case TelemetryMode.ApplicationInsights:
+                case TelemetryMode.None:
+                    loggingBuilder.ConfigureApplicationInsights(context, telemetryMode);
+                    break;
+
+                case TelemetryMode.OpenTelemetry:
+                    loggingBuilder.ConfigureOpenTelemetry(context, telemetryMode);
+                    break;
+
+                case TelemetryMode.Placeholder:
+                    loggingBuilder.ConfigureApplicationInsights(context, telemetryMode);
+                    loggingBuilder.ConfigureOpenTelemetry(context, telemetryMode);
+                    break;
+
+                default:
+                    throw new NotSupportedException($"Unhandled TelemetryMode: {telemetryMode}");
+            }
+        }
+
+        internal static void ConfigureApplicationInsights(this ILoggingBuilder builder, HostBuilderContext context, TelemetryMode telemetryMode)
+        {
+            string appInsightsInstrumentationKey = GetConfigurationValue(EnvironmentSettingNames.AppInsightsInstrumentationKey, context.Configuration);
+            string appInsightsConnectionString = GetConfigurationValue(EnvironmentSettingNames.AppInsightsConnectionString, context.Configuration);
 
             // Initializing AppInsights services during placeholder mode as well to avoid the cost of JITting these objects during specialization
-            if (!string.IsNullOrEmpty(appInsightsInstrumentationKey) || !string.IsNullOrEmpty(appInsightsConnectionString) || SystemEnvironment.Instance.IsPlaceholderModeEnabled())
+            if (!string.IsNullOrEmpty(appInsightsInstrumentationKey) || !string.IsNullOrEmpty(appInsightsConnectionString) || telemetryMode == TelemetryMode.Placeholder)
             {
-                builder.AddApplicationInsightsWebJobs(o =>
-                {
-                    o.InstrumentationKey = appInsightsInstrumentationKey;
-                    o.ConnectionString = appInsightsConnectionString;
-                }, t =>
-                {
-                    if (t.TelemetryChannel is ServerTelemetryChannel channel)
+                string eventLogLevel = GetConfigurationValue(EnvironmentSettingNames.AppInsightsEventListenerLogLevel, context.Configuration);
+                string authString = GetConfigurationValue(EnvironmentSettingNames.AppInsightsAuthenticationString, context.Configuration);
+                // Initialize ScriptTelemetryInitializer before any other telemetry initializers.
+                // This will allow HostInstanceId to be removed as part of MetricsCustomDimensionOptimization.
+                builder.Services.AddSingleton<ITelemetryInitializer, ScriptTelemetryInitializer>();
+                builder.AddApplicationInsightsWebJobs(
+                    o =>
                     {
-                        channel.TransmissionStatusEvent += TransmissionStatusHandler.Handler;
-                    }
+                        o.InstrumentationKey = appInsightsInstrumentationKey;
+                        o.ConnectionString = appInsightsConnectionString;
 
-                    t.TelemetryProcessorChainBuilder.Use(next => new WorkerTraceFilterTelemetryProcessor(next));
-                    t.TelemetryProcessorChainBuilder.Use(next => new ScriptTelemetryProcessor(next));
-                });
+                        if (!string.IsNullOrEmpty(eventLogLevel))
+                        {
+                            if (Enum.TryParse(eventLogLevel, ignoreCase: true, out EventLevel level))
+                            {
+                                o.DiagnosticsEventListenerLogLevel = level;
+                            }
+                            else
+                            {
+                                throw new InvalidEnumArgumentException($"Invalid `{EnvironmentSettingNames.AppInsightsEventListenerLogLevel}`.");
+                            }
+                        }
+                        if (!string.IsNullOrEmpty(authString))
+                        {
+                            o.TokenCredentialOptions = TokenCredentialOptions.ParseAuthenticationString(authString);
+                        }
+                    },
+                    t =>
+                    {
+                        if (t.TelemetryChannel is ServerTelemetryChannel channel)
+                        {
+                            channel.TransmissionStatusEvent += TransmissionStatusHandler.Handler;
+                        }
+
+                        t.TelemetryProcessorChainBuilder.Use(next => new WorkerTraceFilterTelemetryProcessor(next));
+                        t.TelemetryProcessorChainBuilder.Use(next => new ScriptTelemetryProcessor(next));
+                    });
 
                 builder.Services.ConfigureOptions<ApplicationInsightsLoggerOptionsSetup>();
                 builder.Services.AddSingleton<ISdkVersionProvider, FunctionsSdkVersionProvider>();
-                builder.Services.AddSingleton<ITelemetryInitializer, ScriptTelemetryInitializer>();
+
+                // Configure the meter listener, so we publish Meter API based metrics to application insights.
+                builder.Services.AddSingleton<ITelemetryModule, ApplicationInsightsMetricExporter>();
+                builder.Services.Configure<ApplicationInsightsMetricExporterOptions>(o =>
+                {
+                    o.Meters.Add(HostMetrics.FaasMeterName);
+                });
 
                 if (SystemEnvironment.Instance.IsPlaceholderModeEnabled())
                 {
@@ -434,10 +554,10 @@ namespace Microsoft.Azure.WebJobs.Script
             }
         }
 
-        internal static ExtensionBundleOptions GetExtensionBundleOptions(IConfiguration configuration)
+        internal static ExtensionBundleOptions GetExtensionBundleOptions(IConfiguration configuration, IEnvironment environment)
         {
             var options = new ExtensionBundleOptions();
-            var optionsSetup = new ExtensionBundleConfigurationHelper(configuration, SystemEnvironment.Instance);
+            var optionsSetup = new ExtensionBundleConfigurationHelper(configuration, environment);
             configuration.Bind(options);
             optionsSetup.Configure(options);
             return options;
@@ -445,27 +565,13 @@ namespace Microsoft.Azure.WebJobs.Script
 
         private static void RegisterFileProvisioningService(IHostBuilder builder)
         {
-            if (string.Equals(Environment.GetEnvironmentVariable(RpcWorkerConstants.FunctionWorkerRuntimeSettingName), "powershell"))
+            if (string.Equals(Environment.GetEnvironmentVariable(EnvironmentSettingNames.FunctionWorkerRuntime), "powershell"))
             {
                 builder.ConfigureServices(services =>
                 {
                     services.AddSingleton<IFuncAppFileProvisionerFactory, FuncAppFileProvisionerFactory>();
                     services.AddSingleton<IHostedService, FuncAppFileProvisioningService>();
                 });
-            }
-        }
-
-        private static void AddProcessRegistry(IServiceCollection services)
-        {
-            // W3WP already manages job objects
-            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
-                && !ScriptSettingsManager.Instance.IsAppServiceEnvironment)
-            {
-                services.AddSingleton<IProcessRegistry, JobObjectRegistry>();
-            }
-            else
-            {
-                services.AddSingleton<IProcessRegistry, EmptyProcessRegistry>();
             }
         }
 
@@ -497,31 +603,49 @@ namespace Microsoft.Azure.WebJobs.Script
             }
         }
 
-        private static void RecordAndThrowExternalStartupException(string message, Exception ex, ILoggerFactory loggerFactory, string appInsightsConnStr)
+        private static void RecordAndThrowExternalStartupException(string message, Exception ex, ILoggerFactory loggerFactory)
         {
             var startupEx = new ExternalStartupException(message, ex);
 
             var logger = loggerFactory.CreateLogger(LogCategories.Startup);
             logger.LogDiagnosticEventError(DiagnosticEventConstants.ExternalStartupErrorCode, message, DiagnosticEventConstants.ExternalStartupErrorHelpLink, startupEx);
+            throw startupEx;
+        }
 
-            // Send the error to App Insights if possible. This is happening during ScriptHost construction so we
-            // have no existing TelemetryClient to use. Create a one-off client and flush it ASAP.
-            if (appInsightsConnStr is not null)
+        private static string GetConfigurationValue(string key, IConfiguration configuration = null)
+        {
+            if (configuration != null && configuration[key] is string configValue)
             {
-                using TelemetryConfiguration telemetryConfiguration = new()
-                {
-                    ConnectionString = appInsightsConnStr,
-                    TelemetryChannel = new InMemoryChannel()
-                };
+                return configValue;
+            }
+            else if (Environment.GetEnvironmentVariable(key) is string envValue)
+            {
+                return envValue;
+            }
+            else
+            {
+                return null;
+            }
+        }
 
-                TelemetryClient telemetryClient = new(telemetryConfiguration);
-                telemetryClient.Context.GetInternalContext().SdkVersion = new ApplicationInsightsSdkVersionProvider().GetSdkVersion();
-                telemetryClient.TrackTrace(startupEx.ToString(), SeverityLevel.Error);
-                telemetryClient.TrackException(startupEx);
-                telemetryClient.Flush();
+        private static TelemetryMode GetTelemetryMode(HostBuilderContext context)
+        {
+            var telemetryModeSection = context.Configuration.GetSection(ConfigurationPath.Combine(ConfigurationSectionNames.JobHost, ConfigurationSectionNames.TelemetryMode));
+
+            if (telemetryModeSection.Exists())
+            {
+                if (Enum.TryParse(telemetryModeSection.Value, true, out TelemetryMode telemetryMode))
+                {
+                    return telemetryMode;
+                }
+
+                throw new InvalidEnumArgumentException($"Invalid TelemetryMode: `{telemetryModeSection.Value}`.");
             }
 
-            throw startupEx;
+            // Initialize AppInsights SDK and OTel services during placeholder mode to avoid JIT cost during specialization.
+            return SystemEnvironment.Instance.IsPlaceholderModeEnabled()
+                ? TelemetryMode.Placeholder
+                : TelemetryMode.ApplicationInsights;
         }
     }
 }

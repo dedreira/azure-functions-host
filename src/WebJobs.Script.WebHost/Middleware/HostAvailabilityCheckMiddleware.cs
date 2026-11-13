@@ -29,7 +29,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Middleware
         {
             if (_scriptHostManager.State != ScriptHostState.Offline)
             {
-                if (!_scriptHostManager.CanInvoke())
+                if (!_scriptHostManager.HostIsInitialized())
                 {
                     // If we're not ready, take the slower/more expensive route and await being ready
                     return InvokeAwaitingHost(httpContext, _next, _logger, _scriptHostManager);
@@ -54,7 +54,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Middleware
             {
                 Logger.InitiatingHostAvailabilityCheck(logger);
 
-                bool hostReady = await scriptHostManager.DelayUntilHostReady();
+                bool hostReady = await scriptHostManager.DelayUntilHostReadyAsync();
                 if (!hostReady)
                 {
                     Logger.HostUnavailableAfterCheck(logger);

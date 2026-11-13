@@ -7,19 +7,21 @@ using System.Threading.Tasks;
 using System.Threading.Tasks.Dataflow;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace Microsoft.Azure.WebJobs.Script.Workers
 {
     internal class WorkerConsoleLogService : IHostedService, IDisposable
     {
         private readonly ILogger _logger;
-        private readonly Lazy<ILogger> _toolingConsoleJsonLoggerLazy;
+        private readonly ScriptApplicationHostOptions _options;
         private readonly IWorkerConsoleLogSource _source;
         private readonly CancellationTokenSource _cts = new CancellationTokenSource();
         private Task _processingTask;
         private bool _disposed = false;
 
-        public WorkerConsoleLogService(ILoggerFactory loggerFactory, IWorkerConsoleLogSource consoleLogSource)
+        public WorkerConsoleLogService(ILoggerFactory loggerFactory, IWorkerConsoleLogSource consoleLogSource,
+            IOptions<ScriptApplicationHostOptions> options)
         {
             if (loggerFactory == null)
             {
@@ -28,19 +30,23 @@ namespace Microsoft.Azure.WebJobs.Script.Workers
 
             _source = consoleLogSource ?? throw new ArgumentNullException(nameof(consoleLogSource));
             _logger = loggerFactory.CreateLogger(WorkerConstants.ConsoleLogCategoryName);
-            _toolingConsoleJsonLoggerLazy = new Lazy<ILogger>(() => loggerFactory.CreateLogger(WorkerConstants.ToolingConsoleLogCategoryName), isThreadSafe: true);
+            _options = options.Value;
         }
 
-        internal WorkerConsoleLogService(ILogger logger, Lazy<ILogger> toolingConsoleJsonLoggerLazy, IWorkerConsoleLogSource consoleLogSource)
+        internal WorkerConsoleLogService(ILogger logger, IWorkerConsoleLogSource consoleLogSource)
         {
             _source = consoleLogSource ?? throw new ArgumentNullException(nameof(consoleLogSource));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-            _toolingConsoleJsonLoggerLazy = toolingConsoleJsonLoggerLazy ?? throw new ArgumentNullException(nameof(toolingConsoleJsonLoggerLazy));
         }
 
         public Task StartAsync(CancellationToken cancellationToken)
         {
-            _processingTask = ProcessLogs();
+            // Don't start processing logs if this is a standby configuration. This can lead
+            // to placeholder loggers capturing user logs during specialization.
+            if (!_options.IsStandbyConfiguration)
+            {
+                _processingTask = ProcessLogs();
+            }
             return Task.CompletedTask;
         }
 
@@ -62,16 +68,7 @@ namespace Microsoft.Azure.WebJobs.Script.Workers
                 while (await source.OutputAvailableAsync(_cts.Token))
                 {
                     var consoleLog = await source.ReceiveAsync();
-
-                    if (WorkerProcessUtilities.IsToolingConsoleJsonLogEntry(consoleLog))
-                    {
-                        // log with the message prefix as coretools expects it.
-                        _toolingConsoleJsonLoggerLazy.Value.Log(consoleLog.Level, consoleLog.Message);
-                    }
-                    else
-                    {
-                        _logger.Log(consoleLog.Level, consoleLog.Message);
-                    }
+                    _logger.Log(consoleLog.Level, consoleLog.Message);
                 }
             }
             catch (OperationCanceledException)

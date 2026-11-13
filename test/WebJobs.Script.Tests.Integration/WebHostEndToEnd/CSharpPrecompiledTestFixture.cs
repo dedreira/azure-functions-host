@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Threading.Tasks;
 
@@ -6,11 +6,12 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.WebHostEndToEnd
 {
     public class CSharpPrecompiledEndToEndTestFixture : EndToEndTestFixture
     {
-        private const string TestPathTemplate = "..\\..\\..\\..\\CSharpPrecompiledTestProjects\\{0}\\bin\\Debug\\netcoreapp3.1";
+        private const string TestPathTemplate = "..\\..\\{0}\\{1}";
+
         private readonly IDisposable _dispose;
 
         public CSharpPrecompiledEndToEndTestFixture(string testProjectName, IDictionary<string, string> envVars = null, string functionWorkerRuntime = "dotnet")
-            : base(string.Format(TestPathTemplate, testProjectName), testProjectName, functionWorkerRuntime)
+            : base(string.Format(TestPathTemplate, testProjectName, TestHelpers.BuildConfig), testProjectName, functionWorkerRuntime)
         {
             if (envVars != null)
             {
@@ -23,10 +24,11 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.WebHostEndToEnd
             return Task.CompletedTask;
         }
 
-        public override Task DisposeAsync()
+        public override async Task DisposeAsync()
         {
             _dispose?.Dispose();
-            return base.DisposeAsync();
+
+            await base.DisposeAsync();
         }
     }
 }

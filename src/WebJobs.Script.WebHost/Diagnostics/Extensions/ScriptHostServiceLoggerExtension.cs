@@ -1,9 +1,9 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
-using Microsoft.ApplicationInsights.AspNetCore;
-using Microsoft.Azure.Documents;
+using System.Collections.Generic;
+using System.Text.Json;
 using Microsoft.Extensions.Logging;
 
 namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics.Extensions
@@ -126,11 +126,11 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics.Extensions
                 new EventId(518, nameof(ActiveHostChanging)),
                 "Active host changing from '{oldHostInstanceId}' to '{newHostInstanceId}'.");
 
-        private static readonly Action<ILogger, Exception> _enteringRestart =
-            LoggerMessage.Define(
+        private static readonly Action<ILogger, string, Exception> _enteringRestart =
+            LoggerMessage.Define<string>(
                 LogLevel.Debug,
                 new EventId(519, nameof(EnteringRestart)),
-                "Restart requested.");
+                "Restart requested. Reason '{restartReason}'");
 
         private static readonly Action<ILogger, Exception> _restartBeforeStart =
             LoggerMessage.Define(
@@ -150,7 +150,17 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics.Extensions
                 new EventId(522, nameof(CancelingStartupOperationForRestart)),
                 "Canceling startup operation '{operationId}' to unblock restart.");
 
-        // EventId 523 and 524 are defined in ScriptHostStartupOperation.
+        private static readonly Action<ILogger, Guid, Guid?, Exception> _startupOperationCreated =
+            LoggerMessage.Define<Guid, Guid?>(
+                LogLevel.Debug,
+                new EventId(524, nameof(StartupOperationCreated)),
+                "Startup operation '{operationId}' with parent id '{parentOperationId}' created.");
+
+        private static readonly Action<ILogger, Guid, Exception> _startupOperationCompleted =
+            LoggerMessage.Define<Guid>(
+                LogLevel.Debug,
+                new EventId(523, nameof(StartupOperationCompleted)),
+                "Startup operation '{operationId}' completed.");
 
         private static readonly Action<ILogger, Guid, string, Exception> _startupOperationStartingHost =
             LoggerMessage.Define<Guid, string>(
@@ -164,23 +174,31 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics.Extensions
                 new EventId(526, nameof(ScriptHostServiceInitCanceledByRuntime)),
                 "Restart cancellation requested by runtime.");
 
-        private static readonly Action<ILogger, string, string, string, string, Exception> _executingHttpRequest =
-            LoggerMessage.Define<string, string, string, string>(
+        private static readonly Action<ILogger, string, string, Exception> _executingHttpRequest =
+            LoggerMessage.Define<string, string>(
                 LogLevel.Information,
                 new EventId(527, nameof(ExecutingHttpRequest)),
                 Properties.Resources.ExecutingHttpRequest);
 
-        private static readonly Action<ILogger, string, string, int, long, Exception> _executedHttpRequest =
-            LoggerMessage.Define<string, string, int, long>(
-                LogLevel.Information,
-                new EventId(528, nameof(ExecutedHttpRequest)),
-                Properties.Resources.ExecutedHttpRequest);
+        private static readonly EventId _executedHttpRequestEventId = new(528, nameof(ExecutedHttpRequest));
 
         private static readonly Action<ILogger, string, string, Exception> _hostStateChanged =
             LoggerMessage.Define<string, string>(
                 LogLevel.Debug,
                 new EventId(529, nameof(HostStateChanged)),
                 "Host state changed from {previousState} to {newState}.");
+
+        private static readonly Action<ILogger, string, Exception> _logHostInitializationSettings =
+            LoggerMessage.Define<string>(
+                LogLevel.Debug,
+                new EventId(530, nameof(LogHostInitializationSettings)),
+                "{hostInitializationSettings}");
+
+        private static readonly Action<ILogger, string, Exception> _requestAborted =
+            LoggerMessage.Define<string>(
+                LogLevel.Debug,
+                new EventId(531, nameof(RequestAborted)),
+                "The request was aborted by the client (requestId: '{mS_ActivityId}').");
 
         public static void HostStateChanged(this ILogger logger, ScriptHostState previousHostState, ScriptHostState newHostState)
         {
@@ -189,14 +207,36 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics.Extensions
             _hostStateChanged(logger, previousState, newState, null);
         }
 
-        public static void ExecutingHttpRequest(this ILogger logger, string mS_ActivityId, string httpMethod, string userAgent, string uri)
+        public static void ExecutingHttpRequest(this ILogger logger, string mS_ActivityId, string httpMethod)
         {
-            _executingHttpRequest(logger, mS_ActivityId, httpMethod, userAgent, uri, null);
+            _executingHttpRequest(logger, mS_ActivityId, httpMethod, null);
         }
 
-        public static void ExecutedHttpRequest(this ILogger logger, string mS_ActivityId, string identities, int statusCode, long duration)
+        /// <summary>
+        /// Logs request completion with a JSON-encoded message and the original structured property values.
+        /// </summary>
+        /// <param name="logger">The request logger.</param>
+        /// <param name="mS_ActivityId">The request correlation identifier.</param>
+        /// <param name="identities">The authenticated identities.</param>
+        /// <param name="statusCode">The response status code.</param>
+        /// <param name="duration">The request duration in milliseconds.</param>
+        /// <param name="route">The matched route template.</param>
+        public static void ExecutedHttpRequest(this ILogger logger, string mS_ActivityId, string identities, int statusCode, long duration, string route)
         {
-            _executedHttpRequest(logger, mS_ActivityId, identities, statusCode, duration, null);
+            if (logger.IsEnabled(LogLevel.Information))
+            {
+                logger.Log(
+                    LogLevel.Information,
+                    _executedHttpRequestEventId,
+                    new ExecutedHttpRequestLogState(mS_ActivityId, identities, statusCode, duration, route),
+                    null,
+                    static (state, _) => state.ToString());
+            }
+        }
+
+        public static void RequestAborted(this ILogger logger, string mS_ActivityId)
+        {
+            _requestAborted(logger, mS_ActivityId, null);
         }
 
         public static void ScriptHostServiceInitCanceledByRuntime(this ILogger logger)
@@ -294,9 +334,9 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics.Extensions
             _activeHostChanging(logger, oldHostInstanceId, newHostInstanceId, null);
         }
 
-        public static void EnteringRestart(this ILogger logger)
+        public static void EnteringRestart(this ILogger logger, string reason)
         {
-            _enteringRestart(logger, null);
+            _enteringRestart(logger, reason, null);
         }
 
         public static void RestartBeforeStart(this ILogger logger)
@@ -314,6 +354,16 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics.Extensions
             _cancelingStartupOperationForRestart(logger, operationId, null);
         }
 
+        public static void StartupOperationCreated(this ILogger logger, Guid operationId, Guid? parentOperationId)
+        {
+            _startupOperationCreated(logger, operationId, parentOperationId, null);
+        }
+
+        public static void StartupOperationCompleted(this ILogger logger, Guid operationId)
+        {
+            _startupOperationCompleted(logger, operationId, null);
+        }
+
         public static void StartupOperationStartingHost(this ILogger logger, Guid operationId, string hostInstanceId)
         {
             _startupOperationStartingHost(logger, operationId, hostInstanceId, null);
@@ -322,6 +372,38 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics.Extensions
         public static void ScriptHostServiceRestartCanceledByRuntime(this ILogger logger)
         {
             _scriptHostServiceRestartCanceledByRuntime(logger, null);
+        }
+
+        public static void LogHostInitializationSettings(this ILogger logger, string originalFunctionWorkerRuntime, string functionWorkerRuntime,
+            string originalFunctionWorkerRuntimeVersion, string functionsWorkerRuntimeVersion, string functionExtensionVersion, string hostDirectory,
+            bool inStandbyMode, bool hasBeenSpecialized, bool usePlaceholderDotNetIsolated, string websiteSku, string featureFlags,
+            IDictionary<string, string> hostingConfig, string hisMode, bool adminIsolationEnabled, string functionsSiteUpdateId)
+        {
+            // This is a dump of values for telemetry right now, but eventually we will refactor this
+            // into a proper Options object
+            var initializationSettings = new
+            {
+                OriginalFunctionWorkerRuntime = originalFunctionWorkerRuntime,
+                FunctionsWorkerRuntime = functionWorkerRuntime,
+                OriginalFunctionWorkerRuntimeVersion = originalFunctionWorkerRuntimeVersion,
+                FunctionsWorkerRuntimeVersion = functionsWorkerRuntimeVersion,
+                FunctionsExtensionVesion = functionExtensionVersion,
+                HostDirectory = hostDirectory,
+                InStandbyMode = inStandbyMode,
+                HasBeenSpecialized = hasBeenSpecialized,
+                UsePlaceholderDotNetIsolated = usePlaceholderDotNetIsolated,
+                WebSiteSku = websiteSku,
+                FeatureFlags = featureFlags,
+                HostingConfig = hostingConfig,
+                HISMode = hisMode,
+                AdminIsolationEnabled = adminIsolationEnabled,
+                FunctionsSiteUpdateId = functionsSiteUpdateId
+            };
+
+            var options = new JsonSerializerOptions { WriteIndented = true };
+            string settingsJson = JsonSerializer.Serialize(initializationSettings, options);
+
+            _logHostInitializationSettings(logger, settingsJson, null);
         }
     }
 }

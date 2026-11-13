@@ -1,8 +1,9 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
 using System.Collections.Generic;
+using System.Collections.Immutable;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.Globalization;
@@ -13,7 +14,6 @@ using System.Reflection;
 using System.Reflection.Emit;
 using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.AspNetCore.Hosting;
 using Microsoft.Azure.WebJobs.Host;
 using Microsoft.Azure.WebJobs.Host.Executors;
 using Microsoft.Azure.WebJobs.Host.Indexers;
@@ -25,13 +25,15 @@ using Microsoft.Azure.WebJobs.Script.Configuration;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.Diagnostics.Extensions;
+using Microsoft.Azure.WebJobs.Script.Diagnostics.OpenTelemetry;
 using Microsoft.Azure.WebJobs.Script.Eventing;
 using Microsoft.Azure.WebJobs.Script.Extensibility;
 using Microsoft.Azure.WebJobs.Script.ExtensionBundle;
+using Microsoft.Azure.WebJobs.Script.Host;
 using Microsoft.Azure.WebJobs.Script.Workers;
-using Microsoft.Azure.WebJobs.Script.Workers.Http;
 using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using FunctionMetadata = Microsoft.Azure.WebJobs.Script.Description.FunctionMetadata;
@@ -44,7 +46,7 @@ namespace Microsoft.Azure.WebJobs.Script
         private const string HostAssemblyName = "ScriptHost";
         private const string GeneratedTypeNamespace = "Host";
         internal const string GeneratedTypeName = "Functions";
-        private readonly IApplicationLifetime _applicationLifetime;
+        private readonly IScriptApplicationLifetime _applicationLifetime;
         private readonly IScriptHostManager _scriptHostManager;
         private readonly IDistributedLockManager _distributedLockManager;
         private readonly IFunctionMetadataManager _functionMetadataManager;
@@ -54,8 +56,6 @@ namespace Microsoft.Azure.WebJobs.Script
         private readonly IMetricsLogger _metricsLogger = null;
         private readonly string _hostLogPath;
         private readonly IOptions<JobHostOptions> _hostOptions;
-        private readonly bool _isHttpWorker;
-        private readonly HttpWorkerOptions _httpWorkerOptions;
         private readonly IConfiguration _configuration;
         private readonly ScriptTypeLocator _typeLocator;
         private readonly IDebugStateProvider _debugManager;
@@ -66,11 +66,15 @@ namespace Microsoft.Azure.WebJobs.Script
         private readonly string _instanceId;
         private readonly IEnvironment _environment;
         private readonly IFunctionDataCache _functionDataCache;
+        private readonly IOptions<FunctionsHostingConfigOptions> _hostingConfigOptions;
+        private readonly IWorkerFunctionDescriptorProviderFactory _descriptorProviderFactory;
+        private readonly IScriptHostLifecycleService _scriptHostLifecycleService;
+        private readonly IOptions<FunctionMetadataOptions> _metadataOptions;
         private readonly IOptionsMonitor<LanguageWorkerOptions> _languageWorkerOptions;
         private readonly ILogger _logger;
         private readonly IPrimaryHostStateProvider _primaryHostStateProvider;
         private readonly IList<IDisposable> _eventSubscriptions = new List<IDisposable>();
-        private readonly IFunctionInvocationDispatcher _functionDispatcher;
+        private readonly IWorkerRuntimeResolver _workerRuntimeResolver;
         private static readonly int _processId = Process.GetCurrentProcess().Id;
         public static readonly string Version = GetAssemblyFileVersion(typeof(ScriptHost).Assembly);
 
@@ -82,14 +86,12 @@ namespace Microsoft.Azure.WebJobs.Script
         // Map from BindingType to the Assembly Qualified Type name for its IExtensionConfigProvider object.
 
         public ScriptHost(IOptions<JobHostOptions> options,
-            IOptions<HttpWorkerOptions> httpWorkerOptions,
             IEnvironment environment,
             IJobHostContextFactory jobHostContextFactory,
             IConfiguration configuration,
             IDistributedLockManager distributedLockManager,
             IScriptEventManager eventManager,
             ILoggerFactory loggerFactory,
-            IFunctionInvocationDispatcherFactory functionDispatcherFactory,
             IFunctionMetadataManager functionMetadataManager,
             IFileLoggingStatusManager fileLoggingStatusManager,
             IMetricsLogger metricsLogger,
@@ -102,13 +104,20 @@ namespace Microsoft.Azure.WebJobs.Script
             IJobHostMetadataProvider metadataProvider,
             IHostIdProvider hostIdProvider,
             IHttpRoutesManager httpRoutesManager,
-            IApplicationLifetime applicationLifetime,
+            IScriptApplicationLifetime applicationLifetime,
             IExtensionBundleManager extensionBundleManager,
             IFunctionDataCache functionDataCache,
             IOptionsMonitor<LanguageWorkerOptions> languageWorkerOptions,
+            IOptions<FunctionsHostingConfigOptions> hostingConfigOptions,
+            IWorkerFunctionDescriptorProviderFactory descriptorProviderFactory,
+            IScriptHostLifecycleService scriptHostLifecycleService,
+            IOptions<FunctionMetadataOptions> metadataOptions,
+            IWorkerRuntimeResolver workerRuntimeResolver,
             ScriptSettingsManager settingsManager = null)
             : base(options, jobHostContextFactory)
         {
+            ArgumentNullException.ThrowIfNull(workerRuntimeResolver);
+
             _environment = environment;
             _typeLocator = typeLocator as ScriptTypeLocator
                 ?? throw new ArgumentException(nameof(typeLocator), $"A {nameof(ScriptTypeLocator)} instance is required.");
@@ -122,15 +131,13 @@ namespace Microsoft.Azure.WebJobs.Script
             _applicationLifetime = applicationLifetime;
             _hostIdProvider = hostIdProvider;
             _httpRoutesManager = httpRoutesManager;
-            _isHttpWorker = httpWorkerOptions.Value.Description != null;
-            _httpWorkerOptions = httpWorkerOptions.Value;
             ScriptOptions = scriptHostOptions.Value;
             _scriptHostManager = scriptHostManager;
             FunctionErrors = new Dictionary<string, ICollection<string>>(StringComparer.OrdinalIgnoreCase);
             EventManager = eventManager;
-            _functionDispatcher = functionDispatcherFactory.GetFunctionDispatcher();
             _settingsManager = settingsManager ?? ScriptSettingsManager.Instance;
             ExtensionBundleManager = extensionBundleManager;
+            _workerRuntimeResolver = workerRuntimeResolver;
 
             _metricsLogger = metricsLogger;
 
@@ -153,6 +160,10 @@ namespace Microsoft.Azure.WebJobs.Script
                 }));
 
             _functionDataCache = functionDataCache;
+            _hostingConfigOptions = hostingConfigOptions;
+            _descriptorProviderFactory = descriptorProviderFactory;
+            _scriptHostLifecycleService = scriptHostLifecycleService;
+            _metadataOptions = metadataOptions;
         }
 
         public event EventHandler HostInitializing;
@@ -174,6 +185,8 @@ namespace Microsoft.Azure.WebJobs.Script
         public ScriptJobHostOptions ScriptOptions { get; private set; }
 
         public static bool IsFunctionDataCacheEnabled { get; set; }
+
+        public static bool WorkerOpenTelemetryEnabled { get; internal set; }
 
         /// <summary>
         /// Gets the collection of all valid Functions. For functions that are in error
@@ -210,8 +223,6 @@ namespace Microsoft.Azure.WebJobs.Script
         /// Gets a value indicating whether the host is in diagnostic mode.
         /// </summary>
         public virtual bool InDiagnosticMode => _debugManager.InDiagnosticMode;
-
-        internal IFunctionInvocationDispatcher FunctionDispatcher => _functionDispatcher;
 
         /// <summary>
         /// Returns true if the specified name is the name of a known function,
@@ -278,13 +289,22 @@ namespace Microsoft.Azure.WebJobs.Script
                 // Generate Functions
                 IEnumerable<FunctionMetadata> functionMetadataList = GetFunctionsMetadata();
 
-                string workerRuntime = _environment.GetEnvironmentVariable(EnvironmentSettingNames.FunctionWorkerRuntime);
-                _logger.FunctionsWorkerRuntimeValue(workerRuntime);
-
-                if (workerRuntime is null)
+                string workerRuntime;
+                if (_metadataOptions.Value.UseWorkerRuntimeFromMetadata)
                 {
                     workerRuntime = Utility.GetWorkerRuntime(functionMetadataList);
-                    _logger.ResolvedWorkerRuntimeFromMetadata(workerRuntime);
+                    _logger.ResolvedWorkerRuntimeFromMetadata(Sanitizer.Sanitize(workerRuntime));
+                }
+                else
+                {
+                    workerRuntime = _workerRuntimeResolver.GetWorkerRuntime();
+                    _logger.FunctionsWorkerRuntimeValue(Sanitizer.Sanitize(workerRuntime));
+
+                    if (workerRuntime is null)
+                    {
+                        workerRuntime = Utility.GetWorkerRuntime(functionMetadataList);
+                        _logger.ResolvedWorkerRuntimeFromMetadata(Sanitizer.Sanitize(workerRuntime));
+                    }
                 }
 
                 if (!_environment.IsPlaceholderModeEnabled())
@@ -314,7 +334,8 @@ namespace Microsoft.Azure.WebJobs.Script
                 await InitializeFunctionDescriptorsAsync(functionMetadataList, workerRuntime, cancellationToken);
 
                 var filteredFunctionMetadata = functionMetadataList.Where(m => m.IsProxy() || !Utility.IsCodelessDotNetLanguageFunction(m));
-                await _functionDispatcher.InitializeAsync(Utility.GetValidFunctions(filteredFunctionMetadata, Functions), cancellationToken);
+
+                await _scriptHostLifecycleService.InitializedAsync(Utility.GetValidFunctions(filteredFunctionMetadata, Functions), cancellationToken);
 
                 GenerateFunctions();
                 ScheduleFileSystemCleanup();
@@ -367,13 +388,10 @@ namespace Microsoft.Azure.WebJobs.Script
         /// <returns>A metadata collection of functions and proxies configured.</returns>
         private IEnumerable<FunctionMetadata> GetFunctionsMetadata()
         {
-            IEnumerable<FunctionMetadata> functionMetadata;
-
-            functionMetadata = _functionMetadataManager.GetFunctionMetadata(forceRefresh: false, workerConfigs: _languageWorkerOptions.CurrentValue.WorkerConfigs);
-
+            ImmutableArray<FunctionMetadata> functionMetadata = _functionMetadataManager.GetFunctionMetadata(forceRefresh: false);
             foreach (var error in _functionMetadataManager.Errors)
             {
-                FunctionErrors.Add(error.Key, error.Value.ToArray());
+                FunctionErrors.Add(error.Key, error.Value);
             }
 
             return functionMetadata;
@@ -403,11 +421,9 @@ namespace Microsoft.Azure.WebJobs.Script
             return customAttributes;
         }
 
-        // TODO: DI (FACAVAL) Remove this method.
-        // all restart/shutdown requests should go through the
-        internal Task RestartAsync()
+        internal Task RestartAsync(string reason)
         {
-            _scriptHostManager.RestartHostAsync();
+            _scriptHostManager.RestartHostAsync(reason);
             return Task.CompletedTask;
         }
 
@@ -443,6 +459,11 @@ namespace Microsoft.Azure.WebJobs.Script
                 }
             }
 
+            if (!_metadataOptions.Value.UseWorkerRuntimeFromMetadata)
+            {
+                ValidateFunctionsWorkerRuntime(_workerRuntimeResolver, _hostingConfigOptions, _logger);
+            }
+
             // Log whether App Insights is enabled
             if (!string.IsNullOrEmpty(_settingsManager.ApplicationInsightsInstrumentationKey) || !string.IsNullOrEmpty(_settingsManager.ApplicationInsightsConnectionString))
             {
@@ -453,7 +474,43 @@ namespace Microsoft.Azure.WebJobs.Script
                 _metricsLogger.LogEvent(MetricEventNames.ApplicationInsightsDisabled);
             }
 
+            if (ScriptOptions.TelemetryMode.Equals(TelemetryMode.OpenTelemetry))
+            {
+                if (!string.IsNullOrEmpty(_settingsManager.OtlpEndpoint))
+                {
+                    _metricsLogger.LogEvent(MetricEventNames.OpenTelemetryOtlpEnabled);
+                }
+                if (!string.IsNullOrEmpty(_settingsManager.ApplicationInsightsConnectionString))
+                {
+                    _metricsLogger.LogEvent(MetricEventNames.OpenTelemetryAzMonEnabled);
+                }
+            }
+
+            // Log Azure Monitor diagnostic logging usage. Only an explicit category subscription
+            // counts: an unset variable defaults to enabled and is not a usage signal.
+            if (_environment.IsAzureMonitorExplicitlyEnabled())
+            {
+                _metricsLogger.LogEvent(MetricEventNames.AzureMonitorEnabled);
+            }
+
             InitializeFileSystem();
+        }
+
+        internal static void ValidateFunctionsWorkerRuntime(IWorkerRuntimeResolver workerRuntimeResolver, IOptions<FunctionsHostingConfigOptions> hostingConfigOptions, ILogger logger)
+        {
+            if (string.IsNullOrEmpty(workerRuntimeResolver.GetWorkerRuntime()))
+            {
+                string baseMessage = $"The '{EnvironmentSettingNames.FunctionWorkerRuntime}' setting is required. Please specify a valid value. See {DiagnosticEventConstants.MissingFunctionsWorkerRuntimeHelpLink} for more information.";
+
+                if (hostingConfigOptions.Value.ThrowOnMissingFunctionsWorkerRuntime)
+                {
+                    logger.LogDiagnosticEventError(DiagnosticEventConstants.MissingFunctionsWorkerRuntimeErrorCode, baseMessage, DiagnosticEventConstants.MissingFunctionsWorkerRuntimeHelpLink, null);
+                    throw new HostInitializationException(baseMessage);
+                }
+
+                string warningMessage = baseMessage + " The application will continue to run, but may throw an exception in a future release.";
+                logger.LogDiagnosticEventWarning(DiagnosticEventConstants.MissingFunctionsWorkerRuntimeErrorCode, warningMessage, DiagnosticEventConstants.MissingFunctionsWorkerRuntimeHelpLink, null);
+            }
         }
 
         /// <summary>
@@ -535,15 +592,8 @@ namespace Microsoft.Azure.WebJobs.Script
             {
                 _logger.AddingDescriptorProviderForLanguage("All (Multi Language)");
 
-                var workerOptions = _languageWorkerOptions.CurrentValue;
-
-                _descriptorProviders.Add(new MultiLanguageFunctionDescriptorProvider(this, workerOptions.WorkerConfigs, ScriptOptions, _bindingProviders,
-                    _functionDispatcher, _loggerFactory, _applicationLifetime, workerOptions.WorkerConfigs.Max(wc => wc.CountOptions.InitializationTimeout)));
-            }
-            else if (_isHttpWorker)
-            {
-                _logger.AddingDescriptorProviderForHttpWorker();
-                _descriptorProviders.Add(new HttpFunctionDescriptorProvider(this, ScriptOptions, _bindingProviders, _functionDispatcher, _loggerFactory, _applicationLifetime, _httpWorkerOptions.InitializationTimeout));
+                var descriptorProvider = _descriptorProviderFactory.CreateMultiWorkerDescriptorProvider(this, _bindingProviders);
+                _descriptorProviders.Add(descriptorProvider);
             }
             else if (string.Equals(workerRuntime, RpcWorkerConstants.DotNetLanguageWorkerName, StringComparison.OrdinalIgnoreCase))
             {
@@ -554,13 +604,9 @@ namespace Microsoft.Azure.WebJobs.Script
             {
                 _logger.AddingDescriptorProviderForLanguage(workerRuntime);
 
-                var workerConfig = _languageWorkerOptions.CurrentValue.WorkerConfigs?.FirstOrDefault(c => c.Description.Language.Equals(workerRuntime, StringComparison.OrdinalIgnoreCase));
-
-                // If there's no worker config, use the default (for legacy behavior; mostly for tests).
-                TimeSpan initializationTimeout = workerConfig?.CountOptions?.InitializationTimeout ?? WorkerProcessCountOptions.DefaultInitializationTimeout;
-
-                _descriptorProviders.Add(new RpcFunctionDescriptorProvider(this, workerRuntime, ScriptOptions, _bindingProviders,
-                    _functionDispatcher, _loggerFactory, _applicationLifetime, initializationTimeout));
+                // this handles both http and grpc workers
+                var descriptorProvider = _descriptorProviderFactory.CreateWorkerDescriptorProvider(this, workerRuntime, _bindingProviders);
+                _descriptorProviders.Add(descriptorProvider);
             }
 
             // Codeless functions run side by side with regular functions.
@@ -700,7 +746,7 @@ namespace Microsoft.Azure.WebJobs.Script
                         scriptFile);
 
                     // Adding a function error will cause this function to get ignored
-                    Utility.AddFunctionError(this.FunctionErrors, metadata.Name, msg);
+                    Utility.AddFunctionError(FunctionErrors, metadata.Name, msg);
 
                     _logger.ConfigurationError(msg);
                 }
@@ -736,24 +782,85 @@ namespace Microsoft.Azure.WebJobs.Script
             }
         }
 
+        // Ensure customer deployed application payload matches with the worker runtime configured for the function app and log a warning if not.
+        // If a customer has "dotnet-isolated" worker runtime configured for the function app, and then they deploy an in-proc app payload, this will warn/error
+        // If there is a mismatch, the method will return false, else true.
+        private bool ValidateAndLogRuntimeMismatch(IEnumerable<FunctionMetadata> functionMetadata, string workerRuntime, IOptions<FunctionsHostingConfigOptions> hostingConfigOptions, ILogger logger)
+        {
+            if (_environment.IsPlaceholderModeEnabled())
+            {
+                throw new InvalidOperationException($"Validation of '{EnvironmentSettingNames.FunctionWorkerRuntime}' with deployed payload metadata should not occur in placeholder mode.");
+            }
+
+            if (functionMetadata != null && functionMetadata.Any() && !Utility.ContainsAnyFunctionMatchingWorkerRuntime(functionMetadata, workerRuntime))
+            {
+                var languages = string.Join(", ", functionMetadata.Select(f => f.Language).Distinct()).Replace(DotNetScriptTypes.DotNetAssembly, RpcWorkerConstants.DotNetLanguageWorkerName);
+                var baseMessage = $"The '{EnvironmentSettingNames.FunctionWorkerRuntime}' is set to '{workerRuntime}', which does not match the worker runtime metadata found in the deployed function app artifacts. The deployed artifacts are for '{languages}'. See {DiagnosticEventConstants.WorkerRuntimeDoesNotMatchWithFunctionMetadataHelpLink} for more information.";
+
+                if (hostingConfigOptions.Value.WorkerRuntimeStrictValidationEnabled)
+                {
+                    logger.LogDiagnosticEventError(DiagnosticEventConstants.WorkerRuntimeDoesNotMatchWithFunctionMetadataErrorCode, baseMessage, DiagnosticEventConstants.WorkerRuntimeDoesNotMatchWithFunctionMetadataHelpLink, null);
+                    throw new HostInitializationException(baseMessage);
+                }
+
+                var warningMessage = baseMessage + " The application will continue to run, but may throw an exception in the future.";
+                logger.LogDiagnosticEventWarning(DiagnosticEventConstants.WorkerRuntimeDoesNotMatchWithFunctionMetadataErrorCode, warningMessage, DiagnosticEventConstants.WorkerRuntimeDoesNotMatchWithFunctionMetadataHelpLink, null);
+                return false;
+            }
+
+            return true;
+        }
+
         internal async Task<Collection<FunctionDescriptor>> GetFunctionDescriptorsAsync(IEnumerable<FunctionMetadata> functions, IEnumerable<FunctionDescriptorProvider> descriptorProviders, string workerRuntime, CancellationToken cancellationToken)
         {
             Collection<FunctionDescriptor> functionDescriptors = new Collection<FunctionDescriptor>();
             if (!cancellationToken.IsCancellationRequested)
             {
+                bool throwOnWorkerRuntimeAndPayloadMetadataMismatch = !_environment.IsLogicApp();
+
+                // this dotnet isolated specific logic is temporary to ensure in-proc payload compatibility with "dotnet-isolated" as the FUNCTIONS_WORKER_RUNTIME value.
+                if (!_environment.IsLogicApp() && string.Equals(workerRuntime, RpcWorkerConstants.DotNetIsolatedLanguageWorkerName, StringComparison.OrdinalIgnoreCase) && !_environment.IsPlaceholderModeEnabled())
+                {
+                    bool payloadMatchesWorkerRuntime = ValidateAndLogRuntimeMismatch(functions, workerRuntime, _hostingConfigOptions, _logger);
+                    if (!payloadMatchesWorkerRuntime)
+                    {
+                        UpdateFunctionMetadataLanguageForDotnetAssembly(functions, workerRuntime);
+                        throwOnWorkerRuntimeAndPayloadMetadataMismatch = false; // we do not want to throw an exception in this case
+                    }
+                }
+
                 var httpFunctions = new Dictionary<string, HttpTriggerAttribute>();
 
-                Utility.VerifyFunctionsMatchSpecifiedLanguage(functions, workerRuntime, _environment.IsPlaceholderModeEnabled(), _isHttpWorker, cancellationToken);
+                Utility.VerifyFunctionsMatchSpecifiedLanguage(functions, workerRuntime, _environment.IsPlaceholderModeEnabled(), _metadataOptions.Value.SkipRuntimeValidation, cancellationToken, throwOnMismatch: throwOnWorkerRuntimeAndPayloadMetadataMismatch);
+
+                var inProcIndexingSupported = _environment.IsPlaceholderModeEnabled()
+                                              || (_environment.IsDotNetInProcSupported()
+                                                  && !_hostingConfigOptions.Value.IsDotNetInProcDisabled);
 
                 foreach (FunctionMetadata metadata in functions)
                 {
                     try
                     {
-                        bool created = false;
+                        // If this is metadata represents a function that requires direct type indexing (in-proc), and that is not supported,
+                        // throw an exception with detailed information.
+                        // This is temporary and will be removed in a future release, along with all other logic to support the in-proc model.
+                        if (metadata.IsDotNetInProc())
+                        {
+                            if (!inProcIndexingSupported)
+                            {
+                                throw new HostInitializationException(".NET In-process function detected. This model is not supported by the host in the current environment." +
+                                                                      " See https://aka.ms/azure-functions-retirements/in-process-model for more information.");
+                            }
+
+                            // If this is metadata represents a function that supports direct type indexing,
+                            // set that type in the function metadata
+                            TrySetDirectType(metadata);
+                        }
+
                         FunctionDescriptor descriptor = null;
                         foreach (var provider in descriptorProviders)
                         {
-                            (created, descriptor) = await provider.TryCreate(metadata);
+                            (bool created, descriptor) = await provider.TryCreate(metadata);
                             if (created)
                             {
                                 break;
@@ -765,12 +872,8 @@ namespace Microsoft.Azure.WebJobs.Script
                             ValidateFunction(descriptor, httpFunctions, _environment);
                             functionDescriptors.Add(descriptor);
                         }
-
-                        // If this is metadata represents a function that supports direct type indexing,
-                        // set that type int he function metadata
-                        TrySetDirectType(metadata);
                     }
-                    catch (Exception ex)
+                    catch (Exception ex) when (ex is not HostInitializationException)
                     {
                         // log any unhandled exceptions and continue
                         Utility.AddFunctionError(FunctionErrors, metadata.Name, Utility.FlattenException(ex, includeSource: false));
@@ -780,6 +883,17 @@ namespace Microsoft.Azure.WebJobs.Script
                 VerifyPrecompileStatus(functionDescriptors);
             }
             return functionDescriptors;
+        }
+
+        private static void UpdateFunctionMetadataLanguageForDotnetAssembly(IEnumerable<FunctionMetadata> functions, string workerRuntime)
+        {
+            foreach (var function in functions)
+            {
+                if (function.Language == DotNetScriptTypes.DotNetAssembly)
+                {
+                    function.Language = workerRuntime;
+                }
+            }
         }
 
         internal static void ValidateFunction(FunctionDescriptor function, Dictionary<string, HttpTriggerAttribute> httpFunctions, IEnvironment environment)
@@ -827,9 +941,9 @@ namespace Microsoft.Azure.WebJobs.Script
             }
 
             // disallow custom routes in our own reserved route space
-            string httpRoute = httpTrigger.Route.Trim('/').ToLowerInvariant();
-            if (httpRoute.StartsWith("admin") ||
-                httpRoute.StartsWith("runtime"))
+            ReadOnlySpan<char> httpRoute = httpTrigger.Route.AsSpan().Trim('/');
+            if (httpRoute.StartsWith(ScriptConstants.Admin.AsSpan(), StringComparison.OrdinalIgnoreCase) ||
+                httpRoute.StartsWith(ScriptConstants.Runtime.AsSpan(), StringComparison.OrdinalIgnoreCase))
             {
                 throw new InvalidOperationException("The specified route conflicts with one or more built in routes.");
             }
@@ -975,6 +1089,11 @@ namespace Microsoft.Azure.WebJobs.Script
             _logger.ScriptHostStarted((long)_stopwatch.GetElapsedTime().TotalMilliseconds);
         }
 
+        internal Task NotifyStoppingAsync(CancellationToken cancellationToken)
+        {
+            return _scriptHostLifecycleService.StoppingAsync(cancellationToken);
+        }
+
         protected override async Task StopAsyncCore(CancellationToken cancellationToken)
         {
             _logger.StoppingScriptHost(ScriptOptions.InstanceId);
@@ -992,8 +1111,6 @@ namespace Microsoft.Azure.WebJobs.Script
                 {
                     subscription.Dispose();
                 }
-
-                _functionDispatcher?.Dispose();
 
                 foreach (var function in Functions)
                 {

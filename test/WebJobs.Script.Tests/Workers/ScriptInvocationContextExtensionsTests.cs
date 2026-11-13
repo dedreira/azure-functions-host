@@ -1,8 +1,9 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -10,6 +11,7 @@ using System.Text;
 using System.Threading.Tasks;
 using Google.Protobuf.Collections;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Azure.WebJobs.Extensions.Http;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Grpc;
 using Microsoft.Azure.WebJobs.Script.Grpc.Messages;
@@ -70,7 +72,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Workers
                 expectedAttributes = new List<KeyValuePair<string, string>> { new KeyValuePair<string, string>("key1", "value2") };
             }
 
-            RpcTraceContext traceContext = Grpc.ScriptInvocationContextExtensions.GetRpcTraceContext(traceparent, tracestate, attributes, NullLogger.Instance);
+            RpcTraceContext traceContext = Grpc.ScriptInvocationContextExtensions.GetRpcTraceContext(traceparent, tracestate, attributes);
 
             Assert.Equal(traceparent ?? string.Empty, traceContext.TraceParent);
             Assert.Equal(tracestate ?? string.Empty, traceContext.TraceState);
@@ -332,16 +334,52 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Workers
         public async Task ToRpc_Http_WithProxy()
         {
             // Specify that we're using proxies.
-            var rpcHttp = await CreateTestRpcHttp(new Dictionary<string, string>() { { "HttpUri", "something" } });
+            var rpcHttp = await CreateTestRpcHttp(new Dictionary<string, string>() { { RpcWorkerConstants.HttpUri, "something" } });
 
             // everything should come back empty
             Assert.Empty(rpcHttp.Url);
             Assert.Empty(rpcHttp.Headers);
             Assert.Empty(rpcHttp.Query);
             Assert.Null(rpcHttp.Body);
+            Assert.Empty(rpcHttp.Params);
+            Assert.Empty(rpcHttp.NullableParams);
         }
 
-        private async Task<RpcHttp> CreateTestRpcHttp(IDictionary<string, string> capabilities = null)
+        [Fact]
+        public async Task ToRpc_Http_WithProxy_HandleRouteParams_Capability()
+        {
+            // Specify that we're using proxies & worker can handle route params.
+            var workerCapabilities = new Dictionary<string, string>()
+            {
+                { RpcWorkerConstants.HttpUri, "http://localhost:1234" },
+                { RpcWorkerConstants.RequiresRouteParameters, bool.TrueString }
+            };
+
+            var routeDataValues = new Dictionary<string, object>
+            {
+                { "category", "computer" },
+                { "brand",  "microsoft" }
+            };
+            var httpContextItems = new Dictionary<object, object>
+            {
+                [HttpExtensionConstants.AzureWebJobsHttpRouteDataKey] = routeDataValues
+            };
+
+            var rpcHttp = await CreateTestRpcHttp(workerCapabilities, httpContextItems);
+
+            // Ensure the response includes route params
+            Assert.Equal(2, rpcHttp.Params.Count);
+            Assert.Equal("computer", rpcHttp.Params["category"]);
+            Assert.Equal("microsoft", rpcHttp.Params["brand"]);
+
+            // everything else should come back empty
+            Assert.Empty(rpcHttp.Url);
+            Assert.Empty(rpcHttp.Headers);
+            Assert.Empty(rpcHttp.Query);
+            Assert.Null(rpcHttp.Body);
+        }
+
+        private async Task<RpcHttp> CreateTestRpcHttp(IDictionary<string, string> capabilities = null, IDictionary<object, object> httpRequestContextItems = null)
         {
             var logger = new TestLogger("test");
             GrpcCapabilities grpcCapabilities = new GrpcCapabilities(logger);
@@ -353,6 +391,14 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Workers
             var headers = new HeaderDictionary();
             headers.Add("test-header", "test value");
             var request = HttpTestHelpers.CreateHttpRequest("POST", "http://local/test?a=b", headers: headers, body: "test body");
+
+            if (httpRequestContextItems is not null)
+            {
+                foreach (var item in httpRequestContextItems)
+                {
+                    request.HttpContext.Items.Add(item.Key, item.Value);
+                }
+            }
 
             var bindingData = new Dictionary<string, object>
             {
@@ -425,7 +471,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Workers
             {
                 ExecutionContext = new ExecutionContext()
                 {
-                    RetryContext = new Host.RetryContext()
+                    RetryContext = new WebJobs.Host.RetryContext()
                     {
                         RetryCount = 1,
                         MaxRetryCount = 2,
@@ -973,6 +1019,52 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Workers
             // The input data should be transferred over regular RPC despite enabling shared memory
             Assert.Equal(inputString, result.InputData[1].Data.String);
             Assert.Equal(inputBytes, result.InputData[2].Data.Bytes);
+        }
+
+        [Fact]
+        public void RecordException_WhenAsyncExecutionContextIsNull_SetsException()
+        {
+            // Arrange
+            var context = new ScriptInvocationContext
+            {
+                ResultSource = new TaskCompletionSource<ScriptInvocationResult>(),
+                AsyncExecutionContext = null
+            };
+            var ex = new InvalidOperationException("Test error");
+
+            // Act
+            context.SetException(ex);
+
+            // Assert
+            Assert.True(context.ResultSource.Task.IsFaulted);
+            Assert.Same(ex, context.ResultSource.Task.Exception!.InnerException);
+        }
+
+        [Fact]
+        public void RecordException_WhenAsyncExecutionContextNotNull_SetsExceptionAndUpdatesActivity()
+        {
+            using var activity = new Activity("TestActivity");
+            activity.Start();
+
+            // Arrange
+            var context = new ScriptInvocationContext
+            {
+                ResultSource = new TaskCompletionSource<ScriptInvocationResult>(),
+                AsyncExecutionContext = System.Threading.ExecutionContext.Capture()
+            };
+
+            var ex = new InvalidOperationException("Test error");
+
+            // Act
+            context.SetException(ex);
+
+            // Assert
+            Assert.True(context.ResultSource.Task.IsFaulted);
+            Assert.Same(ex, context.ResultSource.Task.Exception!.InnerException);
+
+            // Verify Activity was updated
+            Assert.Equal(ActivityStatusCode.Error, activity.Status);
+            Assert.Contains(activity.Events, e => e.Name == "exception");
         }
 
         private class TestPoco

@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
@@ -28,7 +28,6 @@ using Moq;
 using Newtonsoft.Json.Linq;
 using WebJobs.Script.Tests;
 using Xunit;
-using IApplicationLifetime = Microsoft.AspNetCore.Hosting.IApplicationLifetime;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests
 {
@@ -267,7 +266,9 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             var host = new HostBuilder().ConfigureDefaultTestWebScriptHost(b =>
             {
-                b.AddAzureStorage();
+                b.AddAzureStorageCoreServices();
+                b.AddAzureStorageBlobs();
+                b.AddAzureStorageQueues();
             }).Build();
 
             Collection<FunctionBinding> inputBindings = new Collection<FunctionBinding>()
@@ -368,13 +369,9 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         {
             using (var tempDirectory = new TempDirectory())
             {
-                var mockApplicationLifetime = new Mock<IApplicationLifetime>();
+                RunDependencies dependencies = CreateDependencies();
 
-                // Create the invoker dependencies and setup the appropriate method to throw the exception
-                RunDependencies dependencies = CreateDependencies(s =>
-                {
-                    s.AddSingleton(mockApplicationLifetime.Object);
-                });
+                var applicationLifetime = _host.Services.GetRequiredService<IScriptApplicationLifetime>();
 
                 // Create a dummy file to represent our function
                 string filePath = Path.Combine(tempDirectory.Path, Guid.NewGuid().ToString() + ".csx");
@@ -405,7 +402,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 // and won't be made immediately
                 await Task.Delay(1000);
 
-                mockApplicationLifetime.Verify(e => e.StopApplication(), Times.Exactly(shutdownExpected ? 1 : 0));
+                Assert.Equal(shutdownExpected, applicationLifetime.ApplicationStopping.IsCancellationRequested);
             }
         }
 

@@ -1,23 +1,17 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
 using System.Collections.Generic;
-using System.Data.Common;
 using System.Linq;
-using System.Net;
 using System.Threading.Tasks;
-using Microsoft.Azure.Documents;
-using Microsoft.Azure.Documents.Client;
+using Azure.Data.Tables;
+using Azure.Storage.Blobs;
 using Microsoft.Azure.WebJobs.Host;
 using Microsoft.Azure.WebJobs.Logging;
 using Microsoft.Azure.WebJobs.Script.Config;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
-using Microsoft.WindowsAzure.MobileServices;
-using Microsoft.Azure.Storage.Blob;
-using Microsoft.Azure.Storage.Queue;
-using Microsoft.Azure.Cosmos.Table;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using Xunit;
@@ -25,7 +19,7 @@ using Xunit;
 namespace Microsoft.Azure.WebJobs.Script.Tests
 {
     public abstract class EndToEndTestsBase<TTestFixture> :
-        IClassFixture<TTestFixture> where TTestFixture : EndToEndTestFixture, new()
+        IClassFixture<TTestFixture> where TTestFixture : EndToEndTestFixture
     {
         private INameResolver _nameResolver;
         private IConfiguration _configuration;
@@ -57,11 +51,12 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             });
             string message = result.FormattedMessage.Substring(result.FormattedMessage.IndexOf('{'));
 
-            // verify singleton binding
+            // verify singleton binding (v5 Tables extension returns JArray even for single-entity lookups)
             JObject resultObject = JObject.Parse(message);
-            JObject single = (JObject)resultObject["single"];
-            Assert.Equal("AAA", (string)single["PartitionKey"]);
-            Assert.Equal("001", (string)single["RowKey"]);
+            JArray single = (JArray)resultObject["single"];
+            Assert.Single(single);
+            Assert.Equal("AAA", (string)single[0]["PartitionKey"]);
+            Assert.Equal("001", (string)single[0]["RowKey"]);
 
             // verify partition binding
             JArray partition = (JArray)resultObject["partition"];
@@ -99,9 +94,9 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
         protected async Task TableOutputTest()
         {
-            CloudTable table = Fixture.TableClient.GetTableReference("testoutput");
+            TableClient table = Fixture.TableServiceClient.GetTableClient("testoutput");
             await table.CreateIfNotExistsAsync();
-            await Fixture.DeleteEntities(table);
+            await Fixture.DeleteEntities(table, Fixture.TableServiceClient);
 
             JObject item = new JObject
             {
@@ -117,26 +112,30 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             await Fixture.Host.BeginFunctionAsync("TableOut", item);
 
             // read the entities and verify schema
-            TableQuery tableQuery = new TableQuery();
-            DynamicTableEntity[] entities = null;
+            string tableQuery = string.Empty;
+            List<TableEntity> entities = new List<TableEntity>();
 
             await TestHelpers.Await(async () =>
             {
-                var results = await table.ExecuteQuerySegmentedAsync(tableQuery, null);
-                entities = results.ToArray();
-                return entities.Length == 3;
+                entities.Clear();
+                var results = table.QueryAsync<TableEntity>(tableQuery, null);
+                await foreach (var entity in results)
+                {
+                    entities.Add(entity);
+                }
+
+                return entities.Count == 3;
             });
 
             foreach (var entity in entities)
             {
-                Assert.Equal(EdmType.String, entity.Properties["stringProp"].PropertyType);
-                Assert.Equal(EdmType.Int32, entity.Properties["intProp"].PropertyType);
-                Assert.Equal(EdmType.Boolean, entity.Properties["boolProp"].PropertyType);
+                Assert.IsType<string>(entity["stringProp"]);
+                Assert.True(entity["intProp"] is int || entity["intProp"] is long);
+                Assert.IsType<bool>(entity["boolProp"]);
 
                 // Guids end up roundtripping as strings
-                Assert.Equal(EdmType.String, entity.Properties["guidProp"].PropertyType);
-
-                Assert.Equal(EdmType.Double, entity.Properties["floatProp"].PropertyType);
+                Assert.IsType<string>(entity["guidProp"]);
+                Assert.IsType<double>(entity["floatProp"]);
             }
         }
 
@@ -160,13 +159,15 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             string id = Guid.NewGuid().ToString();
             string messageContent = string.Format("{{ \"id\": \"{0}\" }}", id);
-            CloudQueueMessage message = new CloudQueueMessage(messageContent);
 
-            await Fixture.TestQueue.AddMessageAsync(message);
+            await Fixture.TestQueue.SendMessageAsync(messageContent);
 
-            var resultBlob = Fixture.TestOutputContainer.GetBlockBlobReference(id);
-            string result = await TestHelpers.WaitForBlobAndGetStringAsync(resultBlob);
-            Assert.Equal(TestHelpers.RemoveByteOrderMarkAndWhitespace(messageContent), TestHelpers.RemoveByteOrderMarkAndWhitespace(result));
+            var resultBlob = Fixture.TestOutputContainer.GetBlobClient(id);
+            string expectedContent = TestHelpers.RemoveByteOrderMarkAndWhitespace(messageContent);
+            string result = await TestHelpers.WaitForBlobAndGetStringAsync(
+                resultBlob,
+                content => string.Equals(expectedContent, TestHelpers.RemoveByteOrderMarkAndWhitespace(content), StringComparison.Ordinal));
+            Assert.Equal(expectedContent, TestHelpers.RemoveByteOrderMarkAndWhitespace(result));
 
             string userCategory = LogCategories.CreateFunctionUserCategory("QueueTriggerToBlob");
             LogMessage traceEvent = await WaitForTraceAsync(p => p?.FormattedMessage != null && p.FormattedMessage.Contains(id) && string.Equals(p.Category, userCategory, StringComparison.Ordinal));
@@ -238,7 +239,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         //    await WaitForMobileTableRecordAsync("Item", idToCheck, textToCheck);
         //}
 
-        protected async Task<IEnumerable<CloudBlockBlob>> Scenario_RandGuidBinding_GeneratesRandomIDs()
+        protected async Task<IEnumerable<BlobClient>> Scenario_RandGuidBinding_GeneratesRandomIDs()
         {
             var container = await GetEmptyContainer("scenarios-output");
 
@@ -255,11 +256,16 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 await Fixture.Host.BeginFunctionAsync("Scenarios", input);
             }
 
-            IEnumerable<CloudBlockBlob> blobs = null;
+            IEnumerable<BlobClient> blobs = null;
 
             await TestHelpers.Await(async () =>
             {
-                blobs = await TestHelpers.ListBlobsAsync(container);
+                var blobList = new List<BlobClient>();
+                await foreach (var blob in TestHelpers.ListBlobsAsync(container))
+                {
+                    blobList.Add(blob);
+                }
+                blobs = blobList;
                 return blobs.Count() == 3;
             });
 
@@ -267,100 +273,19 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             return blobs;
         }
 
-        protected async Task<CloudBlobContainer> GetEmptyContainer(string containerName)
+        protected async Task<BlobContainerClient> GetEmptyContainer(string containerName)
         {
-            var container = Fixture.BlobClient.GetContainerReference(containerName);
-            if (!await container.CreateIfNotExistsAsync())
+            var container = Fixture.BlobServiceClient.GetBlobContainerClient(containerName);
+            var exists = await container.ExistsAsync();
+            if (!exists.Value)
+            {
+                await container.CreateAsync();
+            }
+            else
             {
                 await TestHelpers.ClearContainerAsync(container);
             }
             return container;
-        }
-
-        protected async Task<JToken> WaitForMobileTableRecordAsync(string tableName, string itemId, string textToMatch = null)
-        {
-            // We know the tests are using the default INameResolver and this setting.
-            var mobileAppUri = _nameResolver.Resolve("AzureWebJobs_TestMobileUri");
-            var client = new MobileServiceClient(new Uri(mobileAppUri));
-            JToken item = null;
-            var table = client.GetTable(tableName);
-            await TestHelpers.Await(() =>
-            {
-                bool result = false;
-                try
-                {
-                    item = Task.Run(() => table.LookupAsync(itemId)).Result;
-                    if (textToMatch != null)
-                    {
-                        result = item["Text"].ToString() == textToMatch;
-                    }
-                    else
-                    {
-                        result = true;
-                    }
-                }
-                catch (AggregateException aggEx)
-                {
-                    var ex = (MobileServiceInvalidOperationException)aggEx.InnerException;
-                    if (ex.Response.StatusCode != HttpStatusCode.NotFound)
-                    {
-                        throw;
-                    }
-                }
-
-                return result;
-            });
-
-            return item;
-        }
-
-        protected async Task<Document> WaitForDocumentAsync(string itemId, string textToMatch = null)
-        {
-            var docUri = UriFactory.CreateDocumentUri("ItemDb", "ItemCollection", itemId);
-
-            // We know the tests are using the default connection string.
-            var connectionString = _configuration.GetConnectionString("CosmosDB");
-            var builder = new DbConnectionStringBuilder
-            {
-                ConnectionString = connectionString
-            };
-            var serviceUri = new Uri(builder["AccountEndpoint"].ToString());
-            var client = new DocumentClient(serviceUri, builder["AccountKey"].ToString());
-
-            Document doc = null;
-            await TestHelpers.Await(async () =>
-            {
-                bool result = false;
-
-                try
-                {
-                    var response = await client.ReadDocumentAsync(docUri);
-                    doc = response.Resource;
-                }
-                catch (DocumentClientException ex) when (ex.Error.Code == "NotFound")
-                {
-                    return false;
-                }
-
-                if (textToMatch != null)
-                {
-                    result = doc.GetPropertyValue<string>("text") == textToMatch;
-                }
-                else
-                {
-                    result = true;
-                }
-
-                return result;
-            },
-            userMessageCallback: () =>
-            {
-                // AppVeyor only shows 4096 chars
-                var s = string.Join(Environment.NewLine, Fixture.Host.GetScriptHostLogMessages());
-                return s.Length < 4096 ? s : s.Substring(s.Length - 4096);
-            });
-
-            return doc;
         }
 
         protected static bool VerifyNotificationHubExceptionMessage(Exception exception)

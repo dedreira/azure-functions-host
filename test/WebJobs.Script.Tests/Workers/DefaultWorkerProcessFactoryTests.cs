@@ -1,15 +1,15 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using Microsoft.Azure.WebJobs.Script.Workers;
 using Microsoft.Azure.WebJobs.Script.Workers.Http;
 using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
 using Xunit;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests.Workers
@@ -66,7 +66,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Workers
 
         [Theory]
         [MemberData(nameof(TestWorkerContexts))]
-        public void DefaultWorkerProcessFactory_Returns_ExpectedProcess(WorkerContext workerContext)
+        internal void DefaultWorkerProcessFactory_Returns_ExpectedProcess(WorkerContext workerContext)
         {
             Environment.SetEnvironmentVariable("TestEnv", "TestVal");
             DefaultWorkerProcessFactory defaultWorkerProcessFactory = new DefaultWorkerProcessFactory(_testEnvironment, _loggerFactory);
@@ -82,7 +82,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Workers
             }
             if (workerContext is RpcWorkerContext)
             {
-                Assert.Equal(" httpvalue1 TestVal httpvalue2 --host localhost --port 80 --workerId testWorkerId --requestId testId --grpcMaxMessageLength 2147483647", childProcess.StartInfo.Arguments);
+                Assert.Equal(" httpvalue1 TestVal httpvalue2 --host localhost --port 80 --workerId testWorkerId --requestId testId --grpcMaxMessageLength 2147483647 --functions-uri http://localhost/ --functions-worker-id testWorkerId --functions-request-id testId --functions-grpc-max-message-length 2147483647", childProcess.StartInfo.Arguments);
             }
             else
             {
@@ -94,7 +94,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Workers
 
         [Theory]
         [MemberData(nameof(InvalidWorkerContexts))]
-        public void DefaultWorkerProcessFactory_InvalidWorkerContext_Throws(WorkerContext workerContext)
+        internal void DefaultWorkerProcessFactory_InvalidWorkerContext_Throws(WorkerContext workerContext)
         {
             DefaultWorkerProcessFactory defaultWorkerProcessFactory = new DefaultWorkerProcessFactory(_testEnvironment, _loggerFactory);
             Assert.Throws<ArgumentNullException>(() => defaultWorkerProcessFactory.CreateWorkerProcess(workerContext));
@@ -125,13 +125,51 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Workers
             DefaultWorkerProcessFactory defaultWorkerProcessFactory = new DefaultWorkerProcessFactory(_testEnvironment, _loggerFactory);
 
             Process process = defaultWorkerProcessFactory.CreateWorkerProcess(TestWorkerContexts.ToList()[1][0] as WorkerContext);
-            process.StartInfo.EnvironmentVariables[RpcWorkerConstants.FunctionWorkerRuntimeSettingName] = runtime;
+            process.StartInfo.EnvironmentVariables[EnvironmentSettingNames.FunctionWorkerRuntime] = runtime;
             if (!string.IsNullOrEmpty(value))
             {
                 process.StartInfo.EnvironmentVariables[name] = value;
             }
             defaultWorkerProcessFactory.ApplyWorkerConcurrencyLimits(process.StartInfo);
             Assert.Equal(process.StartInfo.EnvironmentVariables.GetValueOrNull(name), expectedValue);
+        }
+
+        [Fact]
+        public void DefaultWorkerProcessFactory_CreatesWorkingDirectory_WhenNotExists()
+        {
+            string tempDir = Path.Combine(Path.GetTempPath(), "functions-test-" + Guid.NewGuid().ToString("N"));
+            try
+            {
+                Assert.False(Directory.Exists(tempDir));
+
+                var context = new RpcWorkerContext(
+                    "testId",
+                    500,
+                    "testWorkerId",
+                    new WorkerProcessArguments()
+                    {
+                        ExecutablePath = "test",
+                        ExecutableArguments = new List<string>(),
+                        WorkerArguments = new List<string>()
+                    },
+                    tempDir,
+                    new Uri("http://localhost"),
+                    new Dictionary<string, string>());
+
+                DefaultWorkerProcessFactory defaultWorkerProcessFactory = new DefaultWorkerProcessFactory(_testEnvironment, _loggerFactory);
+                using Process childProcess = defaultWorkerProcessFactory.CreateWorkerProcess(context);
+
+                Assert.True(Directory.Exists(tempDir));
+                Assert.Equal(tempDir, childProcess.StartInfo.WorkingDirectory);
+                childProcess.Dispose();
+            }
+            finally
+            {
+                if (Directory.Exists(tempDir))
+                {
+                    Directory.Delete(tempDir, recursive: true);
+                }
+            }
         }
 
         public IDictionary<string, string> GetTestEnvVars()

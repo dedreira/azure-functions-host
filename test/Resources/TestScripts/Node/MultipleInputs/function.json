@@ -1,0 +1,33 @@
+﻿{
+    "bindings": [
+        {
+            "type": "manualTrigger",
+            "name": "input",
+            "direction": "in"
+        },
+        {
+            "type": "blob",
+            "name": "$return",
+            "direction": "out",
+            "path": "test-output-node/{id}"
+        },
+        {
+            "type": "table",
+            "name": "entity1",
+            "direction": "in",
+            "tableName": "test",
+            "partitionKey": "AAA",
+            "filter": "RowKey eq '{rk1}'",
+            "take": 1
+        },
+        {
+            "type": "table",
+            "name": "entity2",
+            "direction": "in",
+            "tableName": "test",
+            "partitionKey": "AAA",
+            "filter": "RowKey eq '{rk2}'",
+            "take": 1
+        }
+    ]
+}

@@ -9,6 +9,7 @@ using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.TestHost;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.Eventing;
 using Microsoft.Azure.WebJobs.Script.WebHost;
@@ -28,7 +29,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Configuration
         [Fact]
         public async Task Validator_AllValid()
         {
-            LogMessage invalidServicesMessage = await RunTest();
+            LogMessage invalidServicesMessage = await RunTestAsync();
 
             string msg = $"If you have registered new dependencies, make sure to update the DependencyValidator. Invalid Services:{Environment.NewLine}";
             Assert.True(invalidServicesMessage == null, msg + invalidServicesMessage?.Exception?.ToString());
@@ -37,7 +38,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Configuration
         [Fact]
         public async Task Validator_InvalidServices_ThrowsException()
         {
-            LogMessage invalidServicesMessage = await RunTest(configureJobHost: s =>
+            LogMessage invalidServicesMessage = await RunTestAsync(configureJobHost: s =>
             {
                 s.AddSingleton<IHostedService, MyHostedService>();
                 s.AddSingleton<IScriptEventManager, MyScriptEventManager>();
@@ -61,7 +62,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Configuration
         [Fact]
         public async Task Validator_NoJobHost()
         {
-            LogMessage invalidServicesMessage = await RunTest(configureWebHost: s =>
+            LogMessage invalidServicesMessage = await RunTestAsync(configureWebHost: s =>
             {
                 // This will force us to skip host startup (which removes the JobHost)
                 s.AddSingleton<IScriptHostBuilder, TestScriptHostBuilder>();
@@ -71,37 +72,43 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Configuration
             Assert.True(invalidServicesMessage == null, msg + invalidServicesMessage?.Exception?.ToString());
         }
 
-        private async Task<LogMessage> RunTest(Action<IServiceCollection> configureWebHost = null, Action<IServiceCollection> configureJobHost = null, bool expectSuccess = true)
+        private async Task<LogMessage> RunTestAsync(Action<IServiceCollection> configureWebHost = null, Action<IServiceCollection> configureJobHost = null, bool expectSuccess = true)
         {
             LogMessage invalidServicesMessage = null;
-            TestLoggerProvider loggerProvider = new TestLoggerProvider();
+            TestLoggerProvider loggerProvider = new();
 
-            var builder = Program.CreateWebHostBuilder(null)
-                    .ConfigureLogging(b =>
+            var builder = new HostBuilder().
+                ConfigureWebHost(webhostBuilder =>
+                {
+                    webhostBuilder.ConfigureLogging(b =>
                     {
                         b.AddProvider(loggerProvider);
-                    })
-                    .ConfigureServices(s =>
-                    {
-                        string uniqueTestRootPath = Path.Combine(Path.GetTempPath(), "FunctionsTest", "DependencyValidatorTests");
-                        s.PostConfigureAll<ScriptApplicationHostOptions>(o =>
-                        {
-                            o.IsSelfHost = true;
-                            o.LogPath = Path.Combine(uniqueTestRootPath, "logs");
-                            o.SecretsPath = Path.Combine(uniqueTestRootPath, "secrets");
-                            o.ScriptPath = uniqueTestRootPath;
-                        });
-
-                        configureWebHost?.Invoke(s);
-                    })
-                    .ConfigureScriptHostLogging(b =>
-                    {
-                        b.AddProvider(loggerProvider);
-                    })
-                    .ConfigureScriptHostServices(b =>
-                    {
-                        configureJobHost?.Invoke(b);
                     });
+
+                    webhostBuilder.UseTestServer();
+                    webhostBuilder.UseStartup<Startup>();
+                })
+                .ConfigureServices(s =>
+                {
+                    string uniqueTestRootPath = Path.Combine(Path.GetTempPath(), "FunctionsTest", "DependencyValidatorTests");
+                    s.PostConfigureAll<ScriptApplicationHostOptions>(o =>
+                    {
+                        o.IsSelfHost = true;
+                        o.LogPath = Path.Combine(uniqueTestRootPath, "logs");
+                        o.SecretsPath = Path.Combine(uniqueTestRootPath, "secrets");
+                        o.ScriptPath = uniqueTestRootPath;
+                    });
+
+                    configureWebHost?.Invoke(s);
+                })
+                .ConfigureScriptHostLogging(b =>
+                {
+                    b.AddProvider(loggerProvider);
+                })
+                .ConfigureScriptHostServices(b =>
+                {
+                    configureJobHost?.Invoke(b);
+                });
 
             using (var host = builder.Build())
             {
@@ -158,21 +165,6 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Configuration
                 channel = null;
                 return false;
             }
-
-            bool IScriptEventManager.TryAddWorkerState<T>(string workerId, T state)
-                => false;
-
-            bool IScriptEventManager.TryGetWorkerState<T>(string workerId, out T state)
-            {
-                state = default;
-                return false;
-            }
-
-            bool IScriptEventManager.TryRemoveWorkerState<T>(string workerId, out T state)
-            {
-                state = default;
-                return false;
-            }
         }
 
         private class MyMetricsLogger : IMetricsLogger
@@ -204,9 +196,9 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Configuration
         {
             private readonly DefaultScriptHostBuilder _builder;
 
-            public TestScriptHostBuilder(IOptionsMonitor<ScriptApplicationHostOptions> appHostOptions, IServiceProvider rootServiceProvider, IServiceScopeFactory rootServiceScopeFactory)
+            public TestScriptHostBuilder(IOptionsMonitor<ScriptApplicationHostOptions> appHostOptions, IServiceProvider rootServiceProvider, IServiceCollection rootServices)
             {
-                _builder = new DefaultScriptHostBuilder(appHostOptions, rootServiceProvider, rootServiceScopeFactory);
+                _builder = new DefaultScriptHostBuilder(appHostOptions, rootServices, rootServiceProvider);
             }
 
             public IHost BuildHost(bool skipHostStartup, bool skipHostConfigurationParsing)
